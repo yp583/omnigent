@@ -5,11 +5,29 @@ const http = require("node:http");
 const https = require("node:https");
 const path = require("node:path");
 const tls = require("node:tls");
-const { randomBytes } = require("node:crypto");
+const { createHash, randomBytes } = require("node:crypto");
 const httpProxy = require("http-proxy");
 
 const API_PREFIXES = ["/v1", "/api", "/auth", "/health", "/.well-known"];
 const UPSTREAM_COOKIE_PREFIX = "omnigent_personal_upstream_";
+
+/**
+ * Return a stable cookie namespace for one configured Omnigent server.
+ *
+ * The private proxy binds to a new loopback port and uses a fresh access token
+ * on every launch. Upstream login cookies must not follow that random token:
+ * doing so leaves an otherwise-valid persistent cloud session stranded after
+ * every normal app restart. Hashing the canonical server identity keeps the
+ * cookie name stable across launches while still isolating two cloud servers
+ * (including distinct path-mounted deployments on the same origin).
+ */
+function upstreamCookieNamespaceFor(serverUrl) {
+  const target = serverUrl instanceof URL ? serverUrl : new URL(serverUrl);
+  const basePath = target.pathname.replace(/\/+$/, "");
+  const identity = `${target.origin}${basePath || "/"}`;
+  const serverId = createHash("sha256").update(identity).digest("hex").slice(0, 16);
+  return `${UPSTREAM_COOKIE_PREFIX}${serverId}_`;
+}
 
 function mergeCertificateAuthorities(...groups) {
   return [...new Set(groups.flat().filter((certificate) => typeof certificate === "string"))];
@@ -123,10 +141,11 @@ async function startPersonalProxy({ staticDir, serverUrl }) {
   const proxy = httpProxy.createProxyServer(proxyOptions);
   let localOrigin = null;
   const accessToken = randomBytes(24).toString("hex");
-  // Cookie scope ignores ports, so every local proxy needs a distinct name.
-  // This lets windows connected to two cloud servers stay open concurrently.
+  // The access capability is deliberately launch-specific; the upstream
+  // session namespace is deliberately server-specific and stable so a valid
+  // cloud login survives app restarts without crossing server boundaries.
   const accessCookieName = `omnigent_personal_proxy_${accessToken.slice(0, 12)}`;
-  const upstreamCookieNamespace = `${UPSTREAM_COOKIE_PREFIX}${accessToken.slice(0, 12)}_`;
+  const upstreamCookieNamespace = upstreamCookieNamespaceFor(target);
   const accessCookie = `${accessCookieName}=${accessToken}`;
   const hasAccess = (request) =>
     String(request.headers.cookie ?? "")
@@ -236,5 +255,6 @@ module.exports = {
   stripProxyCookies,
   startPersonalProxy,
   staticFileFor,
+  upstreamCookieNamespaceFor,
   upstreamPath,
 };

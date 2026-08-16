@@ -491,6 +491,22 @@ describe("CodeViewer media rendering", () => {
     expect(screen.queryByText(/binary file/i)).toBeNull();
   });
 
+  it("requests fullscreen for the complete video surface", async () => {
+    const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      configurable: true,
+      value: requestFullscreen,
+    });
+
+    renderMedia();
+    fireEvent.click(await screen.findByRole("button", { name: "Enter video full screen" }));
+
+    expect(requestFullscreen).toHaveBeenCalledTimes(1);
+    expect(requestFullscreen.mock.instances[0]).toHaveAttribute("data-testid", "media-viewer");
+
+    delete (HTMLElement.prototype as { requestFullscreen?: unknown }).requestFullscreen;
+  });
+
   it("does not mount a corrupt player for a server-truncated video", () => {
     renderMedia(true);
     expect(screen.queryByLabelText("Video preview: demo.webm")).toBeNull();

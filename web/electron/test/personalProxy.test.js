@@ -7,6 +7,7 @@ const {
   mergeCertificateAuthorities,
   sanitizeSetCookies,
   stripProxyCookies,
+  upstreamCookieNamespaceFor,
   upstreamPath,
 } = require("../src/personalProxy");
 
@@ -31,6 +32,19 @@ describe("personal frontend proxy", () => {
       upstreamPath("/api/2.0/omnigent", "/v1/sessions?limit=3"),
       "/api/2.0/omnigent/v1/sessions?limit=3",
     );
+  });
+
+  it("keeps the upstream login namespace stable across app restarts", () => {
+    assert.equal(
+      upstreamCookieNamespaceFor("https://omni.example.com/api/2.0/omnigent/"),
+      upstreamCookieNamespaceFor("https://omni.example.com/api/2.0/omnigent"),
+    );
+  });
+
+  it("isolates saved logins for different servers and path-mounted deployments", () => {
+    const primary = upstreamCookieNamespaceFor("https://omni.example.com/");
+    assert.notEqual(primary, upstreamCookieNamespaceFor("https://other.example.com/"));
+    assert.notEqual(primary, upstreamCookieNamespaceFor("https://omni.example.com/team-a/"));
   });
 
   it("rewrites upstream cookies for the private loopback origin", () => {

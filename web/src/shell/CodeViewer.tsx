@@ -28,7 +28,9 @@ import {
   AtSignIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  MaximizeIcon,
   MessageSquarePlusIcon,
+  MinimizeIcon,
   SearchIcon,
   XIcon,
 } from "lucide-react";
@@ -351,6 +353,8 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 
 function MediaViewer({ data, path }: { data: FileContentResponse; path: string }) {
   const [url, setUrl] = useState<string | null>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const surfaceRef = useRef<HTMLDivElement>(null);
   const mediaKind = getBrowserMediaKind(path, data.content_type);
 
   useEffect(() => {
@@ -362,6 +366,29 @@ function MediaViewer({ data, path }: { data: FileContentResponse; path: string }
     setUrl(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
   }, [data, mediaKind]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setFullscreen(document.fullscreenElement === surfaceRef.current);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
+
+  const toggleFullscreen = useCallback(async () => {
+    const surface = surfaceRef.current;
+    if (!surface) return;
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await surface.requestFullscreen();
+      }
+    } catch {
+      // Electron/Chromium may reject while another transition is in flight.
+      // Leave the current state untouched; the user can retry immediately.
+    }
+  }, []);
 
   if (data.truncated) {
     return (
@@ -376,15 +403,37 @@ function MediaViewer({ data, path }: { data: FileContentResponse; path: string }
   if (!url || !mediaKind) return null;
   const filename = path.split("/").pop() ?? path;
   return (
-    <div className="flex h-full items-center justify-center overflow-auto bg-black/5 p-4 dark:bg-black/20">
+    <div
+      ref={surfaceRef}
+      data-testid="media-viewer"
+      className={cn(
+        "relative flex h-full items-center justify-center overflow-hidden bg-black p-4",
+        fullscreen && "h-screen w-screen p-0",
+      )}
+    >
       {mediaKind === "video" ? (
-        <video
-          src={url}
-          controls
-          preload="metadata"
-          aria-label={`Video preview: ${filename}`}
-          className="max-h-full max-w-full rounded bg-black shadow-sm"
-        />
+        <>
+          <video
+            src={url}
+            controls
+            preload="metadata"
+            aria-label={`Video preview: ${filename}`}
+            onDoubleClick={toggleFullscreen}
+            className={cn(
+              "max-h-full max-w-full rounded bg-black shadow-sm",
+              fullscreen && "h-full w-full rounded-none object-contain",
+            )}
+          />
+          <button
+            type="button"
+            aria-label={fullscreen ? "Exit video full screen" : "Enter video full screen"}
+            aria-pressed={fullscreen}
+            onClick={toggleFullscreen}
+            className="absolute right-4 top-4 flex size-9 items-center justify-center rounded-md border border-white/20 bg-black/70 text-white shadow transition-colors hover:bg-black/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+          >
+            {fullscreen ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
+          </button>
+        </>
       ) : (
         <audio src={url} controls preload="metadata" aria-label={`Audio preview: ${filename}`} />
       )}
