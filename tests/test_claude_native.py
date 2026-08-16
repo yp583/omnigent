@@ -7869,6 +7869,42 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
 
 
+def test_claude_transcript_records_uses_summary_without_snapshot() -> None:
+    """Summary-only compactions replace old Claude transcript records."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "old",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "old context"}],
+        },
+        {
+            "id": "cmp",
+            "type": "compaction",
+            "summary": "bounded summary",
+            "last_item_id": "old",
+            "token_count": 3,
+        },
+        {
+            "id": "new",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "new context"}],
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    encoded = json.dumps(records)
+    assert "bounded summary" in encoded
+    assert "new context" in encoded
+    assert "old context" not in encoded
+
+
 def test_websocket_connect_passes_ssl_context_for_wss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

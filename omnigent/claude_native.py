@@ -22,6 +22,7 @@ import subprocess
 import sys
 import uuid
 
+from omnigent.history_projection import compaction_replacement_messages
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
@@ -4335,8 +4336,8 @@ def _claude_transcript_records_from_session_items(
         # all prior records with the compacted messages so the
         # reconstructed transcript reflects the compacted state.
         if item.get("type") == "compaction":
-            compacted_messages = item.get("compacted_messages")
-            if isinstance(compacted_messages, list) and compacted_messages:
+            compacted_messages = compaction_replacement_messages(item)
+            if compacted_messages:
                 records.clear()
                 parent_uuid = None
                 tool_parent_by_call_id.clear()

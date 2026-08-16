@@ -63,6 +63,23 @@ def test_render_transcript_skips_non_message_and_other_roles() -> None:
     assert app._render_opencode_transcript_text(items) == "User: hi"
 
 
+def test_render_transcript_uses_compaction_summary() -> None:
+    items = [
+        {"type": "message", "role": "user", "content": [{"text": "old context"}]},
+        {
+            "type": "compaction",
+            "summary": "bounded summary",
+            "last_item_id": "old",
+            "token_count": 3,
+        },
+        {"type": "message", "role": "user", "content": [{"text": "new context"}]},
+    ]
+    transcript = app._render_opencode_transcript_text(items)
+    assert "bounded summary" in transcript
+    assert "new context" in transcript
+    assert "old context" not in transcript
+
+
 # ── _rehydrate_opencode_session_from_transcript ─────────────────────────────
 
 

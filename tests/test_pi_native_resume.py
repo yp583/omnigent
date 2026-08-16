@@ -136,6 +136,29 @@ def test_records_build_parent_chain() -> None:
     assert entries[1]["message"]["role"] == "assistant"
 
 
+def test_records_replace_pre_compaction_history_with_summary() -> None:
+    records = pi_session_records_from_session_items(
+        [
+            _user_item("old context", item_id="old"),
+            {
+                "id": "cmp",
+                "type": "compaction",
+                "summary": "bounded summary",
+                "last_item_id": "old",
+                "token_count": 3,
+            },
+            _user_item("new context", item_id="new"),
+        ],
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    encoded = json.dumps(records)
+    assert "bounded summary" in encoded
+    assert "new context" in encoded
+    assert "old context" not in encoded
+
+
 def test_user_message_content_blocks() -> None:
     records = pi_session_records_from_session_items(
         [_user_item("remember BANANA42")],
