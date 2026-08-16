@@ -42,6 +42,7 @@ from typing import cast
 
 import httpx
 
+from omnigent.history_projection import expand_latest_compaction
 from omnigent.host.daemon_launch import error_text
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_terminal import url_component
@@ -237,6 +238,7 @@ def pi_session_records_from_session_items(
         ``model``.
     :returns: Pi session record dictionaries (header first).
     """
+    items = expand_latest_compaction(items)
     timestamp = _pi_entry_timestamp()
     header: _JsonObject = {
         "type": "session",

@@ -550,7 +550,10 @@ def compaction_to_history_items(
         data=MessageData(
             role="assistant",
             content=[{"type": "output_text", "text": data.summary}],
-            agent=data.model,
+            # Native/forwarded compactions may not record the summarizer
+            # model. MessageData still requires assistant attribution, so use
+            # a stable synthetic name instead of making history recovery fail.
+            agent=data.model or "compaction-summary",
         ),
     )
     return [user_item, assistant_item]

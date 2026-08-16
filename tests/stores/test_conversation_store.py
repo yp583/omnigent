@@ -3438,6 +3438,62 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+def test_fork_conversation_remaps_compaction_cursor(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A copied compaction must point at the fork's fresh item id."""
+    from omnigent.entities import CompactionData
+
+    source = conversation_store.create_conversation(title="Compacted source")
+    covered = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_old",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "old context"}],
+                ),
+            )
+        ],
+    )[0]
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="resp_compact",
+                data=CompactionData(
+                    summary="The user supplied old context.",
+                    last_item_id=covered.id,
+                    token_count=8,
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_new",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "new context"}],
+                ),
+            ),
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+    source_items = conversation_store.list_items(source.id, limit=20).data
+    fork_items = conversation_store.list_items(fork.id, limit=20).data
+
+    source_compaction = next(item for item in source_items if item.type == "compaction")
+    fork_compaction = next(item for item in fork_items if item.type == "compaction")
+    assert isinstance(source_compaction.data, CompactionData)
+    assert isinstance(fork_compaction.data, CompactionData)
+    assert source_compaction.data.last_item_id == covered.id
+    assert fork_compaction.data.last_item_id == fork_items[0].id
+    assert fork_compaction.data.last_item_id != covered.id
+
+
 def test_fork_of_sub_agent_is_top_level(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

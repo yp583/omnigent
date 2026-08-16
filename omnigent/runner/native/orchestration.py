@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from omnigent.history_projection import expand_latest_compaction
 from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -1733,8 +1734,9 @@ def _render_opencode_transcript_text(items: list[object]) -> str:
     :returns: A ``"User: …\\n\\nAssistant: …"`` transcript, or ``""``.
     """
     lines: list[str] = []
-    for item in items:
-        if not isinstance(item, dict) or item.get("type") != "message":
+    projected = expand_latest_compaction([item for item in items if isinstance(item, dict)])
+    for item in projected:
+        if item.get("type") != "message":
             continue
         role = item.get("role")
         content = item.get("content")
@@ -5432,7 +5434,7 @@ def _cursor_fork_history_preamble(items: list[_JsonObject]) -> str:
         …"``, or ``""`` when no replayable user/assistant text exists.
     """
     turns: list[str] = []
-    for item in items:
+    for item in expand_latest_compaction(items):
         if item.get("type") != "message":
             continue
         role = item.get("role")

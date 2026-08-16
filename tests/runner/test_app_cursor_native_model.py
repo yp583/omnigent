@@ -115,3 +115,19 @@ class TestCursorForkHistoryPreamble:
     def test_no_replayable_text_yields_empty(self) -> None:
         assert _cursor_fork_history_preamble([]) == ""
         assert _cursor_fork_history_preamble([{"type": "function_call"}]) == ""
+
+    def test_compaction_summary_replaces_old_turns(self) -> None:
+        items = [
+            _msg("user", "old context"),
+            {
+                "type": "compaction",
+                "summary": "bounded summary",
+                "last_item_id": "old",
+                "token_count": 3,
+            },
+            _msg("user", "new context"),
+        ]
+        preamble = _cursor_fork_history_preamble(items)
+        assert "bounded summary" in preamble
+        assert "new context" in preamble
+        assert "old context" not in preamble

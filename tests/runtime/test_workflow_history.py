@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.entities import ConversationItem, MessageData, PagedList, SlashCommandData
+from omnigent.entities import (
+    CompactionData,
+    ConversationItem,
+    MessageData,
+    PagedList,
+    SlashCommandData,
+)
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.runtime.workflow import _load_initial_history
 
@@ -46,6 +52,8 @@ class _ConversationStore:
         """
         del conversation_id, kwargs
         items = [item for item in self._items if type is None or item.type == type]
+        if after is not None and not any(item.id == after for item in items):
+            return PagedList()
         return paginate_in_memory(
             items,
             lambda item: item.id,
@@ -105,3 +113,51 @@ def test_load_initial_history_filters_visible_slash_command_but_keeps_meta_messa
     assert [item.id for item in loaded.items] == ["msg_meta", "msg_visible"]
     assert isinstance(loaded.items[0].data, MessageData)
     assert loaded.items[0].data.is_meta is True
+
+
+def test_load_initial_history_recovers_stale_fork_compaction_cursor() -> None:
+    """A pre-fix fork uses the compaction row as a safe fallback boundary."""
+    old = ConversationItem(
+        id="msg_fork_old",
+        type="message",
+        status="completed",
+        response_id="turn_old",
+        created_at=1,
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": "must not replay"}],
+        ),
+    )
+    compacted = ConversationItem(
+        id="cmp_fork",
+        type="compaction",
+        status="completed",
+        response_id="turn_compact",
+        created_at=2,
+        data=CompactionData(
+            summary="Durable compacted summary",
+            last_item_id="msg_source_old",
+            token_count=5,
+        ),
+    )
+    recent = ConversationItem(
+        id="msg_fork_new",
+        type="message",
+        status="completed",
+        response_id="turn_new",
+        created_at=3,
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": "keep this"}],
+        ),
+    )
+
+    loaded = _load_initial_history(
+        _ConversationStore([old, compacted, recent]),  # type: ignore[arg-type]
+        "conv_fork",
+    )
+
+    encoded = " ".join(str(item.data.model_dump()) for item in loaded.items)
+    assert "Durable compacted summary" in encoded
+    assert "keep this" in encoded
+    assert "must not replay" not in encoded

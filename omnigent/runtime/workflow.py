@@ -2637,6 +2637,27 @@ def _load_initial_history(
         conversation_id,
         after=compaction_item.data.last_item_id,
     )
+    if not recent_items:
+        # SQL cursor pagination returns an empty page when the cursor id is not
+        # present in this conversation.  Forks created before compaction cursors
+        # were remapped have exactly that shape: ``last_item_id`` still names
+        # the source session.  Recover without replaying the old transcript by
+        # treating the compaction row's own position as the compatibility
+        # boundary.  A valid cursor always has at least the later compaction row
+        # after it, so an empty result is unambiguous here.
+        full_items = fetch_all_items(conv_store, conversation_id)
+        compaction_index = next(
+            (index for index, item in enumerate(full_items) if item.id == compaction_item.id),
+            None,
+        )
+        if compaction_index is not None:
+            _logger.warning(
+                "Recovered stale compaction cursor %s for %s using compaction item %s",
+                compaction_item.data.last_item_id,
+                conversation_id,
+                compaction_item.id,
+            )
+            recent_items = full_items[compaction_index + 1 :]
     # Filter metadata items — they are not conversation content the
     # LLM should receive verbatim.
     content_items = [i for i in recent_items if i.type not in NON_CONTENT_ITEM_TYPES]

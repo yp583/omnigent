@@ -3644,11 +3644,44 @@ class SqlAlchemyConversationStore(ConversationStore):
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all()
 
+            # Every copied item receives a fresh id.  Compaction payloads are
+            # the one place item ids are also stored *inside* another item's
+            # data: ``last_item_id`` is the inclusive cursor covered by the
+            # summary.  Copying that payload verbatim leaves the fork pointing
+            # at an id which only exists in the source conversation.  That is
+            # especially damaging when a different runner/host must rebuild a
+            # native transcript: an ``after=old_id`` history query returns an
+            # empty page and the fork appears to have no usable context.
+            #
+            # Allocate the complete mapping before building rows so a
+            # compaction can safely refer to any earlier copied item.  Decode
+            # through the store hooks rather than assuming plaintext; hosted
+            # subclasses may compress or encrypt this column.
+            new_item_ids = [
+                generate_item_id(decode_item_type(src_item.type)) for src_item in source_items
+            ]
+            copied_item_ids = {
+                src_item.id: new_item_id
+                for src_item, new_item_id in zip(source_items, new_item_ids, strict=True)
+            }
+            decoded_item_data = self._decode_item_data_batch(
+                [src_item.data for src_item in source_items]
+            )
+
             fts_rows: list[tuple[str, str, str]] = []
-            for pos, src_item in enumerate(source_items):
-                # src_item.type/status are int codes copied verbatim to the new
-                # row; only generate_item_id needs the decoded string type.
-                new_item_id = generate_item_id(decode_item_type(src_item.type))
+            for pos, (src_item, new_item_id, data_json) in enumerate(
+                zip(source_items, new_item_ids, decoded_item_data, strict=True)
+            ):
+                item_type = decode_item_type(src_item.type)
+                copied_data = data_json
+                if item_type == "compaction":
+                    data_dict = json.loads(data_json)
+                    last_item_id = data_dict.get("last_item_id")
+                    if isinstance(last_item_id, str) and last_item_id in copied_item_ids:
+                        data_dict["last_item_id"] = copied_item_ids[last_item_id]
+                        copied_data = self._encode_item_data(
+                            strip_nul_bytes(json.dumps(data_dict))
+                        )
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -3657,7 +3690,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     status=src_item.status,
                     position=pos,
                     type=src_item.type,
-                    data=src_item.data,
+                    data=copied_data,
                     search_text=src_item.search_text,
                     created_by=src_item.created_by,
                 )

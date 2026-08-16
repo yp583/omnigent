@@ -68,6 +68,7 @@ from omnigent.harness_availability import (
     HARNESS_VERSION_TOO_LOW,
     HarnessUnavailableReason,
 )
+from omnigent.history_projection import compaction_replacement_messages
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
@@ -2021,7 +2022,7 @@ def _codex_rollout_records_from_session_items(
         # Compacted rollout record and discard all prior records — the
         # replacement_history replaces them.
         if item.get("type") == "compaction":
-            compacted_msgs = item.get("compacted_messages")
+            compacted_msgs = compaction_replacement_messages(item)
             if compacted_msgs:
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),

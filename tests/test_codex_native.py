@@ -10173,6 +10173,44 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     assert len(post_items) == 1
 
 
+def test_rollout_records_uses_summary_when_snapshot_is_missing() -> None:
+    """Summary-only compactions still bound rebuilt Codex context."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "old",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "old context"}],
+        },
+        {
+            "id": "cmp",
+            "type": "compaction",
+            "summary": "bounded summary",
+            "last_item_id": "old",
+            "token_count": 3,
+        },
+        {
+            "id": "new",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "new context"}],
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    encoded = json.dumps(records)
+    assert '"type": "compacted"' in encoded
+    assert "bounded summary" in encoded
+    assert "new context" in encoded
+    assert "old context" not in encoded
+
+
 def test_codex_event_msg_record_ignores_non_list_content() -> None:
     """Malformed message content is skipped as it was before type narrowing."""
     assert (
