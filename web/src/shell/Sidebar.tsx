@@ -40,6 +40,7 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  RadioIcon,
   SearchIcon,
   Settings2Icon,
   ShareIcon,
@@ -297,6 +298,7 @@ interface SidebarProps {
 function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
+  isConductorPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
   newSessionProjectName: string | null;
@@ -305,10 +307,15 @@ function useActiveNavItem(): {
   const location = useLocation();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isInboxPage = leaf === "inbox";
+  const isConductorPage = leaf === "conductor";
   const isTasksPage = leaf === "tasks";
   const isUsagePage = leaf === "usage";
   const isNewSessionRoute =
-    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage;
+    activeConversationId == null &&
+    !isInboxPage &&
+    !isConductorPage &&
+    !isTasksPage &&
+    !isUsagePage;
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;
@@ -317,7 +324,14 @@ function useActiveNavItem(): {
   // would otherwise light up the "New session" button. A project-prefilled
   // new session belongs to that project row instead of the global nav item.
   const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
-  return { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName };
+  return {
+    isNewChatPage,
+    isInboxPage,
+    isConductorPage,
+    isTasksPage,
+    isUsagePage,
+    newSessionProjectName,
+  };
 }
 
 /**
@@ -593,8 +607,14 @@ export function Sidebar({
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName } =
-    useActiveNavItem();
+  const {
+    isNewChatPage,
+    isInboxPage,
+    isConductorPage,
+    isTasksPage,
+    isUsagePage,
+    newSessionProjectName,
+  } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -864,6 +884,29 @@ export function Sidebar({
                   )}
                 />
                 New session
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="ghost"
+              className={cn(
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
+                SIDEBAR_HOVER_HIGHLIGHT,
+                isConductorPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              )}
+              data-testid="conductor-nav"
+            >
+              <Link to="/conductor" onClick={onNavClick}>
+                <RadioIcon
+                  className={cn(
+                    "ui-icon",
+                    isConductorPage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
+                Conductor
               </Link>
             </Button>
             {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
@@ -1595,8 +1638,7 @@ function ConversationList({
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
-      | { label?: string; project?: string | null; isPinned?: boolean }
-      | undefined;
+      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
