@@ -150,6 +150,8 @@ interface SessionResponseWire {
   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
   harness?: string | null;
   model_override?: string | null;
+  /** Native CLI argv persisted for relaunch/resume. */
+  terminal_launch_args?: string[] | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
@@ -312,6 +314,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     llmModel: wire.llm_model,
     harness: wire.harness ?? null,
     modelOverride: wire.model_override,
+    terminalLaunchArgs: wire.terminal_launch_args ?? null,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
     contextWindow: wire.context_window,
@@ -685,12 +688,13 @@ export async function updateSession(
     codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
+    terminalLaunchArgs?: string[];
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null | Record<string, string>> = {};
+  const body: Record<string, string | boolean | null | string[] | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
@@ -705,6 +709,9 @@ export async function updateSession(
   }
   if ("subagentRoutingOverride" in updates) {
     body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
+  }
+  if (updates.terminalLaunchArgs !== undefined) {
+    body.terminal_launch_args = updates.terminalLaunchArgs;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;

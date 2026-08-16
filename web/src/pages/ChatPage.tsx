@@ -109,7 +109,16 @@ import {
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retrySession } from "@/lib/sessionsApi";
+import { retrySession, stopSession, updateSession } from "@/lib/sessionsApi";
+import {
+  CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+  mergeNativePermissionModeArgs,
+  NATIVE_PERMISSION_CUSTOM_OPTION,
+  NATIVE_PERMISSION_CUSTOM_VALUE,
+  nativePermissionControlForHarness,
+  nativePermissionModeFromSession,
+} from "@/lib/nativePermissionModes";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
@@ -187,6 +196,7 @@ import {
 } from "@/components/ui/select";
 import {
   ConfigRow,
+  DescribedSelect,
   EFFORT_SELECT_NONE,
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
@@ -6302,11 +6312,11 @@ const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session s
 /**
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
- * knobs switchable mid-session appear — Model (which folds Smart Routing in as
- * an option where a dropdown exists), Effort, and Subagent routing. A session's
- * own Smart Routing is otherwise a create-time choice, and
- * permission/approval/cursor modes are launch-time only (no in-session state to
- * read or write), so they are intentionally absent.
+ * knobs switchable per session appear — Model (which folds Smart Routing in as
+ * an option where a dropdown exists), Effort, native Permissions / Approval /
+ * Mode, and Subagent routing. Native permission choices are launch flags, so a
+ * changed mode is persisted and the idle native session is restarted before
+ * the modal reports success.
  *
  * Like the new-session modal, changes are drafted locally and only applied on
  * Save (through the store setters ``setModel`` / ``setEffort`` /
@@ -6324,6 +6334,8 @@ function SessionConfigModal({
   codexModelOptions,
   costRoutingEligible,
   subagentRoutingEligible,
+  permissionMode,
+  onPermissionModeApplied,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -6335,11 +6347,23 @@ function SessionConfigModal({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
+  permissionMode: string | null;
+  onPermissionModeApplied: (mode: string) => void;
 }) {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const localStatus = useChatStore((s) => s.status);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const { session } = useSession(conversationId);
+  const permissionControl = nativePermissionControlForHarness(sessionHarness);
+  const currentPermissionMode = permissionMode ?? permissionControl?.defaultValue;
+  const canRestartForPermissionChange =
+    isOwnerLevel(session?.permissionLevel ?? null) &&
+    localStatus === "idle" &&
+    (sessionStatus === "idle" || sessionStatus === "failed");
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel, modelLabel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
 
@@ -6367,6 +6391,10 @@ function SessionConfigModal({
   const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  const [draftPermissionMode, setDraftPermissionMode] = useState<string | undefined>(
+    currentPermissionMode,
+  );
+  const [saving, setSaving] = useState(false);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
   // as long as the user hasn't chosen anything. A draft seeded once per open
@@ -6381,6 +6409,7 @@ function SessionConfigModal({
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
+    setDraftPermissionMode(currentPermissionMode);
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
@@ -6420,7 +6449,7 @@ function SessionConfigModal({
     pickedSubagentRouting === undefined ? subagentRoutingOverride : pickedSubagentRouting;
   const subagentRoutingValue = effectiveSubagentRouting === "on" ? "on" : "off";
 
-  const save = () => {
+  const save = async () => {
     // Commit the changed knobs SEQUENTIALLY, awaiting each PATCH before the
     // next. Claude-native applies model/effort changes by typing separate
     // ``/model``/``/effort`` slash commands into its terminal, so firing them
@@ -6429,47 +6458,87 @@ function SessionConfigModal({
     // Awaiting serializes them — each change lands in its own turn. Order
     // matches HarnessConfigModal.save: model/routing first (their setters
     // enforce the mutual exclusion server-side), then effort.
-    void (async () => {
-      const store = useChatStore.getState();
-      try {
-        if (draftRoutingOn) {
-          if (costRoutingEligible && !liveRoutingOn) await store.setCostControlMode("on");
-        } else {
-          // Re-pin the model when routing was on and there's a Model dropdown
-          // (its setter cleared the applied override, and `resolvedModelId`
-          // reflects the leftover cross-session sticky — not what's applied — so
-          // the ``!==`` guard would false-negative), or whenever the drafted
-          // model actually changed. For a no-dropdown agent (e.g. Polly) the
-          // user can't have chosen a model, so re-pinning the seeded
-          // `resolvedModelId` would risk pinning a leaked sticky — turning
-          // routing off just clears via setModel(null) below.
-          const modelChanged = draftModelId !== resolvedModelId;
-          const rePinAfterRouting = liveRoutingOn && showModels;
-          if (rePinAfterRouting || modelChanged) await store.setModel(draftModelId);
-          if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
-        }
-        // Skip effort while routing is on: the router picks it per turn, and a
-        // stray ``/effort`` injection would just be noise.
-        if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
-          await store.setEffort(draftEffort);
-        // Sub-agent routing is independent of this session's own model — a
-        // plain PATCH with no slash-command injection, so ordering is free.
-        // Only an explicit pick is written, and only when it still differs from
-        // what the session has now: an untouched row must never persist a value
-        // the user didn't choose, and an unset store value already means "off",
-        // so picking Default on such a session writes nothing.
-        if (
-          subagentRoutingEligible &&
-          pickedSubagentRouting !== undefined &&
-          pickedSubagentRouting !== (store.subagentRoutingOverride ?? "off")
-        )
-          await store.setSubagentRouting(pickedSubagentRouting);
-      } catch {
-        // Individual setters already roll back their optimistic state; a failed
-        // PATCH shouldn't wedge the modal open.
+    const store = useChatStore.getState();
+    let permissionPersisted = false;
+    setSaving(true);
+    try {
+      if (draftRoutingOn) {
+        if (costRoutingEligible && !liveRoutingOn) await store.setCostControlMode("on");
+      } else {
+        // Re-pin the model when routing was on and there's a Model dropdown
+        // (its setter cleared the applied override, and `resolvedModelId`
+        // reflects the leftover cross-session sticky — not what's applied — so
+        // the ``!==`` guard would false-negative), or whenever the drafted
+        // model actually changed. For a no-dropdown agent (e.g. Polly) the
+        // user can't have chosen a model, so re-pinning the seeded
+        // `resolvedModelId` would risk pinning a leaked sticky — turning
+        // routing off just clears via setModel(null) below.
+        const modelChanged = draftModelId !== resolvedModelId;
+        const rePinAfterRouting = liveRoutingOn && showModels;
+        if (rePinAfterRouting || modelChanged) await store.setModel(draftModelId);
+        if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
       }
-    })();
-    onOpenChange(false);
+      // Skip effort while routing is on: the router picks it per turn, and a
+      // stray ``/effort`` injection would just be noise.
+      if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
+        await store.setEffort(draftEffort);
+      // Sub-agent routing is independent of this session's own model — a
+      // plain PATCH with no slash-command injection, so ordering is free.
+      if (
+        subagentRoutingEligible &&
+        pickedSubagentRouting !== undefined &&
+        pickedSubagentRouting !== (store.subagentRoutingOverride ?? "off")
+      )
+        await store.setSubagentRouting(pickedSubagentRouting);
+
+      const permissionChanged =
+        permissionControl != null &&
+        draftPermissionMode != null &&
+        draftPermissionMode !== currentPermissionMode &&
+        draftPermissionMode !== NATIVE_PERMISSION_CUSTOM_VALUE;
+      if (permissionChanged && conversationId) {
+        if (!canRestartForPermissionChange) {
+          throw new Error("Permission mode can only change while an owner has the session idle.");
+        }
+        const terminalLaunchArgs = mergeNativePermissionModeArgs(
+          sessionHarness,
+          session?.terminalLaunchArgs,
+          draftPermissionMode,
+        );
+        const labels =
+          sessionHarness === "codex-native"
+            ? {
+                [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]:
+                  draftPermissionMode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE ? "1" : "0",
+              }
+            : undefined;
+        await updateSession(conversationId, {
+          terminalLaunchArgs,
+          ...(labels ? { labels } : {}),
+        });
+        permissionPersisted = true;
+        onPermissionModeApplied(draftPermissionMode);
+
+        // These modes are native CLI launch settings. Stop + retry resumes the
+        // same vendor session with the new argv; no transcript input is added.
+        await stopSession(conversationId);
+        await retrySession(conversationId);
+        const selectedLabel = permissionControl.options.find(
+          (option) => option.value === draftPermissionMode,
+        )?.label;
+        showToast(`${permissionControl.label} changed to ${selectedLabel ?? draftPermissionMode}.`);
+      }
+      onOpenChange(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      showToast(
+        permissionPersisted
+          ? `The permission setting was saved, but the session could not restart: ${message}`
+          : `Could not save session configuration: ${message}`,
+      );
+    } finally {
+      setSaving(false);
+    }
   };
 
   const modelSelectOptions = useMemo(() => {
@@ -6490,13 +6559,28 @@ function SessionConfigModal({
     return [...catalog, { id: draftModelId, label: modelLabel ?? draftModelId }];
   }, [usesServerModelOptions, modelOptions, draftModelId, modelLabel]);
 
+  const permissionOptions =
+    permissionControl && currentPermissionMode === NATIVE_PERMISSION_CUSTOM_VALUE
+      ? [...permissionControl.options, NATIVE_PERMISSION_CUSTOM_OPTION]
+      : (permissionControl?.options ?? []);
+  const dangerousPermissionMode =
+    draftPermissionMode === "bypassPermissions" ||
+    draftPermissionMode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE ||
+    draftPermissionMode === "yolo" ||
+    draftPermissionMode === "skip";
+  const permissionRowDescription = !isOwnerLevel(session?.permissionLevel ?? null)
+    ? "Only the session owner can change this"
+    : !canRestartForPermissionChange
+      ? "Available when the session is idle"
+      : (permissionControl?.description ?? "Native harness permissions");
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md" data-testid="composer-config-modal">
         <DialogHeader>
           <DialogTitle>Configure {harnessLabel ?? "session"}</DialogTitle>
           <DialogDescription className="sr-only">
-            Change how this session runs. Model, effort, and smart routing apply to the next turn.
+            Change how this session runs. Native permission changes restart an idle session.
           </DialogDescription>
         </DialogHeader>
 
@@ -6552,6 +6636,30 @@ function SessionConfigModal({
               </Select>
             </ConfigRow>
           )}
+          {permissionControl && draftPermissionMode && (
+            <>
+              <ConfigRow label={permissionControl.label} description={permissionRowDescription}>
+                <DescribedSelect
+                  value={draftPermissionMode}
+                  onValueChange={setDraftPermissionMode}
+                  options={permissionOptions}
+                  testId="composer-config-permission"
+                  ariaLabel={permissionControl.label}
+                  disabled={!canRestartForPermissionChange || saving}
+                />
+              </ConfigRow>
+              {dangerousPermissionMode && (
+                <div
+                  role="alert"
+                  data-testid="composer-config-permission-warning"
+                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
+                >
+                  <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                  <span>This mode runs tools without the usual approval and safety checks.</span>
+                </div>
+              )}
+            </>
+          )}
           {/* Sub-agent routing — the only in-session routing control, for a
           native session whose launch installed the spawn-routing apparatus
           (spawns route through the harness hook) and for SDK/bundle agents
@@ -6591,11 +6699,17 @@ function SessionConfigModal({
             type="button"
             variant="outline"
             onClick={() => onOpenChange(false)}
+            disabled={saving}
             data-testid="composer-config-cancel"
           >
             Cancel
           </Button>
-          <Button type="button" onClick={save} data-testid="composer-config-save">
+          <Button
+            type="button"
+            onClick={() => void save()}
+            loading={saving}
+            data-testid="composer-config-save"
+          >
             Save
           </Button>
         </DialogFooter>
@@ -6607,8 +6721,9 @@ function SessionConfigModal({
 /**
  * Composer gear affordance: a ghost `SettingsIcon` that shows the session's
  * live run-config on hover and opens `SessionConfigModal` on click. Rendered
- * only when the session has at least one switchable knob (model, effort, or
- * smart routing) — otherwise there's nothing to configure.
+ * only when the session has at least one switchable knob (model, effort,
+ * native permissions, or smart routing) — otherwise there's nothing to
+ * configure.
  *
  * @param openNonce External "open the modal" signal, nonce-keyed so repeat
  *   requests re-open (bare ``/model`` submits route here now that the composer
@@ -6638,6 +6753,19 @@ function ComposerConfigGear({
   openNonce?: number;
 }) {
   const [open, setOpen] = useState(false);
+  const conversationId = useChatStore((s) => s.conversationId);
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const { session } = useSession(conversationId);
+  const permissionControl = nativePermissionControlForHarness(sessionHarness);
+  const sessionPermissionMode =
+    nativePermissionModeFromSession(sessionHarness, session?.terminalLaunchArgs, session?.labels) ??
+    permissionControl?.defaultValue;
+  const [permissionMode, setPermissionMode] = useState<string | null>(
+    sessionPermissionMode ?? null,
+  );
+  useEffect(() => {
+    setPermissionMode(sessionPermissionMode ?? null);
+  }, [conversationId, sessionPermissionMode]);
   const appliedOpenNonce = useRef(0);
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
@@ -6655,9 +6783,17 @@ function ComposerConfigGear({
     modelPickerKind,
     codexModelOptions,
     costRoutingEligible,
+    permissionMode,
   });
 
-  if (!showModels && !showEffort && !costRoutingEligible && !subagentRoutingEligible) return null;
+  if (
+    !showModels &&
+    !showEffort &&
+    !costRoutingEligible &&
+    !subagentRoutingEligible &&
+    !permissionControl
+  )
+    return null;
 
   return (
     <>
@@ -6718,6 +6854,8 @@ function ComposerConfigGear({
         codexModelOptions={codexModelOptions}
         costRoutingEligible={costRoutingEligible}
         subagentRoutingEligible={subagentRoutingEligible}
+        permissionMode={permissionMode}
+        onPermissionModeApplied={setPermissionMode}
       />
     </>
   );
@@ -6726,7 +6864,7 @@ function ComposerConfigGear({
 /**
  * Label/value rows summarizing the session's live run-config, for the gear
  * icon's hover tooltip. Mirrors the new-session summary but with in-session
- * values and no Permissions row (permission mode is launch-time only).
+ * values, including the persisted native permission mode.
  */
 function useSessionConfigSummary({
   harnessLabel,
@@ -6735,6 +6873,7 @@ function useSessionConfigSummary({
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
+  permissionMode,
 }: {
   harnessLabel: string | null;
   showModels: boolean;
@@ -6742,9 +6881,11 @@ function useSessionConfigSummary({
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
+  permissionMode: string | null;
 }): { label: string; value: string }[] {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
@@ -6761,6 +6902,15 @@ function useSessionConfigSummary({
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
+  }
+  const permissionControl = nativePermissionControlForHarness(sessionHarness);
+  if (permissionControl && permissionMode) {
+    rows.push({
+      label: permissionControl.label,
+      value:
+        permissionControl.options.find((option) => option.value === permissionMode)?.label ??
+        NATIVE_PERMISSION_CUSTOM_OPTION.label,
+    });
   }
   return rows;
 }

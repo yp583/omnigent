@@ -318,6 +318,11 @@ export interface Session {
    */
   modelOverride?: string | null;
   /**
+   * Native CLI argv persisted for this session. Permission controls replace
+   * only their harness-owned flags and preserve unrelated launch options.
+   */
+  terminalLaunchArgs?: string[] | null;
+  /**
    * Per-session cost-control switch: `"on"` activates the spec's
    * configured cost-control mode, `"off"` disables cost control for
    * this session, `null` defers to the spec default. Driven by the
