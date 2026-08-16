@@ -36,8 +36,15 @@ class ConductorStore(ABC):
         self,
         user_id: str,
         *,
+        conversation_id: str | None = None,
         memory_provider: str | None = None,
         config: dict[str, Any] | None = None,
     ) -> Conductor | None:
-        """Update provider/config fields, or return ``None`` if absent."""
+        """Update binding/provider/config fields, or return ``None`` if absent.
+
+        ``conversation_id`` is an internal repair primitive. The HTTP PATCH
+        surface never exposes transcript replacement; the Conductor route uses
+        it only to recover a legacy binding that does not point at a real
+        Conductor-agent session.
+        """
         ...

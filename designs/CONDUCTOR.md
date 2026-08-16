@@ -7,6 +7,9 @@ an owner-scoped control plane, pluggable memory, and a focused operational UI.
 ## Product contract
 
 - One active Conductor transcript per `(workspace, user)`.
+- The active transcript must be a top-level session whose bound agent is named
+  `conductor`; ordinary Claude, Codex, and custom-agent history is never
+  eligible. The server enforces this independently of the UI.
 - The dashboard lists top-level sessions the user owns. Shared sessions never
   enter Conductor scope.
 - The Conductor may read or steer an owned session and any descendant in that
@@ -60,9 +63,10 @@ Conductor transcript.
 - a provider selector when more than one backend is registered; and
 - a responsive layout suitable for the mobile web shell.
 
-The initial setup intentionally asks the user to choose a dedicated transcript.
-The shipped Conductor agent is available in the new-session picker and is the
-recommended choice.
+The initial setup starts a dedicated transcript with the shipped Conductor
+agent. Existing Conductor-agent sessions may be resumed, but ordinary session
+history is never offered. Legacy invalid bindings are shown as unconfigured and
+are repaired when the dedicated Conductor chat is created.
 
 ## Mobile voice
 

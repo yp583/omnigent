@@ -201,6 +201,7 @@ import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { bindConductor } from "@/lib/conductorApi";
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
@@ -2063,13 +2064,17 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
+  const requestedAgentName = searchParams.get("agent")?.trim() ?? "";
+  const conductorSetup = searchParams.get("conductorSetup") === "1";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
   // project-driven visit defers to the project-prefill effect instead
   // (which falls back to the same last pick).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => landingDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
+    () =>
+      landingDraft?.pickedAgentId ??
+      (projectParam !== "" || requestedAgentName !== "" ? null : readLastAgentId()),
   );
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
     () => landingDraft?.selectedHostId ?? null,
@@ -2411,14 +2416,14 @@ export function NewChatLandingScreen() {
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
     setSelectedHostId(null);
-    setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
+    setPickedAgentId(projectParam !== "" || requestedAgentName !== "" ? null : readLastAgentId());
     setWorkspace("");
     setBranchName("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project, prefillConfigSig]);
+  }, [projectParam, requestedAgentName, prefill.project, prefillConfigSig]);
 
   // Record the config the machine settled from, once it's loaded and the
   // machine is done, so the reseed effect above can spot a later change to it
@@ -2627,11 +2632,16 @@ export function NewChatLandingScreen() {
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
   const pendingAgentAllowedOnTarget = !sandboxSelected;
+  const requestedAgentId =
+    requestedAgentName === ""
+      ? null
+      : (agentList.find((agent) => agent.name === requestedAgentName)?.id ?? null);
   const effectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
-      : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
-        null);
+      : ((agentList.some((a) => a.id === pickedAgentId)
+          ? pickedAgentId
+          : (requestedAgentId ?? agentList[0]?.id)) ?? null);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -3876,6 +3886,17 @@ export function NewChatLandingScreen() {
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
+      // Dedicated Conductor setup binds the new transcript before ChatPage
+      // auto-sends its first prompt. That ordering guarantees the Conductor's
+      // owner-wide tools are authorized on turn one and prevents an existing
+      // ordinary transcript from ever being repurposed.
+      if (conductorSetup) {
+        await bindConductor(data.id);
+        // Drop setup's cached null/legacy binding so the guarded chat route
+        // fetches the newly active Conductor before it decides whether this
+        // deep link is allowed.
+        queryClient.removeQueries({ queryKey: ["conductor", "dashboard"] });
+      }
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
       landingDraft = null;
@@ -3884,7 +3905,9 @@ export function NewChatLandingScreen() {
       // session; jumping them into this one now would hijack that. The
       // session is created either way and its first message stays held
       // for whenever they open it.
-      if (onScreenRef.current) navigate(`/c/${data.id}`);
+      if (onScreenRef.current) {
+        navigate(conductorSetup ? `/conductor/${data.id}` : `/c/${data.id}`);
+      }
     } catch {
       returnDraftToUser();
       setCreateError("Couldn't reach the server. Check your connection and try again.");

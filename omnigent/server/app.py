@@ -2167,6 +2167,7 @@ def create_app(
                 conductor_store,
                 memory_providers,
                 conversation_store,
+                agent_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
             ),

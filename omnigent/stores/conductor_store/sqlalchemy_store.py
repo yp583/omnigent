@@ -75,6 +75,7 @@ class SqlAlchemyConductorStore(ConductorStore):
         self,
         user_id: str,
         *,
+        conversation_id: str | None = None,
         memory_provider: str | None = None,
         config: dict[str, Any] | None = None,
     ) -> Conductor | None:
@@ -82,6 +83,8 @@ class SqlAlchemyConductorStore(ConductorStore):
             row = session.get(SqlConductor, (current_workspace_id(), user_id))
             if row is None:
                 return None
+            if conversation_id is not None:
+                row.conversation_id = conversation_id
             if memory_provider is not None:
                 row.memory_provider = memory_provider
             if config is not None:

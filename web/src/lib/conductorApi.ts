@@ -18,6 +18,8 @@ export interface ConductorSession {
   workspace: string | null;
   gitBranch: string | null;
   taskSummary: string | null;
+  agentName: string | null;
+  conductorEligible: boolean;
 }
 
 export interface ConductorDashboard {
@@ -53,6 +55,8 @@ interface SessionWire {
   workspace?: string | null;
   git_branch?: string | null;
   task_summary?: string | null;
+  agent_name?: string | null;
+  conductor_eligible?: boolean;
 }
 
 interface MemoryWire {
@@ -85,6 +89,8 @@ function parseSession(wire: SessionWire): ConductorSession {
     workspace: wire.workspace ?? null,
     gitBranch: wire.git_branch ?? null,
     taskSummary: wire.task_summary ?? null,
+    agentName: wire.agent_name ?? null,
+    conductorEligible: wire.conductor_eligible ?? false,
   };
 }
 

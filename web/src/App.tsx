@@ -1,11 +1,14 @@
 import { lazy, Suspense, type ComponentType } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { useParams } from "@/lib/routing";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { getConductorDashboard } from "@/lib/conductorApi";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
 // beside the component, keeps the route table clean and means no route ships
@@ -63,6 +66,23 @@ const UsagePage = withPageView(
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+
+function ConductorChatRoute({ fallbackPath }: { fallbackPath: string }) {
+  const { conversationId } = useParams<{ conversationId: string }>();
+  const dashboard = useQuery({
+    queryKey: ["conductor", "dashboard"],
+    queryFn: getConductorDashboard,
+  });
+
+  // A legacy or hand-edited deep link must never turn an ordinary transcript
+  // into the Conductor surface. Wait for a fresh invalidated query before
+  // deciding so the just-created dedicated chat does not bounce through setup.
+  if (dashboard.isLoading || dashboard.isFetching) return null;
+  if (dashboard.data?.conductor?.conversationId !== conversationId) {
+    return <Navigate to={fallbackPath} replace />;
+  }
+  return <ChatPage />;
+}
 
 interface AppProps {
   /**
@@ -158,7 +178,10 @@ function App({ basename }: AppProps = {}) {
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route path={`${prefix}/conductor`} element={<ConductorPage />} />
-          <Route path={`${prefix}/conductor/:conversationId`} element={<ChatPage />} />
+          <Route
+            path={`${prefix}/conductor/:conversationId`}
+            element={<ConductorChatRoute fallbackPath={`${prefix}/conductor`} />}
+          />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           {isFeatureEnabled(info, "usage_page") && (
             <Route path={`${prefix}/usage`} element={<UsagePage />} />

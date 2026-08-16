@@ -36,6 +36,8 @@ const session: conductorApi.ConductorSession = {
   workspace: "/repo",
   gitBranch: "feature/onboarding",
   taskSummary: null,
+  agentName: "conductor",
+  conductorEligible: true,
 };
 
 function renderPage() {
@@ -95,11 +97,18 @@ afterEach(() => {
 });
 
 describe("ConductorPage", () => {
-  it("lets the user designate an owned session", async () => {
+  it("only lets the user designate a Conductor-agent session", async () => {
+    const ordinarySession: conductorApi.ConductorSession = {
+      ...session,
+      id: "ordinary-session",
+      title: "Existing work transcript",
+      agentName: "claude-native-ui",
+      conductorEligible: false,
+    };
     vi.mocked(conductorApi.getConductorDashboard).mockResolvedValue({
       conductor: null,
       memoryProviders: ["markdown"],
-      sessions: [session],
+      sessions: [ordinarySession, session],
     });
     vi.mocked(conductorApi.bindConductor).mockResolvedValue({
       conversationId: session.id,
@@ -110,9 +119,25 @@ describe("ConductorPage", () => {
     });
     renderPage();
 
+    expect(screen.queryByRole("button", { name: /Existing work transcript/ })).toBeNull();
     fireEvent.click(await screen.findByRole("button", { name: /Fix onboarding/ }));
     fireEvent.click(screen.getByRole("button", { name: "Make Conductor" }));
     await waitFor(() => expect(conductorApi.bindConductor).toHaveBeenCalledWith(session.id));
+  });
+
+  it("links empty setup directly to a preselected Conductor chat", async () => {
+    vi.mocked(conductorApi.getConductorDashboard).mockResolvedValue({
+      conductor: null,
+      memoryProviders: ["markdown"],
+      sessions: [{ ...session, conductorEligible: false, agentName: "claude-native-ui" }],
+    });
+    renderPage();
+
+    expect(await screen.findByRole("link", { name: "Start Conductor chat" })).toHaveAttribute(
+      "href",
+      "/?agent=conductor&conductorSetup=1",
+    );
+    expect(screen.queryByRole("button", { name: /Fix onboarding/ })).toBeNull();
   });
 
   it("opens the bound Conductor as a chat", async () => {

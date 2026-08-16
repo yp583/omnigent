@@ -83,6 +83,10 @@ export function ConductorPage() {
 
 function ConductorSetup({ sessions }: { sessions: ConductorSession[] }) {
   const queryClient = useQueryClient();
+  const candidates = useMemo(
+    () => sessions.filter((session) => session.conductorEligible),
+    [sessions],
+  );
   const [bindingId, setBindingId] = useState<string | null>(null);
   const mutation = useMutation({
     mutationFn: (conversationId: string) => bindConductor(conversationId),
@@ -99,30 +103,31 @@ function ConductorSetup({ sessions }: { sessions: ConductorSession[] }) {
           Give one session the wider view.
         </h1>
         <p className="mt-6 max-w-xl text-base leading-7 text-muted-foreground">
-          Your Conductor keeps its own transcript and memory, watches the sessions you own, and
-          routes you to work that needs a decision.
+          Your Conductor gets a dedicated transcript and memory, watches the sessions you own, and
+          routes you to work that needs a decision. Existing work chats are never reused.
         </p>
       </div>
 
       <div className="mt-12 border-t">
         <div className="flex items-center justify-between gap-4 py-4">
           <div>
-            <h2 className="text-sm font-semibold">Choose its transcript</h2>
+            <h2 className="text-sm font-semibold">Start its dedicated chat</h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              Use a dedicated session with the agent, model, and host you prefer.
+              Only sessions created with the built-in Conductor agent are eligible.
             </p>
           </div>
           <Button asChild variant="outline" size="sm">
-            <Link to="/">New session</Link>
+            <Link to="/?agent=conductor&conductorSetup=1">Start Conductor chat</Link>
           </Button>
         </div>
-        {sessions.length === 0 ? (
+        {candidates.length === 0 ? (
           <div className="border-y py-10 text-sm text-muted-foreground">
-            Start a session first, then return here to designate it as your Conductor.
+            No dedicated Conductor chat exists yet. Starting one will bind it automatically before
+            its first message is sent.
           </div>
         ) : (
           <div className="divide-y border-y">
-            {sessions.map((session) => (
+            {candidates.map((session) => (
               <button
                 key={session.id}
                 type="button"

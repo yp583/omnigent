@@ -18,6 +18,7 @@ from omnigent.server.schemas import (
     UpdateConductorRequest,
     WriteConductorMemoryRequest,
 )
+from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.conductor_store import ConductorStore
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.memory_store import MemoryConflictError
@@ -25,6 +26,7 @@ from omnigent.stores.permission_store import PermissionStore
 
 CONDUCTOR_LABEL_KEY = "omnigent.conductor"
 CONDUCTOR_LABEL_VALUE = "true"
+CONDUCTOR_AGENT_NAME = "conductor"
 
 
 def _scope_user(user_id: str | None) -> str:
@@ -70,6 +72,7 @@ def create_conductor_router(
     conductor_store: ConductorStore,
     memory_providers: MemoryProviderRegistry,
     conversation_store: ConversationStore,
+    agent_store: AgentStore,
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
@@ -83,10 +86,27 @@ def create_conductor_router(
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
+    def _is_conductor_session(conversation: Conversation | None) -> bool:
+        if (
+            conversation is None
+            or conversation.parent_conversation_id is not None
+            or conversation.agent_id is None
+        ):
+            return False
+        agent = agent_store.get(conversation.agent_id)
+        return agent is not None and agent.name == CONDUCTOR_AGENT_NAME
+
+    def _binding_is_valid(conductor: Conductor | None) -> bool:
+        if conductor is None:
+            return False
+        conversation = conversation_store.get_conversation(conductor.conversation_id)
+        return _is_conductor_session(conversation)
+
     def _load(scope_user: str) -> Conductor:
         conductor = conductor_store.get(scope_user)
-        if conductor is None:
+        if not _binding_is_valid(conductor):
             raise OmnigentError("Conductor is not configured", code=ErrorCode.NOT_FOUND)
+        assert conductor is not None
         return conductor
 
     def _owned_sessions(user_id: str | None, conductor_id: str | None) -> list[dict[str, Any]]:
@@ -99,6 +119,9 @@ def create_conductor_router(
             order="desc",
             sort_by="updated_at",
         )
+        agent_names = agent_store.get_names(
+            list({session.agent_id for session in page.data if session.agent_id is not None})
+        )
         return [
             {
                 "id": session.id,
@@ -110,6 +133,9 @@ def create_conductor_router(
                 "workspace": session.workspace,
                 "git_branch": session.git_branch,
                 "task_summary": session.task_summary,
+                "agent_name": agent_names.get(session.agent_id or ""),
+                "conductor_eligible": agent_names.get(session.agent_id or "")
+                == CONDUCTOR_AGENT_NAME,
             }
             for session in page.data
             if session.id != conductor_id
@@ -139,6 +165,11 @@ def create_conductor_router(
         user_id = require_user(request, auth_provider)
         scope_user = _scope_user(user_id)
         conductor = await asyncio.to_thread(conductor_store.get, scope_user)
+        if conductor is not None and not await asyncio.to_thread(_binding_is_valid, conductor):
+            # Legacy builds allowed any ordinary transcript to be bound. Treat
+            # those rows as unconfigured so the UI cannot route into unrelated
+            # history; PUT repairs the row once a real Conductor chat is made.
+            conductor = None
         sessions = await asyncio.to_thread(
             _owned_sessions,
             user_id,
@@ -162,12 +193,13 @@ def create_conductor_router(
         conversation = await asyncio.to_thread(
             conversation_store.get_conversation, body.conversation_id
         )
-        if (
-            conversation is None
-            or conversation.parent_conversation_id is not None
-            or conversation.agent_id is None
-        ):
+        if conversation is None or conversation.parent_conversation_id is not None:
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        if not await asyncio.to_thread(_is_conductor_session, conversation):
+            raise OmnigentError(
+                "Only a session using the built-in Conductor agent can be made Conductor",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if permission_store is not None:
             owner = await asyncio.to_thread(
                 conversation_store.get_session_owner, body.conversation_id
@@ -182,19 +214,38 @@ def create_conductor_router(
                 raise OmnigentError("Owner permission is required", code=ErrorCode.FORBIDDEN)
         existing = await asyncio.to_thread(conductor_store.get, scope_user)
         if existing is not None:
-            if existing.conversation_id != body.conversation_id:
+            if await asyncio.to_thread(_binding_is_valid, existing):
+                if existing.conversation_id != body.conversation_id:
+                    raise OmnigentError(
+                        "A Conductor is already configured; update it instead of "
+                        "replacing its transcript",
+                        code=ErrorCode.CONFLICT,
+                    )
+                return _conductor_dict(existing)
+            repaired = await asyncio.to_thread(
+                conductor_store.update,
+                scope_user,
+                conversation_id=body.conversation_id,
+                memory_provider=body.memory_provider,
+            )
+            if repaired is None:
                 raise OmnigentError(
-                    "A Conductor is already configured; update it instead of "
-                    "replacing its transcript",
+                    "Conductor binding disappeared during repair",
                     code=ErrorCode.CONFLICT,
                 )
-            return _conductor_dict(existing)
-        conductor = await asyncio.to_thread(
-            conductor_store.create,
-            scope_user,
-            body.conversation_id,
-            memory_provider=body.memory_provider,
-        )
+            await asyncio.to_thread(
+                conversation_store.delete_label,
+                existing.conversation_id,
+                CONDUCTOR_LABEL_KEY,
+            )
+            conductor = repaired
+        else:
+            conductor = await asyncio.to_thread(
+                conductor_store.create,
+                scope_user,
+                body.conversation_id,
+                memory_provider=body.memory_provider,
+            )
         await asyncio.to_thread(
             conversation_store.set_labels,
             body.conversation_id,
