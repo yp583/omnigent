@@ -157,6 +157,19 @@ export async function updateConductorMemoryProvider(
   return parseBinding(wire);
 }
 
+export async function updateConductorConfig(
+  config: Record<string, unknown>,
+): Promise<ConductorBinding> {
+  const wire = await readJson<BindingWire>(
+    await authenticatedFetch("/v1/conductor", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config }),
+    }),
+  );
+  return parseBinding(wire);
+}
+
 export async function listConductorMemory(): Promise<ConductorMemoryDocument[]> {
   const wire = await readJson<{ data: MemoryWire[] }>(
     await authenticatedFetch("/v1/conductor/memory"),

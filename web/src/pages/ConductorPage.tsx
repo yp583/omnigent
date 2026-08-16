@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { PageScroll } from "@/components/PageScroll";
+import { ConductorVoicePanel } from "@/components/ConductorVoicePanel";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -201,7 +202,7 @@ function ConductorWorkspace({
             One operational view across your sessions. Shared sessions stay outside this scope.
           </p>
         </div>
-        <div className="flex items-center gap-2 self-start sm:self-auto">
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
           <span className="sr-only" id="memory-provider-label">
             Memory provider
           </span>
@@ -221,6 +222,11 @@ function ConductorWorkspace({
               ))}
             </SelectContent>
           </Select>
+          <ConductorVoicePanel
+            conversationId={dashboard.conductor!.conversationId}
+            config={dashboard.conductor!.config}
+            onConfigUpdated={() => void queryClient.invalidateQueries({ queryKey: DASHBOARD_KEY })}
+          />
           <Button asChild variant="outline">
             <Link to={`/c/${dashboard.conductor!.conversationId}`}>
               Open transcript <ArrowUpRightIcon className="size-4" />

@@ -64,11 +64,28 @@ The initial setup intentionally asks the user to choose a dedicated transcript.
 The shipped Conductor agent is available in the new-session picker and is the
 recommended choice.
 
-## Mobile voice follow-up
+## Mobile voice
 
 Voice is isolated on `personal/mobile-conductor-voice` and should land only
-after this core passes human testing. Its contract is foreground conversation
-with replaceable realtime or STT → LLM → TTS providers, explicit tap-to-approve
-cards for consequential actions, and push notifications for ready PRs or blocked
-sessions. Voice does not widen Conductor authorization and does not execute a
-sensitive approval from speech alone.
+after this core passes human testing. The first registered provider is the
+session pipeline: the existing browser/server dictation path supplies STT, a
+normal visible message runs through the active Conductor transcript, and the
+device supplies TTS. The web layer owns a small provider interface so a future
+realtime provider can replace that route without changing the panel or the
+Conductor authorization boundary. Voice preferences live under `config.voice`
+and do not affect the selected memory provider.
+
+The foreground panel is push-to-talk and review-before-send. Even an ordinary
+dictated turn requires a Send tap. Requests that mention merge, deploy,
+deletion, production, permissions, or approval get an additional warning;
+speech never submits a runner elicitation. The Conductor's agent prompt treats
+`[Voice request]` messages as spoken output and responds in short, listenable
+sentences while directing consequential work back to on-screen approval cards.
+
+iOS uses `AVSpeechSynthesizer`, Android uses `TextToSpeech`, and older native
+shells fall back to the Web Speech API. Closing the panel cancels response
+polling and active speech. The existing native notification path continues to
+surface session completion and blocked/elicitation transitions while the app is
+running. True background APNs/FCM delivery and proactive mobile PR polling need
+device-token registration plus a deployment-owned push provider; they are not
+silently represented as working by this foreground branch.

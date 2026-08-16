@@ -4,6 +4,7 @@ import {
   bindConductor,
   getConductorDashboard,
   readConductorMemory,
+  updateConductorConfig,
   updateConductorMemoryProvider,
   writeConductorMemory,
 } from "./conductorApi";
@@ -94,6 +95,24 @@ describe("Conductor API", () => {
     expect(url).toBe("/v1/conductor");
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body as string)).toEqual({ memory_provider: "files" });
+  });
+
+  it("persists provider-neutral Conductor settings", async () => {
+    fetchMock.mockResolvedValueOnce(
+      response({
+        conversation_id: "session-1",
+        memory_provider: "markdown",
+        config: { voice: { provider: "session-pipeline", speakReplies: false } },
+        created_at: 10,
+      }),
+    );
+
+    const config = { voice: { provider: "session-pipeline", speakReplies: false } };
+    await updateConductorConfig(config);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/conductor");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({ config });
   });
 
   it("round-trips encoded paths and optimistic revisions", async () => {
