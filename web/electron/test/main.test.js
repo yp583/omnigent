@@ -230,25 +230,25 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     );
   });
 
-  it("scans second-instance argv for omnigent:// and enqueues as live code", () => {
+  it("scans second-instance argv for this build's deep-link prefix", () => {
     assert.match(
       liveCode,
-      /app\.on\("second-instance"[\s\S]{0,220}startsWith\("omnigent:\/\/"\)[\s\S]{0,60}enqueueDeepLink\(/,
+      /app\.on\("second-instance"[\s\S]{0,220}startsWith\(DEEP_LINK_PREFIX\)[\s\S]{0,60}enqueueDeepLink\(/,
       [
-        "main.js no longer scans second-instance argv for omnigent://. Windows/Linux",
+        "main.js no longer scans second-instance argv for the build's deep-link prefix. Windows/Linux",
         "warm-start deep links (a second launch funneled by the single-instance lock)",
         "would be ignored. Restore the argv scan → enqueueDeepLink inside second-instance.",
       ].join(" "),
     );
   });
 
-  it("registers the omnigent:// scheme as live code", () => {
+  it("registers a build-specific scheme as live code", () => {
     assert.match(
       liveCode,
-      /setAsDefaultProtocolClient\("omnigent"\)/,
+      /setAsDefaultProtocolClient\(PERSONAL_BUILD \? "omnigent-personal" : "omnigent"\)/,
       [
-        "main.js no longer calls app.setAsDefaultProtocolClient('omnigent'), so dev",
-        "(`electron .`) clicks on an omnigent:// link won't route to the running dev",
+        "main.js no longer calls app.setAsDefaultProtocolClient with the build-specific scheme, so dev",
+        "(`electron .`) clicks on a session link won't route to the running dev",
         "instance. The packaged build's manifest registration is separate (package.json",
         "build.protocols). Restore the runtime call.",
       ].join(" "),

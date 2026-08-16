@@ -174,6 +174,7 @@ import {
   readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
+  sortByCreatedAtDesc,
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
@@ -1077,8 +1078,6 @@ function ProjectFolder({
   marker,
   onToggleCollapsed,
   pinnedConversationIds,
-  activeOverride,
-  frozenSortKeys,
   scrollRoot,
   onRowClick,
   onTogglePinned,
@@ -1101,10 +1100,6 @@ function ProjectFolder({
   marker: SessionState | null;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
-  activeOverride: ActiveChatOverride | null;
-  /** Pointer-inside sort-key freeze shared with the flat list (see
-      ConversationList); null while the pointer is outside the list. */
-  frozenSortKeys: Map<string, number> | null;
   scrollRoot: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
@@ -1130,12 +1125,8 @@ function ProjectFolder({
     for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pinned sessions live in the global Pinned section, not their folder.
-    return sortByUpdatedAtDesc(
-      [...byId.values()].filter((c) => !pinnedSet.has(c.id)),
-      activeOverride,
-      frozenSortKeys,
-    );
-  }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
+    return sortByCreatedAtDesc([...byId.values()].filter((c) => !pinnedSet.has(c.id)));
+  }, [query.data, windowConversations, pinnedSet]);
 
   // Publish the folder's rendered rows upward so projects-scope bulk selection
   // resolves them (the parent sources its action set from these, not the global
@@ -1457,7 +1448,7 @@ function ConversationList({
         return {
           id,
           name,
-          conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+          conversations: sortByCreatedAtDesc(inProject),
         };
       });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
@@ -1467,11 +1458,14 @@ function ConversationList({
     // rather than hiding it (matches the target sidebar layout).
 
     // Sessions: the remainder — not pinned, not filed.
-    const sessions = sortByUpdatedAtDesc(
-      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
-      activeOverride,
-      frozenKeys,
-    );
+    const unfiledSessions = tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id));
+    // My/All sessions follow immutable creation time. Shared and Archived
+    // retain their activity-oriented ordering because those views are used as
+    // inbox/history surfaces rather than the primary workspace navigator.
+    const sessions =
+      activeTab === "shared" || activeTab === "archived"
+        ? sortByUpdatedAtDesc(unfiledSessions, activeOverride, frozenKeys)
+        : sortByCreatedAtDesc(unfiledSessions);
     return { pinned, sessions, projectGroups };
   }, [
     allConversations,
@@ -1601,7 +1595,8 @@ function ConversationList({
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
+      | { label?: string; project?: string | null; isPinned?: boolean }
+      | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
@@ -1950,8 +1945,6 @@ function ConversationList({
                       marker={projectMarkerState(group.conversations)}
                       onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                       pinnedConversationIds={pinnedConversationIds}
-                      activeOverride={activeOverride}
-                      frozenSortKeys={frozenKeys}
                       scrollRoot={scrollContainerRef}
                       onRowClick={onRowClick}
                       onTogglePinned={onTogglePinned}

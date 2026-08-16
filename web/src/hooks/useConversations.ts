@@ -345,12 +345,11 @@ async function fetchConversationsPage({
   includeArchived: boolean;
   project?: string;
 }): Promise<ConversationsPage> {
-  // `updated_at` matches the sidebar's sort, which keeps server
-  // pagination consistent with the visible order as the user scrolls.
-  // See sidebarNav.ts.
+  // Creation order is intentionally stable: streaming and background agent
+  // activity must not move rows while the user is navigating the sidebar.
   const params = new URLSearchParams({
     order: "desc",
-    sort_by: "updated_at",
+    sort_by: "created_at",
     limit: "30",
   });
   if (after) params.set("after", after);
@@ -1734,7 +1733,7 @@ async function fetchProjectSessionsPage(
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
-    sort_by: "updated_at",
+    sort_by: "created_at",
     limit: String(limit),
     project,
   });
@@ -1751,7 +1750,7 @@ async function fetchProjectSessionsPage(
  * excluded (they leave the active sidebar). `enabled` gates the fetch so a
  * collapsed folder costs nothing — pass the folder's expanded state.
  *
- * Same page size (20) and sort (`updated_at desc`) as the global list, so a
+ * Same page size (20) and sort (`created_at desc`) as the global list, so a
  * folder paginates independently with its own infinite-scroll sentinel.
  */
 export function useProjectSessions(project: string, enabled: boolean) {

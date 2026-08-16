@@ -1,8 +1,8 @@
 {
   "name": "omnigent-desktop-electron",
-  "productName": "Omnigent",
+  "productName": "Omnigent Personal",
   "version": "0.10.0-dev.0",
-  "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
+  "description": "Isolated personal Omnigent desktop client with a locally packaged frontend.",
   "private": true,
   "main": "src/main.js",
   "homepage": "https://omnigent.ai",
@@ -24,36 +24,31 @@
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win",
     "build:overlay": "pnpm --filter web run build:overlay",
-    "predev": "pnpm run build:overlay",
-    "prestart": "pnpm run build:overlay",
-    "prebuild": "pnpm run build:overlay",
-    "prebuild:mac": "pnpm run build:overlay",
-    "prebuild:mac:release": "pnpm run build:overlay",
-    "prebuild:linux": "pnpm run build:overlay",
-    "prebuild:win": "pnpm run build:overlay"
+    "predev": "pnpm run build:web && pnpm run build:overlay",
+    "prestart": "pnpm run build:web && pnpm run build:overlay",
+    "build:web": "pnpm --filter web run build",
+    "prebuild": "pnpm run build:web && pnpm run build:overlay",
+    "prebuild:mac": "pnpm run build:web && pnpm run build:overlay",
+    "prebuild:mac:release": "pnpm run build:web && pnpm run build:overlay",
+    "prebuild:linux": "pnpm run build:web && pnpm run build:overlay",
+    "prebuild:win": "pnpm run build:web && pnpm run build:overlay"
   },
   "devDependencies": {
     "electron": "^42.3.2",
     "electron-builder": "^26.0.0"
   },
   "build": {
-    "appId": "ai.omnigent.desktop",
-    "productName": "Omnigent",
+    "appId": "ai.omnigent.desktop.personal",
+    "productName": "Omnigent Personal",
     "directories": {
       "output": "dist"
     },
     "protocols": [
       {
-        "name": "Omnigent session link",
+        "name": "Omnigent Personal session link",
         "schemes": [
-          "omnigent"
+          "omnigent-personal"
         ]
-      }
-    ],
-    "publish": [
-      {
-        "provider": "generic",
-        "url": "https://omnigent.ai/_desktop/updates/"
       }
     ],
     "afterPack": "build/afterPack.js",
@@ -71,13 +66,20 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "../../omnigent/server/static/web-ui",
+        "to": "web-ui",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icons/icon.icns",
       "artifactName": "${productName}-${version}-${arch}-mac.${ext}",
-      "identity": "Databricks, Inc. (8RMX4WU6F8)",
+      "identity": null,
       "hardenedRuntime": true,
       "entitlements": "signing/entitlements.mac.plist",
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
@@ -101,12 +103,6 @@
             "x64",
             "arm64"
           ]
-        }
-      ],
-      "publish": [
-        {
-          "provider": "generic",
-          "url": "https://omnigent.ai/_desktop/updates/"
         }
       ]
     },
@@ -138,29 +134,18 @@
       "target": [
         "AppImage",
         "deb"
-      ],
-      "publish": [
-        {
-          "provider": "generic",
-          "url": "https://omnigent.ai/_desktop/updates/"
-        }
       ]
     },
     "win": {
       "icon": "icons/icon.ico",
       "target": [
         "nsis"
-      ],
-      "publish": [
-        {
-          "provider": "generic",
-          "url": "https://omnigent.ai/_desktop/updates/"
-        }
       ]
     }
   },
   "dependencies": {
     "electron-updater": "^6.3.9",
+    "http-proxy": "^1.18.1",
     "js-yaml": "^4.3.0"
   }
 }

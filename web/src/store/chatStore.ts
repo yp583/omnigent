@@ -4277,24 +4277,48 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
   });
 }
 
-/** Append live output to the matching in-progress tool execution. */
-function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): void {
-  set((s) => {
-    const at = s.blocks.findIndex(
-      (b): b is ToolGroup =>
-        b.type === "tool_group" && b.executions.some((execution) => execution.callId === callId),
+/** Apply all native preview deltas collected during one animation frame. */
+function applyLiveDeltaBatch(
+  blocks: AnyBlock[],
+  activeResponse: ActiveResponse | null,
+  textDeltas: ReadonlyMap<string, string>,
+  toolDeltas: ReadonlyMap<string, string>,
+): AnyBlock[] {
+  let next = blocks;
+  for (const [messageId, delta] of textDeltas) {
+    const itemId = LIVE_ITEM_PREFIX + messageId;
+    const at = next.findIndex((block) => block.ctx.itemId === itemId);
+    if (at === -1) {
+      const responseId = activeResponse?.state === "streaming" ? activeResponse.responseId : itemId;
+      next = [...next, makeLiveTextBlock(itemId, delta, responseId)];
+      continue;
+    }
+    const existing = next[at]!;
+    if (existing.type !== "text_done") continue;
+    const fullText = existing.fullText + delta;
+    const updated = next.slice();
+    updated[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
+    next = updated;
+  }
+
+  for (const [callId, delta] of toolDeltas) {
+    const at = next.findIndex(
+      (block): block is ToolGroup =>
+        block.type === "tool_group" &&
+        block.executions.some((execution) => execution.callId === callId),
     );
-    if (at === -1) return {};
-    const group = s.blocks[at] as ToolGroup;
+    if (at === -1) continue;
+    const group = next[at] as ToolGroup;
     const executions = group.executions.map((execution) =>
       execution.callId === callId
         ? { ...execution, output: (execution.output ?? "") + delta }
         : execution,
     );
-    const next = s.blocks.slice();
-    next[at] = { ...group, executions };
-    return { blocks: next };
-  });
+    const updated = next.slice();
+    updated[at] = { ...group, executions };
+    next = updated;
+  }
+  return next;
 }
 
 /**
@@ -4342,6 +4366,8 @@ async function* tapLiveDeltas(
   events: AsyncIterable<StreamEvent>,
   id: string,
   ignored: Set<string>,
+  onTextDelta: (messageId: string, delta: string) => void,
+  onToolOutputDelta: (callId: string, delta: string) => void,
   set: Setter,
   get: Getter,
 ): AsyncIterable<StreamEvent> {
@@ -4358,14 +4384,14 @@ async function* tapLiveDeltas(
           ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.delta);
+        onTextDelta(ev.messageId, ev.delta);
       }
       continue;
     }
     if (ev.type === "tool_output_delta") {
       if (!isConversationDisposed(id) && !isStaleCompletedResponse(get())) {
         reviveStrayCompletedResponse(set);
-        applyLiveToolOutputDelta(set, ev.callId, ev.delta);
+        onToolOutputDelta(ev.callId, ev.delta);
       }
       continue;
     }
@@ -4469,16 +4495,17 @@ export async function pumpStreamEvents(
   // A scheduled wake can stream before its new turn id arrives. Ignore the
   // rest of that message so it cannot attach to the completed prior turn.
   const ignoredWakeMessages = new Set<string>();
-  const events = tapLiveDeltas(tapSessionEvents(rawEvents, id), id, ignoredWakeMessages, set, get);
-
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
   // (one SSE connection); bounded by item count like `blocks` itself.
   const buffer: AnyBlock[] = [];
   const seenItemIds = new Set<string>();
+  const liveTextDeltas = new Map<string, string>();
+  const liveToolDeltas = new Map<string, string>();
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
   let paintedFirstContent = false;
+  let paintedFirstLiveContent = false;
 
   // Drain the buffer (+ optional trailing block) into one `blocks` append,
   // applying any sidecar state in the same commit. No-ops if switched away.
@@ -4486,15 +4513,28 @@ export async function pumpStreamEvents(
     scheduler.cancel();
     if (isConversationDisposed(id)) {
       buffer.length = 0;
+      liveTextDeltas.clear();
+      liveToolDeltas.clear();
       return;
     }
     const batch = trailing !== undefined ? [...buffer, trailing] : [...buffer];
     buffer.length = 0;
-    if (batch.length === 0) {
+    const textDeltas = new Map(liveTextDeltas);
+    const toolDeltas = new Map(liveToolDeltas);
+    liveTextDeltas.clear();
+    liveToolDeltas.clear();
+    const hasLiveDeltas = textDeltas.size > 0 || toolDeltas.size > 0;
+    if (batch.length === 0 && !hasLiveDeltas) {
       if (extra !== undefined) set(extra);
       return;
     }
     set((s) => {
+      const withLiveDeltas = applyLiveDeltaBatch(
+        s.blocks,
+        s.activeResponse,
+        textDeltas,
+        toolDeltas,
+      );
       // Re-check itemIds at commit time: a snapshot merge can insert an
       // item while it sits in this buffer (merges read only state.blocks),
       // and appending the buffered copy would double-render it. ItemId-less
@@ -4502,7 +4542,7 @@ export async function pumpStreamEvents(
       let fresh = batch;
       if (batch.some((b) => b.ctx.itemId)) {
         const committed = new Set(
-          s.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+          withLiveDeltas.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
         );
         fresh = batch.filter((b) => !b.ctx.itemId || !committed.has(b.ctx.itemId));
       }
@@ -4512,7 +4552,7 @@ export async function pumpStreamEvents(
       // buffer.
       if (fresh.some((b) => b.type === "elicitation")) {
         const committedElicitations = new Set(
-          s.blocks
+          withLiveDeltas
             .filter((b): b is ElicitationBlock => b.type === "elicitation")
             .map((b) => b.elicitationId),
         );
@@ -4520,10 +4560,40 @@ export async function pumpStreamEvents(
           (b) => b.type !== "elicitation" || !committedElicitations.has(b.elicitationId),
         );
       }
-      if (fresh.length === 0) return extra ?? {};
-      return { ...(extra ?? {}), blocks: [...s.blocks, ...fresh] };
+      if (fresh.length === 0 && withLiveDeltas === s.blocks) return extra ?? {};
+      return { ...(extra ?? {}), blocks: [...withLiveDeltas, ...fresh] };
     });
   };
+
+  const queueLiveTextDelta = (messageId: string, delta: string): void => {
+    // Preserve instant first-token feedback, then collapse the hot token path
+    // to at most one immutable blocks update per animation frame.
+    if (!paintedFirstLiveContent) {
+      paintedFirstLiveContent = true;
+      applyLiveDelta(set, messageId, delta);
+      return;
+    }
+    liveTextDeltas.set(messageId, (liveTextDeltas.get(messageId) ?? "") + delta);
+    scheduler.schedule(() => flush());
+  };
+
+  const queueLiveToolDelta = (callId: string, delta: string): void => {
+    // A tool card can itself still be waiting in the reducer buffer. Land it
+    // before its first output delta so the frame update has a target.
+    if (buffer.length > 0) flush();
+    liveToolDeltas.set(callId, (liveToolDeltas.get(callId) ?? "") + delta);
+    scheduler.schedule(() => flush());
+  };
+
+  const events = tapLiveDeltas(
+    tapSessionEvents(rawEvents, id),
+    id,
+    ignoredWakeMessages,
+    queueLiveTextDelta,
+    queueLiveToolDelta,
+    set,
+    get,
+  );
 
   try {
     for await (const block of stream.reduce(events)) {
@@ -4534,6 +4604,7 @@ export async function pumpStreamEvents(
         // New response: force-flush whatever is buffered, then land the
         // marker + lifecycle in one commit. Reset the first-paint latch.
         paintedFirstContent = false;
+        paintedFirstLiveContent = false;
         flush(block, {
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
@@ -4555,6 +4626,9 @@ export async function pumpStreamEvents(
         (seenItemIds.has(block.ctx.itemId) ||
           get().blocks.some((b) => b.ctx.itemId === block.ctx.itemId))
       ) {
+        // A queued native tail must be visible before deciding whether its
+        // provisional block should be replaced by this authoritative item.
+        flush();
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
           flush();
@@ -4638,6 +4712,7 @@ export async function pumpStreamEvents(
       }
 
       if (block.type === "text_done" && get().isNativeTerminalSession) {
+        flush();
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
           // The done item has no message id. Native messages are sequential,
@@ -4736,6 +4811,8 @@ export async function pumpStreamEvents(
     // not here — it must survive across reconnect attempts.
     scheduler.cancel();
     buffer.length = 0;
+    liveTextDeltas.clear();
+    liveToolDeltas.clear();
   }
 }
 

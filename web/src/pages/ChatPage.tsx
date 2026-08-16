@@ -65,6 +65,7 @@ import { useAppName } from "@/lib/branding";
 import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { PullRequestStrip } from "@/pages/PullRequestStrip";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
@@ -75,6 +76,7 @@ import {
   onNativeViewModeChanged,
   setNativeServerSwitcherHidden,
   setNativeViewMode,
+  supportsPullRequestTracking,
 } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
@@ -139,7 +141,7 @@ import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
 export type { MentionItem, MentionState };
-import { useSession } from "@/hooks/useSession";
+import { useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
@@ -680,6 +682,62 @@ function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }
 
 const sessionDrafts = loadDraftsFromStorage();
 
+// Returning to a recently viewed session should not remount and syntax-highlight
+// every offscreen bubble. We only enable content skipping after a bubble has
+// been measured once, so its exact cached height keeps scroll geometry stable.
+const measuredBubbleHeights = new Map<string, number>();
+const MAX_MEASURED_BUBBLES = 2_000;
+
+function TranscriptBubbleShell({
+  cacheKey,
+  settled,
+  children,
+}: {
+  cacheKey: string;
+  settled: boolean;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const cachedHeight = measuredBubbleHeights.get(cacheKey);
+
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const rememberHeight = () => {
+      const height = Math.ceil(element.getBoundingClientRect().height);
+      if (height <= 0) return;
+      measuredBubbleHeights.delete(cacheKey);
+      measuredBubbleHeights.set(cacheKey, height);
+      while (measuredBubbleHeights.size > MAX_MEASURED_BUBBLES) {
+        const oldest = measuredBubbleHeights.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        measuredBubbleHeights.delete(oldest);
+      }
+    };
+    rememberHeight();
+    const observer = new ResizeObserver(rememberHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [cacheKey]);
+
+  return (
+    <div
+      ref={ref}
+      className={cn(
+        "chat-bubble-shell",
+        settled && cachedHeight !== undefined && "chat-bubble-shell-cached",
+      )}
+      style={
+        cachedHeight === undefined
+          ? undefined
+          : ({ "--chat-bubble-height": `${cachedHeight}px` } as React.CSSProperties)
+      }
+    >
+      {children}
+    </div>
+  );
+}
+
 /**
  * Single component that drives the chat surface. Streaming + history
  * state lives in `useChatStore` (a Zustand store at module scope), so
@@ -999,6 +1057,7 @@ export function ChatPage() {
   // the hook is skipped on renders that hit the loading/error branches,
   // tripping React's "rendered fewer hooks than expected".
   const { session: activeSession, isLoading: sessionLoading } = useSession(urlConvId ?? null);
+  const sessionTreeRootId = useRootSessionId(urlConvId ?? null, activeSession?.parentSessionId);
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check. An
@@ -1308,6 +1367,7 @@ export function ChatPage() {
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
       wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
+      sessionTreeRootId={sessionTreeRootId ?? urlConvId ?? null}
     />
   );
 
@@ -1384,15 +1444,83 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
   );
 }
 
-function SelectionPopup({
+interface SelectionPopupPosition {
+  x: number;
+  y: number;
+  side: "above" | "below";
+}
+
+/**
+ * Return the document-order direction of a browser selection.
+ *
+ * Ranges are always normalized from start to end, so the selection's anchor
+ * and focus are the only reliable way to tell which end the user dragged
+ * toward. Keeping that direction lets the action bar follow the release end
+ * instead of jumping to the top-center of a multi-line selection.
+ */
+export function isBackwardSelection(selection: Selection): boolean {
+  const anchor = selection.anchorNode;
+  const focus = selection.focusNode;
+  if (!anchor || !focus) return false;
+  if (anchor === focus) return selection.anchorOffset > selection.focusOffset;
+
+  const anchorPoint = document.createRange();
+  const focusPoint = document.createRange();
+  try {
+    anchorPoint.setStart(anchor, selection.anchorOffset);
+    anchorPoint.collapse(true);
+    focusPoint.setStart(focus, selection.focusOffset);
+    focusPoint.collapse(true);
+    return anchorPoint.compareBoundaryPoints(Range.START_TO_START, focusPoint) > 0;
+  } catch {
+    // A selection can briefly reference detached nodes while streamed content
+    // is reconciling. Treat that transient state as forward; the next
+    // selectionchange will recompute it against the live DOM.
+    return false;
+  }
+}
+
+function selectionPopupPosition(selection: Selection): SelectionPopupPosition | null {
+  if (selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  const rects = Array.from(range.getClientRects()).filter(
+    (rect) => rect.width > 0 || rect.height > 0,
+  );
+  const fallback = range.getBoundingClientRect();
+  if (rects.length === 0 && fallback.width === 0 && fallback.height === 0) return null;
+
+  const backward = isBackwardSelection(selection);
+  const rect = rects.length > 0 ? (backward ? rects[0]! : rects[rects.length - 1]!) : fallback;
+  const edgePadding = 76;
+  const x = Math.min(
+    Math.max(backward ? rect.left : rect.right, edgePadding),
+    Math.max(edgePadding, window.innerWidth - edgePadding),
+  );
+  let side: SelectionPopupPosition["side"] = backward ? "above" : "below";
+  // Keep the controls in the viewport when a selection ends at either edge.
+  if (side === "above" && rect.top < 44) side = "below";
+  if (side === "below" && window.innerHeight - rect.bottom < 44) side = "above";
+
+  return {
+    x,
+    y: side === "above" ? rect.top : rect.bottom,
+    side,
+  };
+}
+
+export function SelectionPopup({
   containerRef,
   onReply,
 }: {
   containerRef: React.RefObject<HTMLElement | null>;
   onReply: (text: string) => void;
 }) {
-  const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
+  const [popupPos, setPopupPos] = useState<SelectionPopupPosition | null>(null);
+  const [copied, setCopied] = useState(false);
   const selectedTextRef = useRef<string>("");
+  const pointerSelectingRef = useRef(false);
+  const updateFrameRef = useRef<number>(0);
+  const copiedTimerRef = useRef<number>(0);
 
   const updatePopup = useCallback(() => {
     const sel = window.getSelection();
@@ -1417,51 +1545,111 @@ function SelectionPopup({
       return;
     }
     const anchor = sel.anchorNode;
-    if (!anchor || !container.contains(anchor)) {
+    const focus = sel.focusNode;
+    if (!anchor || !focus || !container.contains(anchor) || !container.contains(focus)) {
       setPopupPos(null);
       selectedTextRef.current = "";
       return;
     }
 
-    const range = sel.getRangeAt(0);
-    const rect = range.getBoundingClientRect();
-    // Position the button just above the selection, horizontally centered.
-    setPopupPos({
-      x: rect.left + rect.width / 2,
-      y: rect.top,
-    });
+    const position = selectionPopupPosition(sel);
+    if (!position) {
+      setPopupPos(null);
+      selectedTextRef.current = "";
+      return;
+    }
+
+    setCopied(false);
+    setPopupPos(position);
     selectedTextRef.current = text;
   }, [containerRef]);
 
   useEffect(() => {
-    document.addEventListener("mouseup", updatePopup);
-    document.addEventListener("selectionchange", updatePopup);
-    return () => {
-      document.removeEventListener("mouseup", updatePopup);
-      document.removeEventListener("selectionchange", updatePopup);
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      const container = containerRef.current;
+      if (!container || !(event.target instanceof Node) || !container.contains(event.target)) {
+        return;
+      }
+      pointerSelectingRef.current = true;
+      setPopupPos(null);
+      setCopied(false);
     };
-  }, [updatePopup]);
+    const finishPointerSelection = () => {
+      if (!pointerSelectingRef.current) return;
+      pointerSelectingRef.current = false;
+      cancelAnimationFrame(updateFrameRef.current);
+      // Let Chromium commit the final anchor/focus before measuring. Most
+      // importantly, no toolbar exists while a bottom-to-top drag is active.
+      updateFrameRef.current = requestAnimationFrame(updatePopup);
+    };
+    const onSelectionChange = () => {
+      if (pointerSelectingRef.current) return;
+      updatePopup();
+    };
+
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("pointerup", finishPointerSelection);
+    document.addEventListener("pointercancel", finishPointerSelection);
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("pointerup", finishPointerSelection);
+      document.removeEventListener("pointercancel", finishPointerSelection);
+      document.removeEventListener("selectionchange", onSelectionChange);
+      cancelAnimationFrame(updateFrameRef.current);
+      window.clearTimeout(copiedTimerRef.current);
+    };
+  }, [containerRef, updatePopup]);
 
   if (!popupPos) return null;
 
   return (
     <div
+      role="toolbar"
+      aria-label="Selected text actions"
+      className="flex items-center gap-0.5 rounded-lg border border-border/80 bg-popover p-1 text-popover-foreground shadow-lg"
       style={{
         position: "fixed",
-        // Translate left by 50% to center the button over the midpoint of the
-        // selection, and up by 100% + 6px to sit just above the selection rect.
         left: popupPos.x,
-        top: popupPos.y,
-        transform: "translate(-50%, calc(-100% - 6px))",
+        top: popupPos.side === "above" ? popupPos.y - 7 : popupPos.y + 7,
+        transform: popupPos.side === "above" ? "translate(-50%, -100%)" : "translate(-50%, 0)",
         zIndex: 50,
       }}
     >
       <Button
         type="button"
-        variant="secondary"
+        variant="ghost"
         size="sm"
-        // Override shared-variant translucent hover — this button floats over text.
-        className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
+        className="h-7 gap-1.5 px-2 text-xs"
+        onMouseDown={(e) => {
+          // Prevent the mousedown from clearing the selection before we read it.
+          e.preventDefault();
+        }}
+        onClick={() => {
+          const text = selectedTextRef.current;
+          if (!text) return;
+          void copyText(text)
+            .then(() => {
+              setCopied(true);
+              window.clearTimeout(copiedTimerRef.current);
+              copiedTimerRef.current = window.setTimeout(() => setCopied(false), 1500);
+            })
+            .catch(() => {
+              showToast(<span className="text-ui">Couldn&apos;t copy selected text</span>);
+            });
+        }}
+        aria-label="Copy selected text"
+      >
+        {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+        {copied ? "Copied" : "Copy"}
+      </Button>
+      <div aria-hidden="true" className="h-4 w-px bg-border" />
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1.5 px-2 text-xs"
         onMouseDown={(e) => {
           // Prevent the mousedown from clearing the selection before we read it.
           e.preventDefault();
@@ -1475,9 +1663,10 @@ function SelectionPopup({
             selectedTextRef.current = "";
           }
         }}
+        aria-label="Quote selected text in reply"
       >
         <CornerUpLeftIcon className="size-3.5" />
-        Reply ↵
+        Quote
       </Button>
     </div>
   );
@@ -1558,6 +1747,8 @@ interface MainAgentSurfaceProps {
   subAgentLabel: string | null;
   /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
   wrapperLabel: string | null;
+  /** Root of the current session tree, used to aggregate PRs across child agents. */
+  sessionTreeRootId: string | null;
 }
 
 /**
@@ -1689,6 +1880,7 @@ function MainAgentSurface({
   subagentRoutingEligible,
   subAgentLabel,
   wrapperLabel,
+  sessionTreeRootId,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
@@ -2057,14 +2249,23 @@ function MainAgentSurface({
                   <>
                     {/* Older pages prepend here while their request is in flight. */}
                     {loadingMoreHistory && <HistoryLoadingIndicator />}
-                    {streamBubbles.map((bubble, bubbleIndex) => (
-                      <BubbleView
-                        key={bubbleKey(bubble)}
-                        bubble={bubble}
-                        isLastAssistant={bubbleIndex === lastAssistantIndex}
-                        showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
-                      />
-                    ))}
+                    {streamBubbles.map((bubble, bubbleIndex) => {
+                      const key = bubbleKey(bubble);
+                      const isLiveAssistant = showsWorking && bubbleIndex === lastAssistantIndex;
+                      return (
+                        <TranscriptBubbleShell
+                          key={key}
+                          cacheKey={`${conversationId}:${key}`}
+                          settled={!isLiveAssistant && bubble.kind !== "compaction_loading"}
+                        >
+                          <BubbleView
+                            bubble={bubble}
+                            isLastAssistant={bubbleIndex === lastAssistantIndex}
+                            showsWorking={isLiveAssistant}
+                          />
+                        </TranscriptBubbleShell>
+                      );
+                    })}
                     {/* Pending elicitation cards, floated to the bottom of the
                     chat so an outstanding question stays in view (stick-to-
                     bottom) no matter how much text the agent streamed after
@@ -2204,6 +2405,7 @@ function MainAgentSurface({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
+            sessionTreeRootId={sessionTreeRootId ?? conversationId}
           />
 
           {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
@@ -4035,6 +4237,8 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
+  /** Top-level session whose local workspace tree contributes PRs. */
+  sessionTreeRootId?: string | null;
 }
 
 /**
@@ -4441,6 +4645,7 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
+  sessionTreeRootId = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -5281,6 +5486,12 @@ export function Composer({
           }
         }}
       />
+      {supportsPullRequestTracking() ? (
+        <PullRequestStrip
+          rootSessionId={sessionTreeRootId ?? conversationId}
+          widthClassName={CHAT_COLUMN_WIDTH}
+        />
+      ) : null}
       {/* Queued messages — peeks above the card like the sub-agent tray.
           Lists follow-ups held while the agent is busy; drains FIFO on idle.
           Scope to this conversation so a queue held elsewhere never leaks in. */}

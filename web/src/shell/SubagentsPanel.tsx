@@ -14,7 +14,7 @@
 // Each row is a Link to the target conversation page so cmd/middle-
 // click opens it in a new tab, matching the sidebar's behavior.
 
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { ComponentType, SVGProps } from "react";
 import {
   BookOpenIcon,
@@ -114,10 +114,29 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const { children, isLoading, error } = useChildSessions(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
   const toggleCollapsedRow = (id: string) => {
     setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
   };
+  const { activeChildren, settledChildren } = useMemo(() => {
+    const active: { child: ChildSessionInfo; index: number }[] = [];
+    const settled: ChildSessionInfo[] = [];
+    children.forEach((child, index) => {
+      if (SETTLED_STATE[childStatus(child).activity]) settled.push(child);
+      else active.push({ child, index });
+    });
+    active.sort(
+      (a, b) =>
+        ACTIVE_PRIORITY[childStatus(a.child).activity] -
+          ACTIVE_PRIORITY[childStatus(b.child).activity] || a.index - b.index,
+    );
+    return { activeChildren: active.map(({ child }) => child), settledChildren: settled };
+  }, [children]);
+
+  useEffect(() => {
+    if (settledChildren.some((child) => child.id === conversationId)) setHistoryOpen(true);
+  }, [conversationId, settledChildren]);
 
   // Loading/error states only surface when there's no cached data to
   // show alongside the "main" row.
@@ -167,7 +186,12 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       </button>
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child) => (
+        {activeChildren.length > 0 && (
+          <li className="px-2.5 pt-2 pb-1 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+            Active · {activeChildren.length}
+          </li>
+        )}
+        {activeChildren.map((child) => (
           <SubagentRow
             key={child.id}
             child={child}
@@ -177,6 +201,41 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             onToggleCollapsed={toggleCollapsedRow}
           />
         ))}
+        {settledChildren.length > 0 && (
+          <li>
+            <button
+              type="button"
+              data-testid="subagent-history-toggle"
+              aria-expanded={historyOpen}
+              onClick={() => setHistoryOpen((open) => !open)}
+              className="flex w-full items-center gap-1.5 border-t px-2.5 py-2 text-left text-xs font-medium text-muted-foreground hover:bg-accent/60 hover:text-foreground"
+            >
+              {historyOpen ? (
+                <ChevronDownIcon aria-hidden="true" className="size-3.5" />
+              ) : (
+                <ChevronRightIcon aria-hidden="true" className="size-3.5" />
+              )}
+              <span>History</span>
+              <span className="ml-auto tabular-nums">{settledChildren.length}</span>
+            </button>
+          </li>
+        )}
+        {settledChildren.length > 0 && (
+          <li data-testid="subagent-history" hidden={!historyOpen}>
+            <ul>
+              {settledChildren.map((child) => (
+                <SubagentRow
+                  key={child.id}
+                  child={child}
+                  depth={1}
+                  conversationId={conversationId}
+                  collapsedRows={collapsedRows}
+                  onToggleCollapsed={toggleCollapsedRow}
+                />
+              ))}
+            </ul>
+          </li>
+        )}
       </ul>
       {/* Mounted only while open so a closed rail issues no /v1/agents
           fetch and carries none of the dialog's query dependencies. */}
@@ -252,6 +311,17 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
   other: false,
   done: true,
   idle: true,
+};
+
+const ACTIVE_PRIORITY: Record<AgentActivity, number> = {
+  awaiting: 0,
+  failed: 1,
+  disconnected: 2,
+  launching: 3,
+  working: 4,
+  other: 5,
+  done: 6,
+  idle: 7,
 };
 
 /**

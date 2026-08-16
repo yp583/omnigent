@@ -560,13 +560,13 @@ describe("double-click to rename", () => {
       ...CONV,
       id: "conv_a",
       title: "Session A",
-      updated_at: 1_700_000_200,
+      created_at: 1_700_000_200,
     };
     const convB: Conversation = {
       ...CONV,
       id: "conv_b",
       title: "Session B",
-      updated_at: 1_700_000_100,
+      created_at: 1_700_000_100,
     };
     mockConversations([convA, convB]);
     const view = renderSidebar();
@@ -574,9 +574,9 @@ describe("double-click to rename", () => {
     // Click #1 of the user's double-click lands on session A (the top row).
     fireEvent.click(screen.getByRole("link", { name: /Session A/ }));
 
-    // Before click #2, session B's updated_at bumps and the list reorders —
+    // Before click #2, session B's created_at correction reorders the list —
     // B now occupies the screen position where A was.
-    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    mockConversations([{ ...convB, created_at: 1_700_000_300 }, convA]);
     view.rerenderSidebar();
 
     // Click #2 and the dblclick land on B, the row now under the cursor.
@@ -927,19 +927,19 @@ describe("right-click context menu", () => {
     // double-click guard does — if the list reorders in the instant before
     // the click lands, the row that slid under the cursor opens its (visually
     // identical) menu and gets renamed. The fix is upstream: while the
-    // pointer is inside the list, every row's sort key is frozen so rows
-    // can't move under the cursor at all.
+    // primary list is ordered by immutable creation time, so activity cannot
+    // move rows under the cursor at all.
     const convA: Conversation = {
       ...CONV,
       id: "conv_a",
       title: "Session A",
-      updated_at: 1_700_000_200,
+      created_at: 1_700_000_200,
     };
     const convB: Conversation = {
       ...CONV,
       id: "conv_b",
       title: "Session B",
-      updated_at: 1_700_000_100,
+      created_at: 1_700_000_100,
     };
     mockConversations([convA, convB]);
     const view = renderSidebar();
@@ -947,7 +947,7 @@ describe("right-click context menu", () => {
     // The pointer moves over the list, aiming at session A (the top row).
     fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
 
-    // Session B's updated_at bumps past A before the right-click lands.
+    // Session B receives fresh activity before the right-click lands.
     mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
     view.rerenderSidebar();
 
@@ -966,21 +966,19 @@ describe("right-click context menu", () => {
 
   it("keeps the order held while a rename edit is open even after the pointer leaves", () => {
     // The pointer naturally drifts out of the sidebar while typing a new
-    // title. If that released the freeze, background updated_at churn would
-    // shuffle rows around the open input — and moving the input's DOM node
-    // blurs it, committing a half-typed title. An open rename edit must hold
-    // the order on its own; the snap-back happens once the edit ends.
+    // title. Background activity must not shuffle rows around the open input
+    // and blur it, committing a half-typed title.
     const convA: Conversation = {
       ...CONV,
       id: "conv_a",
       title: "Session A",
-      updated_at: 1_700_000_200,
+      created_at: 1_700_000_200,
     };
     const convB: Conversation = {
       ...CONV,
       id: "conv_b",
       title: "Session B",
-      updated_at: 1_700_000_100,
+      created_at: 1_700_000_100,
     };
     mockConversations([convA, convB]);
     const view = renderSidebar();
@@ -991,7 +989,7 @@ describe("right-click context menu", () => {
     fireEvent.click(screen.getByTestId("rename-conversation"));
     const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
 
-    // The pointer leaves the list mid-edit; then session B's updated_at bumps.
+    // The pointer leaves the list mid-edit; then session B receives activity.
     fireEvent.mouseOut(screen.getByTestId("sidebar-conversation-list"), {
       relatedTarget: document.body,
     });
@@ -1006,13 +1004,16 @@ describe("right-click context menu", () => {
     expect(input.compareDocumentPosition(rowB) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(listEl).toContainElement(rowB);
 
-    // Committing the rename targets session A and releases the hold: the
-    // order snaps to reality (B first).
+    // Committing the rename still targets session A; creation ordering keeps
+    // the row in place.
     fireEvent.change(input, { target: { value: "Renamed A" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });
-    const after = screen.getAllByRole("link", { name: /^Session/ });
-    expect(after[0]).toHaveAccessibleName(/Session B/);
+    const renamedA = screen.getByRole("link", { name: /Renamed A/ });
+    const sessionB = screen.getByRole("link", { name: /Session B/ });
+    expect(
+      renamedA.compareDocumentPosition(sessionB) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("snaps the order back to reality when the pointer leaves the list", () => {
@@ -1020,13 +1021,13 @@ describe("right-click context menu", () => {
       ...CONV,
       id: "conv_a",
       title: "Session A",
-      updated_at: 1_700_000_200,
+      created_at: 1_700_000_200,
     };
     const convB: Conversation = {
       ...CONV,
       id: "conv_b",
       title: "Session B",
-      updated_at: 1_700_000_100,
+      created_at: 1_700_000_100,
     };
     mockConversations([convA, convB]);
     const view = renderSidebar();
@@ -1039,7 +1040,7 @@ describe("right-click context menu", () => {
     fireEvent.mouseOut(screen.getByTestId("sidebar-conversation-list"), {
       relatedTarget: document.body,
     });
-    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session B/);
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session A/);
   });
 });
 

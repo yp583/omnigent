@@ -67,6 +67,18 @@ describe("sessionWorkspaceState", () => {
     });
   });
 
+  it("persists an explicit dismissal of automatic agent-rail opening", () => {
+    writeSessionWorkspaceState("conv_agents", {
+      rightRailTab: "subagents",
+      agentsAutoOpenDismissed: true,
+    });
+
+    expect(readSessionWorkspaceState("conv_agents")).toEqual({
+      rightRailTab: "subagents",
+      agentsAutoOpenDismissed: true,
+    });
+  });
+
   it("caps the persisted shell tabs at 20, keeping the most recent", () => {
     const terminals = Array.from({ length: 25 }, (_, i) => `terminal:t${i}`);
     writeSessionWorkspaceState("conv_terms", { openTerminals: terminals });

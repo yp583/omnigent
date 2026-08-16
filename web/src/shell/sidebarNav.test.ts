@@ -12,6 +12,7 @@ import {
   migratePinnedConversationIds,
   orderByPinnedTimestamp,
   resolveSidebarDrop,
+  sortByCreatedAtDesc,
 } from "./sidebarNav";
 
 function conversation(
@@ -98,6 +99,25 @@ describe("computeNextActiveOverride", () => {
 
   it("drops the override while the new active chat hasn't loaded yet", () => {
     expect(computeNextActiveOverride("c", [a, b], { id: "a", updatedAt: 100 })).toBeNull();
+  });
+});
+
+describe("sortByCreatedAtDesc", () => {
+  it("does not move an active session when only updated_at changes", () => {
+    const older = conversation("older", "Older", new Date(2026, 4, 14, 9), {
+      updatedAt: new Date(2026, 4, 14, 12),
+    });
+    const newer = conversation("newer", "Newer", new Date(2026, 4, 14, 10));
+
+    expect(sortByCreatedAtDesc([older, newer]).map((item) => item.id)).toEqual(["newer", "older"]);
+  });
+
+  it("uses the id as a deterministic tie-breaker", () => {
+    const created = new Date(2026, 4, 14, 10);
+    const b = conversation("b", "B", created);
+    const a = conversation("a", "A", created);
+
+    expect(sortByCreatedAtDesc([b, a]).map((item) => item.id)).toEqual(["a", "b"]);
   });
 });
 

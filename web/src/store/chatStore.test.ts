@@ -7054,11 +7054,62 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it("coalesces native text deltas while painting the first token immediately", async () => {
+    useChatStore.setState({
+      conversationId: "conv_native_batch",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_native_batch",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    sink.push(sse("response.created", { id: "resp_native", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", { delta: "A", message_id: "msg_native", index: 0 }),
+    );
+    sink.push(
+      sse("response.output_text.delta", { delta: "B", message_id: "msg_native", index: 1 }),
+    );
+    sink.push(
+      sse("response.output_text.delta", { delta: "C", message_id: "msg_native", index: 2 }),
+    );
+    await tick();
+
+    const preview = () =>
+      useChatStore.getState().blocks.find((block) => block.ctx.itemId === "live:msg_native") as
+        | TextDone
+        | undefined;
+    expect(preview()?.fullText).toBe("A");
+    expect(manual.pending()).toBe(true);
+
+    manual.fire();
+    expect(preview()?.fullText).toBe("ABC");
+
+    controller.abort();
+  });
+
   it("appends live command output to the running tool card", async () => {
     useChatStore.setState({ conversationId: "conv_tool_delta", blocks: [] });
     const sink = pushableStream();
     const controller = new AbortController();
-    void pumpStreamEvents("conv_tool_delta", sink.stream, controller, setState, getState);
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_tool_delta",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
 
     sink.push(sse("response.created", { id: "resp_tool", status: "in_progress", output: [] }));
     sink.push(
@@ -7087,6 +7138,7 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
       }),
     );
     await tick();
+    manual.fire();
 
     const group = useChatStore
       .getState()
@@ -8744,12 +8796,13 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       blocks: [],
       isNativeTerminalSession: true,
     });
-    const { sink, controller } = startPump("conv_live");
+    const { sink, controller, manual } = startPump("conv_live");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
     sink.push(nativeDelta("m1", 0, "Hello ", false));
     sink.push(nativeDelta("m1", 1, "world", true));
     await tick();
+    manual.fire();
 
     // The streamed text lands as ONE provisional text block in `blocks`
     // (keyed live:m1), accumulating the chunks — so it renders in-order
@@ -9055,7 +9108,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       blocks: [],
       isNativeTerminalSession: true,
     });
-    const { sink, controller } = startPump("conv_live4");
+    const { sink, controller, manual } = startPump("conv_live4");
 
     sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
     sink.push(nativeDelta("m1", 0, "first", true));
@@ -9067,6 +9120,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     // Second message streams after a tool/gap.
     sink.push(nativeDelta("m2", 0, "second", false));
     await tick();
+    manual.fire();
 
     // m2 is the only in-flight preview (FIFO cleanup took m1, not m2).
     expect(provisional()?.ctx.itemId).toBe("live:m2");

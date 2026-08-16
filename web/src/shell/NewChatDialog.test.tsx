@@ -2143,21 +2143,14 @@ describe("NewChatLandingScreen", () => {
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
+    const hostItem = screen.getByTestId("new-chat-landing-host-host_1");
     expect(
-      sandboxOption.compareDocumentPosition(hostItem!) & Node.DOCUMENT_POSITION_FOLLOWING,
+      sandboxOption.compareDocumentPosition(hostItem) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     // Picking the host restores the workspace flow (file-browser chip,
     // worktree chip) — the sandbox default doesn't wedge the normal path.
-    fireEvent.click(hostItem!);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
-    );
+    fireEvent.click(hostItem);
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy());
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
@@ -3159,9 +3152,18 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
 });
 
 describe("NewChatLandingScreen custom-agent sandbox gating", () => {
-  beforeEach(setupLandingMocks);
+  const clearRadixBodyLock = () => {
+    document.body.removeAttribute("data-scroll-locked");
+    document.body.style.removeProperty("pointer-events");
+  };
+
+  beforeEach(() => {
+    clearRadixBodyLock();
+    setupLandingMocks();
+  });
   afterEach(() => {
     cleanup();
+    clearRadixBodyLock();
     localStorage.clear();
   });
 
@@ -3182,6 +3184,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     // The item is omitted entirely on a sandbox target.
     expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
+    closeMenu();
   });
 
   it("shows 'Create custom agent' on a host and opens the dialog", async () => {
@@ -3192,16 +3195,8 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
-    fireEvent.click(hostItem!);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
-    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy());
     // With no custom agents yet, the create item is a top-level row (no
     // "Custom agents" submenu to hide it behind) and opens the dialog.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
@@ -3210,6 +3205,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   });
 
   // Switch the target to the connected host, then create + submit a pending
@@ -3219,15 +3215,8 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    fireEvent.click(hostItem!);
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
-        "This machine",
-      ),
-    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy());
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());

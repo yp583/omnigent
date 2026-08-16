@@ -46,7 +46,7 @@ function parseOmnigentDeepLink(raw) {
   } catch {
     return null;
   }
-  if (url.protocol !== "omnigent:") return null;
+  if (url.protocol !== "omnigent:" && url.protocol !== "omnigent-personal:") return null;
   // No host → a bare `omnigent://` or `omnigent:`; nothing to connect to.
   if (url.host === "") return null;
   const path = url.pathname;

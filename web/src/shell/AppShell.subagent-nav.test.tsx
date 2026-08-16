@@ -73,7 +73,10 @@ vi.mock("@/hooks/useAgents", () => ({
   useUpdateMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
   useDeleteMcpServer: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }));
-vi.mock("./Sidebar", () => ({ Sidebar: () => <div data-testid="sidebar" /> }));
+vi.mock("./Sidebar", () => ({
+  isMobileViewport: () => false,
+  Sidebar: () => <div data-testid="sidebar" />,
+}));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
 }));

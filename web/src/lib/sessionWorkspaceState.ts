@@ -24,6 +24,8 @@ export interface SessionWorkspaceState {
   widthPx?: number;
   /** The selected rail tab (Files / Changes / Agents / Shells / Tasks). */
   rightRailTab?: RightRailTab;
+  /** User explicitly closed or left an automatically surfaced Agents rail. */
+  agentsAutoOpenDismissed?: boolean;
   /** Ordered list of open file tabs. */
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
@@ -73,6 +75,9 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (typeof record.open === "boolean") state.open = record.open;
   if (isValidWidth(record.widthPx)) state.widthPx = record.widthPx;
   if (isRailTab(record.rightRailTab)) state.rightRailTab = record.rightRailTab;
+  if (typeof record.agentsAutoOpenDismissed === "boolean") {
+    state.agentsAutoOpenDismissed = record.agentsAutoOpenDismissed;
+  }
   if (Array.isArray(record.openFiles) && record.openFiles.every((p) => typeof p === "string")) {
     state.openFiles = record.openFiles as string[];
   }

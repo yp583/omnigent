@@ -49,6 +49,8 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { registerSessionExpiryReload } = require("./session-expiry");
+const { listPullRequests } = require("./pullRequests");
+const { startPersonalProxy } = require("./personalProxy");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
@@ -89,6 +91,39 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
+const PERSONAL_BUILD = true;
+if (PERSONAL_BUILD) {
+  // Set this before the single-instance lock or any settings access. Electron
+  // keys both to userData, so the official app and this fork can run together
+  // without sharing cookies, settings, windows, or lock ownership.
+  app.setName("Omnigent Personal");
+  app.setPath("userData", path.join(app.getPath("appData"), "Omnigent Personal"));
+}
+const PERSONAL_WEB_DIR = app.isPackaged
+  ? path.join(process.resourcesPath, "web-ui")
+  : path.resolve(__dirname, "..", "..", "..", "omnigent", "server", "static", "web-ui");
+const personalProxies = new Map();
+
+async function personalProxyFor(serverUrl) {
+  const existing = personalProxies.get(serverUrl);
+  if (existing) return existing;
+  const pending = startPersonalProxy({ staticDir: PERSONAL_WEB_DIR, serverUrl });
+  personalProxies.set(serverUrl, pending);
+  try {
+    return await pending;
+  } catch (error) {
+    personalProxies.delete(serverUrl);
+    throw error;
+  }
+}
+
+async function closePersonalProxies() {
+  const proxies = await Promise.allSettled([...personalProxies.values()]);
+  personalProxies.clear();
+  await Promise.allSettled(
+    proxies.flatMap((result) => (result.status === "fulfilled" ? [result.value.close()] : [])),
+  );
+}
 
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
@@ -527,6 +562,12 @@ function pinnedOrigin(win) {
   return (win && windows.get(win)?.origin) ?? null;
 }
 
+/** Actual local page origin trusted to call preload IPC in the Personal build. */
+function trustedPageOrigin(win) {
+  const state = win && windows.get(win);
+  return state?.pageOrigin ?? state?.origin ?? null;
+}
+
 /**
  * True when a URL (or origin string) belongs to an origin some open window
  * is currently pinned to — i.e. a server the user explicitly connected to.
@@ -541,7 +582,7 @@ function isPinnedServerUrl(url) {
   const origin = originOf(url ?? "");
   if (!origin) return false;
   for (const state of windows.values()) {
-    if (state.origin === origin) return true;
+    if (state.origin === origin || state.pageOrigin === origin) return true;
   }
   return false;
 }
@@ -576,6 +617,12 @@ function pinWindow(win, origin) {
     }
   }
   state.origin = origin;
+  if (origin === null) state.pageOrigin = null;
+}
+
+function setWindowPageOrigin(win, origin) {
+  const state = windows.get(win);
+  if (state) state.pageOrigin = origin;
 }
 
 /**
@@ -1004,10 +1051,17 @@ function resolveServerPath(serverUrl, routePath) {
  * @param {string} [routePath] Optional basename-less in-app path (e.g. ``/c/<id>``).
  * @returns {Promise<void>}
  */
-function loadServerUrl(win, serverUrl, routePath) {
+async function loadServerUrl(win, serverUrl, routePath) {
   pinWindow(win, originOf(serverUrl));
   setWindowServerUrl(win, serverUrl);
-  return win.loadURL(routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
+  if (!PERSONAL_BUILD) {
+    setWindowPageOrigin(win, originOf(serverUrl));
+    return win.loadURL(routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
+  }
+  const proxy = await personalProxyFor(serverUrl);
+  setWindowPageOrigin(win, proxy.origin);
+  const localUrl = routePath ? resolveServerPath(proxy.origin, routePath) : proxy.origin;
+  return win.loadURL(localUrl);
 }
 
 /**
@@ -1048,7 +1102,7 @@ function createWindow(targetUrl, opts = {}) {
     // Tall enough that the bundled setup page (logo, Start-locally, divider,
     // URL field, Connect, and a few recents) fits without overflowing.
     minHeight: 600,
-    title: "Omnigent",
+    title: PERSONAL_BUILD ? "Omnigent Personal" : "Omnigent",
     backgroundColor: "#0b0b0c",
     // macOS: hide the native title bar but keep the traffic lights, inset
     // into the content. The web layer provides the drag surface + clearance
@@ -1095,11 +1149,12 @@ function createWindow(targetUrl, opts = {}) {
   // treated as "no server configured" rather than crashing window creation.
   const destinationOrigin = serverUrl ? originOf(serverUrl) : null;
   const destination = destinationOrigin ? loadUrl : null;
-  updateOverlay.ensureOverlay(win);
+  if (!PERSONAL_BUILD) updateOverlay.ensureOverlay(win);
   windows.set(win, {
     // Pin to the destination's origin up front; setup-page windows stay
     // unpinned (null) until the user connects them.
     origin: destinationOrigin,
+    pageOrigin: null,
     // Clean server identity (no conversation path) for host/server CLI
     // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
     serverUrl: destination ? serverUrl : null,
@@ -1119,7 +1174,7 @@ function createWindow(targetUrl, opts = {}) {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
     }
-    void win.loadURL(destination);
+    void loadServerUrl(win, serverUrl, typeof opts.path === "string" ? opts.path : undefined);
   } else {
     // ?ephemeral=1 only changes the setup page's copy (the window's
     // WindowState is the source of truth for persistence behavior).
@@ -1144,7 +1199,7 @@ function createWindow(targetUrl, opts = {}) {
       { url, disposition, features },
       {
         openerOrigin: originOf(win.webContents.getURL()),
-        pinnedOrigin: pinnedOrigin(win),
+        pinnedOrigin: trustedPageOrigin(win),
         extraPopupOrigins: loadSettings().popup_allowed_origins,
       },
     );
@@ -1189,13 +1244,19 @@ function createWindow(targetUrl, opts = {}) {
       // window was re-pointed while the failing load was in flight) must
       // not yank the window off its new destination.
       const failedOrigin = originOf(validatedURL ?? "");
-      if (failedOrigin !== windows.get(win)?.origin) return;
+      if (failedOrigin !== trustedPageOrigin(win)) return;
+      const connectedServerUrl = windows.get(win)?.serverUrl;
       const params = new URLSearchParams({
         error: `${errorDescription || "load failed"} (${errorCode})`,
         // The failure often happens on a deep SPA route (e.g. /chat/…);
         // prefill the setup form with just the server origin — that's what
         // the user connects to — not the full path that happened to fail.
-        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
+        url:
+          typeof connectedServerUrl === "string"
+            ? connectedServerUrl
+            : failedOrigin
+              ? failedOrigin + "/"
+              : (validatedURL ?? ""),
       });
       if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
       pinWindow(win, null); // back on the setup page → no trusted origin
@@ -1450,10 +1511,22 @@ function isFindBarSender(event) {
  */
 function newWindow() {
   const win = activeWindow();
+  const state = win ? windows.get(win) : null;
   const current = win?.webContents.getURL();
+  let routePath;
+  try {
+    const parsed = new URL(current);
+    routePath = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    routePath = undefined;
+  }
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  createWindow(undefined, {
+    ephemeral: state?.ephemeral === true,
+    serverUrl: state?.serverUrl,
+    path: routePath,
+  });
 }
 
 /**
@@ -1480,7 +1553,8 @@ async function confirmExternalProtocol(win, url, scheme) {
   // The persisted grant applies only when the user is actually ON the
   // pinned server — a foreign page reached via redirect gets a fresh
   // prompt even for an always-allowed scheme.
-  const onPinnedServer = pinned !== null && originOf(win.webContents.getURL()) === pinned;
+  const onPinnedServer =
+    pinned !== null && originOf(win.webContents.getURL()) === trustedPageOrigin(win);
   const allowedSchemes = loadSettings().allowed_protocols?.[pinned] ?? [];
   if (onPinnedServer && allowedSchemes.includes(scheme)) {
     void shell.openExternal(url);
@@ -1541,7 +1615,7 @@ async function confirmHostEnrollment(win) {
   // Only honor (and offer to persist) the grant while the visible top-level
   // page is the pinned server itself — never a foreign page that reached a
   // pinned window via redirect.
-  const onPinnedServer = originOf(win.webContents.getURL()) === pinned;
+  const onPinnedServer = originOf(win.webContents.getURL()) === trustedPageOrigin(win);
   const approved = loadSettings().allowed_hosting_origins ?? [];
   if (onPinnedServer && Array.isArray(approved) && approved.includes(pinned)) return true;
 
@@ -1809,6 +1883,7 @@ function buildMenu() {
     {
       id: "check_for_updates",
       label: "Check for Updates…",
+      visible: !PERSONAL_BUILD,
       click: async () => {
         // Surface the two silent outcomes of a manual menubar check with a
         // native dialog: "no update" (otherwise only the renderer banner
@@ -1841,6 +1916,7 @@ function buildMenu() {
     {
       id: "restart_to_update",
       label: "Restart to Update",
+      visible: !PERSONAL_BUILD,
       click: async () => {
         // Production install path: the UpdateBanner toast is dismissible (and
         // a user may have closed it), so the menubar must still offer a way to
@@ -2022,7 +2098,7 @@ function isSetupPageSender(event) {
  * @returns {boolean}
  */
 function isPinnedOriginSender(event) {
-  const pinned = pinnedOrigin(BrowserWindow.fromWebContents(event.sender));
+  const pinned = trustedPageOrigin(BrowserWindow.fromWebContents(event.sender));
   if (!pinned) return false;
   if (originOf(event.senderFrame?.url ?? "") !== pinned) return false;
   // event.sender.getURL() is the webContents' main-frame URL.
@@ -2124,8 +2200,7 @@ function registerIpc() {
       void fetchServerManifest(target).then((manifest) => {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
-      win
-        .loadURL(target)
+      loadServerUrl(win, target)
         .then(() => {
           // Only a server that actually responded earns a recents slot —
           // a typo'd or unreachable URL must not show up in the
@@ -2196,6 +2271,17 @@ function registerIpc() {
     };
   });
 
+  // Personal workspace PR summary. The renderer supplies only session
+  // workspace metadata; pullRequests.js validates it and executes a fixed,
+  // read-only git/gh command set (there is deliberately no generic shell IPC).
+  ipcMain.handle("omnigent:list-pull-requests", async (event, request) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] list-pull-requests from untrusted sender dropped");
+      return { pullRequests: [], error: "Pull request tracking is unavailable." };
+    }
+    return listPullRequests(request);
+  });
+
   // SPA title-bar server picker → re-point the SENDING window to another
   // server. Only URLs already in the persisted recent-servers list are
   // accepted: pinning is a privilege grant (notifications, badge, protocol
@@ -2229,8 +2315,7 @@ function registerIpc() {
       void fetchServerManifest(url).then((manifest) => {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
-      win
-        .loadURL(url)
+      loadServerUrl(win, url)
         .then(() => {
           if (ephemeral) return;
           const settings = loadSettings();
@@ -2853,8 +2938,9 @@ async function handleDeepLink(raw) {
 // App lifecycle
 // ---------------------------------------------------------------------------
 
-// Name drives the macOS app menu title and the notification source name.
-app.setName("Omnigent");
+// Name drives the macOS app menu title and the notification source name. The
+// Personal build sets it near startup, before userData and the instance lock.
+const DEEP_LINK_PREFIX = PERSONAL_BUILD ? "omnigent-personal://" : "omnigent://";
 
 // Single-instance: focus the existing window instead of opening a second.
 const gotLock = app.requestSingleInstanceLock();
@@ -2870,7 +2956,7 @@ if (!gotLock) {
   // `npm start -- 'omnigent://...'` exercise the real code path on macOS too.
   // Safe: a packaged macOS launch has no omnigent:// in argv, so no double-handling.
   for (const arg of process.argv) {
-    if (typeof arg === "string" && arg.startsWith("omnigent://")) enqueueDeepLink(arg);
+    if (typeof arg === "string" && arg.startsWith(DEEP_LINK_PREFIX)) enqueueDeepLink(arg);
   }
 
   // macOS: `open-url` fires for omnigent:// links, including BEFORE
@@ -2892,7 +2978,7 @@ if (!gotLock) {
     // scan above). A plain second launch (no URL) just focuses an existing window.
     let handledUrl = false;
     for (const arg of argv) {
-      if (typeof arg === "string" && arg.startsWith("omnigent://")) {
+      if (typeof arg === "string" && arg.startsWith(DEEP_LINK_PREFIX)) {
         enqueueDeepLink(arg);
         handledUrl = true;
       }
@@ -2908,7 +2994,11 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     // App User Model ID so Windows attributes notifications/taskbar correctly.
-    if (process.platform === "win32") app.setAppUserModelId("ai.omnigent.desktop");
+    if (process.platform === "win32") {
+      app.setAppUserModelId(
+        PERSONAL_BUILD ? "ai.omnigent.desktop.personal" : "ai.omnigent.desktop",
+      );
+    }
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();
@@ -2936,7 +3026,7 @@ if (!gotLock) {
     // per-install registration that survives reinstalls; this lets dev
     // (`electron .`) clicks route to the running dev instance too. No-op
     // (returns false) when another app is already the default handler.
-    app.setAsDefaultProtocolClient("omnigent");
+    app.setAsDefaultProtocolClient(PERSONAL_BUILD ? "omnigent-personal" : "omnigent");
     // If a deep link arrived before ready (macOS open-url, or Windows/Linux
     // argv), open it instead of the default launch window; the drain's
     // fallback opens a default window if a consent is cancelled. Otherwise
@@ -2946,7 +3036,9 @@ if (!gotLock) {
     } else {
       createWindow();
     }
-    updater.init();
+    // Personal builds are deliberately rebuilt from source and ship no update
+    // feed. Do not probe for app-update.yml or surface updater errors.
+    if (!PERSONAL_BUILD) updater.init();
 
     app.on("activate", () => {
       // macOS: re-create the window when the dock icon is clicked and none
@@ -3012,7 +3104,7 @@ if (!gotLock) {
     // SIGKILL'd within 4s and `omnigent server stop` has its own exec timeout.
     (async () => {
       const cliPath = resolvedCliPath();
-      await serverManager.shutdown(cliPath);
+      await Promise.all([serverManager.shutdown(cliPath), closePersonalProxies()]);
     })()
       .catch(() => {})
       .finally(() => {

@@ -210,6 +210,15 @@ export function sortByUpdatedAtDesc(
   return [...conversations].sort((a, b) => effective(b) - effective(a));
 }
 
+/**
+ * Keep navigation stable while sessions are active by ordering on the one
+ * timestamp that never changes. The id tie-break makes equal-second creation
+ * times deterministic across pagination and cache refreshes.
+ */
+export function sortByCreatedAtDesc(conversations: Conversation[]): Conversation[] {
+  return [...conversations].sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id));
+}
+
 // Decide the next `activeOverride` value given the current route and
 // loaded conversations. Pulled out so the freeze behavior can be
 // unit-tested without driving a React render.
@@ -307,7 +316,10 @@ export interface SidebarDragSource {
     drop that landed on nothing droppable (e.g. "Shared with me", which is
     never a target — sessions can't be filed there). */
 export type SidebarDropTarget =
-  { type: "project"; name: string } | { type: "ungroup" } | { type: "pin" } | null;
+  | { type: "project"; name: string }
+  | { type: "ungroup" }
+  | { type: "pin" }
+  | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
     `ungroup` removes it from its current project (the caller still confirms

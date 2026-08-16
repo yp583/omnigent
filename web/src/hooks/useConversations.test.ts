@@ -1623,7 +1623,7 @@ describe("useProjectSessions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("fetches the project's non-archived sessions, newest-first, when enabled", async () => {
+  it("fetches the project's non-archived sessions by stable creation time", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
@@ -1642,7 +1642,7 @@ describe("useProjectSessions", () => {
     expect(url).toContain("/v1/sessions?");
     expect(url).toContain("project=Sprint+42");
     expect(url).toContain("order=desc");
-    expect(url).toContain("sort_by=updated_at");
+    expect(url).toContain("sort_by=created_at");
     expect(url).toContain("limit=20");
     // Folders show active sessions only — archived ones leave the sidebar.
     expect(url).not.toContain("include_archived");

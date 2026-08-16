@@ -61,6 +61,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
+  isMobileViewport: () => false,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
   // whether it is peeking (a floating hover card rather than a docked panel).
   // Rendered as aside.conversations-sidebar like the real one, so the
@@ -1870,7 +1871,7 @@ describe("Subagents tab", () => {
     expect(badge.className).not.toContain("bg-destructive");
   });
 
-  it("keeps the Agents count badge neutral when children stream in on connect", () => {
+  it("opens the Agents rail when the first children stream in and keeps its badge neutral", () => {
     // Mirror of the terminal connect case: child sessions arrive over SSE
     // (snapshot + live deltas). The count should update without looking like
     // an error on refresh.
@@ -1940,6 +1941,8 @@ describe("Subagents tab", () => {
     expect(badge.className).toContain("text-muted-foreground");
     expect(badge.className).not.toContain("bg-destructive");
     expect(badge.className).not.toContain("text-white");
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("subagents-panel")).toBeInTheDocument();
   });
 
   it("keeps the Subagents tab visible inside a child session", () => {

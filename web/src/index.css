@@ -1080,6 +1080,15 @@ aside[aria-label="Workspace"][data-maximized] {
   content-visibility: visible !important;
 }
 
+/* Session revisits can skip rendering settled offscreen bubbles only after the
+ * bubble has an exact measured height. This avoids Streamdown's old flat-size
+ * estimate problem above: the scrollbar and anchor geometry stay unchanged as
+ * a cached bubble becomes visible. The currently streaming bubble is excluded. */
+.chat-bubble-shell-cached {
+  content-visibility: auto;
+  contain-intrinsic-size: auto var(--chat-bubble-height);
+}
+
 /* Streamdown pins `text-sm` on table cells and h6. That tier is the caption
  * step, so inside chat prose those read as a shrink rather than body text —
  * pin them back to the surrounding size. sub/sup keep the caption step, where

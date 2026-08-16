@@ -479,8 +479,9 @@ describe("SubagentsPanel", () => {
     expect(screen.getByTestId("subagent-main-row")).toBeInTheDocument();
     const rows = screen.getAllByTestId("subagent-row");
     expect(rows).toHaveLength(2);
-    expect(rows[0]).toHaveAttribute("href", "/c/conv_child_a");
-    expect(rows[1]).toHaveAttribute("href", "/c/conv_child_b");
+    // Active work is deliberately promoted above settled history.
+    expect(rows[0]).toHaveAttribute("href", "/c/conv_child_b");
+    expect(rows[1]).toHaveAttribute("href", "/c/conv_child_a");
     // Status-word display (which states show a word vs. a bare dot) is owned
     // by the dedicated "shows the status word only for notable states" test.
   });
@@ -1271,6 +1272,40 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "c_idle").className.split(/\s+/)).toContain("opacity-60");
     // Settled row you're viewing is not dimmed (active beats dim).
     expect(childRow(container, "c_done").className.split(/\s+/)).not.toContain("opacity-60");
+  });
+
+  it("orders attention and active agents before collapsed history", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "c_work", tool: "coder", busy: true }),
+        childInfo({ id: "c_done", tool: "reviewer", current_task_status: "completed" }),
+        childInfo({ id: "c_fail", tool: "tester", current_task_status: "failed" }),
+        childInfo({ id: "c_await", tool: "researcher", pending_elicitations_count: 1 }),
+      ],
+    });
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(
+      screen.getAllByTestId("subagent-row").map((row) => row.getAttribute("data-child-session-id")),
+    ).toEqual(["c_await", "c_fail", "c_work", "c_done"]);
+    expect(screen.getByTestId("subagent-history-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("subagent-history")).toHaveAttribute("hidden");
+
+    fireEvent.click(screen.getByTestId("subagent-history-toggle"));
+    expect(screen.getByTestId("subagent-history-toggle")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("subagent-history")).not.toHaveAttribute("hidden");
+  });
+
+  it("automatically reveals history when its active transcript is selected", () => {
+    mockChildTree({
+      conv_root: [childInfo({ id: "c_done", tool: "reviewer", current_task_status: "completed" })],
+    });
+
+    renderPanel({ conversationId: "c_done", rootSessionId: "conv_root" });
+
+    expect(screen.getByTestId("subagent-history-toggle")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("subagent-history")).not.toHaveAttribute("hidden");
   });
 
   it("renders a distinct, role-specific icon per agent type", () => {

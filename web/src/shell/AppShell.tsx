@@ -560,6 +560,7 @@ export function AppShell() {
   // SubagentsPanel mounts its own polling usage of the hook against
   // the same rootSessionId, so the cache is shared.
   const { children: childSessions } = useChildSessions(rootSessionId);
+  const childCountByRootRef = useRef<Map<string, number>>(new Map());
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
@@ -573,6 +574,34 @@ export function AppShell() {
   // (the panel's "main" row links back to the root, so an empty tree is
   // a one-entry list, not a dead end).
   const agentCount = childSessions.length + 1;
+
+  // Surface the Agents rail when the first child appears during this view.
+  // Initial cached trees stay where the user left them; only a 0 → N spawn
+  // transition interrupts the current layout, and an explicit close/tab
+  // switch suppresses future automatic openings for this root.
+  useEffect(() => {
+    if (!rootSessionId || isMobileViewport()) return;
+    const previousCount = childCountByRootRef.current.get(rootSessionId);
+    childCountByRootRef.current.set(rootSessionId, childSessions.length);
+    if (previousCount === undefined || previousCount > 0 || childSessions.length === 0) return;
+    if (selectedFilePath !== null) return;
+    const rootWorkspace = readSessionWorkspaceState(rootSessionId);
+    if (rootWorkspace.agentsAutoOpenDismissed === true) return;
+
+    setRightRailTab("subagents");
+    setRightPanelOpen(true);
+    writeSessionWorkspaceState(rootSessionId, {
+      open: true,
+      rightRailTab: "subagents",
+      agentsAutoOpenDismissed: false,
+    });
+    if (conversationId && conversationId !== rootSessionId) {
+      writeSessionWorkspaceState(conversationId, {
+        open: true,
+        rightRailTab: "subagents",
+      });
+    }
+  }, [childSessions.length, conversationId, rootSessionId, selectedFilePath]);
 
   // Hide the files panel entirely when the agent spec has no os_env. Probe
   // the default environment resource instead of the root filesystem listing:
@@ -803,6 +832,13 @@ export function AppShell() {
       return;
     }
     const persisted = readSessionWorkspaceState(conversationId);
+    const stickyRoot = stickyRootRef.current;
+    const rootAgentsState =
+      stickyRoot !== null &&
+      stickyRoot !== conversationId &&
+      cachedTreeContains(queryClient, stickyRoot, conversationId, MAX_TREE_DEPTH)
+        ? readSessionWorkspaceState(stickyRoot)
+        : null;
 
     const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
     setPanelInitialKeyState(stored);
@@ -811,7 +847,11 @@ export function AppShell() {
     // itself). ``nextTab`` stays null when there's no persisted tab and no file
     // to surface, so the tab-fallback effect can still land on the first
     // *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null = persisted.rightRailTab ?? null;
+    let nextTab: RightRailTab | null =
+      rootAgentsState?.rightRailTab === "subagents" &&
+      rootAgentsState.agentsAutoOpenDismissed !== true
+        ? "subagents"
+        : (persisted.rightRailTab ?? null);
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -854,7 +894,15 @@ export function AppShell() {
     const commentParam = searchParams.get("comment");
     const hasWorkspaceUrlSignal =
       urlFile !== null || (commentParam !== null && commentParam !== "");
-    setRightPanelOpen((persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal);
+    const rootAgentsOpen =
+      nextTab === "subagents" &&
+      rootAgentsState?.open === true &&
+      rootAgentsState.agentsAutoOpenDismissed !== true;
+    setRightPanelOpen(
+      rootAgentsOpen ||
+        (persisted.open ?? readDefaultWorkspacePanelOpen()) ||
+        hasWorkspaceUrlSignal,
+    );
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -964,7 +1012,13 @@ export function AppShell() {
   // advertises a panel that isn't shown.
   const toggleRightPanel = () => {
     const next = !rightPanelOpen;
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: next });
+    const agentPreference = rightRailTab === "subagents" ? { agentsAutoOpenDismissed: !next } : {};
+    if (conversationId) {
+      writeSessionWorkspaceState(conversationId, { open: next, ...agentPreference });
+    }
+    if (rootSessionId && rootSessionId !== conversationId && rightRailTab === "subagents") {
+      writeSessionWorkspaceState(rootSessionId, { open: next, ...agentPreference });
+    }
     if (next) {
       if (selectedFilePath) {
         // Reopening lands back on the file remembered in per-session
@@ -1204,6 +1258,12 @@ export function AppShell() {
   // open file to reveal the picked tab's scope list.
   function handleRightRailTabChange(next: RightRailTab) {
     setRightRailTab(next);
+    if (rootSessionId) {
+      writeSessionWorkspaceState(rootSessionId, {
+        ...(next === "subagents" ? { rightRailTab: next } : {}),
+        agentsAutoOpenDismissed: next !== "subagents",
+      });
+    }
     if (selectedFilePath !== null) {
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);

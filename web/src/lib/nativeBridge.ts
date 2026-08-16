@@ -172,6 +172,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
   resetCliPath?: () => Promise<CliStatus | null>;
+  /** Fixed read-only git/gh scan for local session workspaces. */
+  listPullRequests?: (request: PullRequestScanRequest) => Promise<PullRequestScanResult>;
   /**
    * Open/navigate a conversation's embedded browser view. Present only on
    * desktop shells new enough to ship the embedded browser feature — its
@@ -222,6 +224,34 @@ export interface HostIdentity {
 /** Result of a host control action from the desktop shell. */
 export interface HostActionResult {
   ok: boolean;
+  error?: string;
+}
+
+export interface PullRequestWorkspace {
+  sessionId: string;
+  workspace: string;
+  branch?: string;
+}
+
+export interface PullRequestSummary {
+  repository: string;
+  number: number;
+  title: string;
+  url: string;
+  branch: string;
+  headSha: string;
+  additions: number;
+  deletions: number;
+  ciStatus: "passing" | "pending" | "failing" | "unknown";
+  sourceSessionIds: string[];
+}
+
+export interface PullRequestScanRequest {
+  sessions: PullRequestWorkspace[];
+}
+
+export interface PullRequestScanResult {
+  pullRequests: PullRequestSummary[];
   error?: string;
 }
 
@@ -389,6 +419,25 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
  */
 export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
+}
+
+/** True only in a desktop build that ships the read-only PR bridge. */
+export function supportsPullRequestTracking(): boolean {
+  return typeof electronApi()?.listPullRequests === "function";
+}
+
+/** Discover open PRs for validated local session workspaces. */
+export async function listNativePullRequests(
+  request: PullRequestScanRequest,
+): Promise<PullRequestScanResult> {
+  const bridge = electronApi()?.listPullRequests;
+  if (!bridge) return { pullRequests: [] };
+  try {
+    return await bridge(request);
+  } catch (err) {
+    console.warn("[nativeBridge] pull request scan failed:", err);
+    return { pullRequests: [], error: "Pull request status is temporarily unavailable." };
+  }
 }
 
 /**
