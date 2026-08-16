@@ -15,6 +15,7 @@ export const ATTACHMENT_SIZE_LIMITS_MB = {
   image: 5,
   pdf: 20,
   text: 10,
+  binary: 25,
 } as const;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
@@ -119,11 +120,12 @@ function extensionOf(filename: string): string {
 
 /**
  * Classify a file into an attachment category, or `null` if its type is not
- * supported (e.g. pptx, docx, xlsx, zip, binaries). Uses the browser MIME
- * type first, falling back to the filename extension for code/text files
- * whose MIME is unreliable.
+ * sent. Uses the browser MIME type first, falling back to the filename
+ * extension for code/text files whose MIME is unreliable. Unknown and binary
+ * formats are accepted as runner-local files rather than inlined into a model
+ * request.
  */
-export function classifyAttachment(file: File): AttachmentCategory | null {
+export function classifyAttachment(file: File): AttachmentCategory {
   const type = file.type || "";
   const ext = extensionOf(file.name || "");
 
@@ -136,7 +138,7 @@ export function classifyAttachment(file: File): AttachmentCategory | null {
   ) {
     return "text";
   }
-  return null;
+  return "binary";
 }
 
 export interface AttachmentValidation {
@@ -158,12 +160,6 @@ export function validateAttachments(files: File[]): AttachmentValidation {
   for (const file of files) {
     const name = file.name || "file";
     const category = classifyAttachment(file);
-    if (category === null) {
-      errors.push(
-        `"${name}" can't be attached — only images, PDF, and text/code files are supported.`,
-      );
-      continue;
-    }
     const limitMb = ATTACHMENT_SIZE_LIMITS_MB[category];
     if (file.size > limitMb * 1024 * 1024) {
       errors.push(`"${name}" is too large — the limit for ${category} files is ${limitMb} MB.`);

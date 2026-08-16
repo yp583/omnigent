@@ -7,6 +7,7 @@ import logging
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.inner.native_attachments import (
@@ -16,6 +17,7 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     materialize_attachment,
     parse_data_uri,
+    resolve_file_id_block,
     unresolved_attachment_marker,
 )
 
@@ -288,3 +290,53 @@ def test_attachment_reference_line_covers_both_outcomes(tmp_path: Path) -> None:
     assert unresolved_line == "[Attachment photo.png could not be loaded]"
     assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, resolved_line)
     assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, unresolved_line)
+
+
+@pytest.mark.asyncio
+async def test_resolve_file_id_can_materialize_arbitrary_binary_on_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native attachment is downloaded to disk without base64 wrapping."""
+    import omnigent.inner.native_attachments as native_attachments
+
+    monkeypatch.setattr(native_attachments, "_runner_attachment_root", lambda: tmp_path)
+    payload = b"\x00\x01arbitrary-binary\xff"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(
+                200,
+                content=payload,
+                headers={"content-type": "application/octet-stream"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_binary",
+                "name": "operations-approval-prototype",
+                "content_type": "application/octet-stream",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://omni.test"
+    ) as client:
+        resolved = await resolve_file_id_block(
+            {
+                "type": "input_file",
+                "file_id": "file_binary",
+                "filename": "operations-approval-prototype",
+            },
+            session_id="conv_cross_host",
+            client=client,
+            to_disk=True,
+        )
+
+    assert resolved is not None
+    assert "file_id" not in resolved
+    assert "file_data" not in resolved
+    path = materialize_attachment(resolved, tmp_path / "unused-bridge")
+    assert path is not None
+    assert path.read_bytes() == payload
+    assert path.name == "operations-approval-prototype"
+    assert path.stat().st_mode & 0o777 == 0o600

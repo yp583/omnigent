@@ -18,6 +18,7 @@ import binascii
 import hashlib
 import logging
 import re
+import tempfile
 import urllib.parse
 import uuid
 from collections.abc import Mapping
@@ -32,6 +33,28 @@ _logger = logging.getLogger(__name__)
 # marker line for the consumers that regex-match it (forwarders, title
 # seeding): brackets end the match early, newlines break the line shape.
 _MARKER_UNSAFE = re.compile(r"[\[\]\r\n]")
+
+_LOCAL_PATH_FIELD = "_omnigent_local_path"
+
+
+def _runner_attachment_root() -> Path:
+    """Return the private root used for server-uploaded runner files."""
+    return Path(tempfile.gettempdir()) / "omnigent" / "native-attachments"
+
+
+def _trusted_materialized_path(block: Mapping[str, object]) -> Path | None:
+    """Return an internal local path only when it stays under our root."""
+    raw_path = block.get(_LOCAL_PATH_FIELD)
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        path = Path(raw_path).resolve()
+        root = _runner_attachment_root().resolve()
+        if path.is_file() and path.is_relative_to(root):
+            return path
+    except OSError:
+        return None
+    return None
 
 # Maps a data-URI MIME type to the file extension used when no filename
 # is supplied, e.g. ``"image/png"`` -> ``".png"``.
@@ -94,6 +117,10 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
     """
+    downloaded = _trusted_materialized_path(block)
+    if downloaded is not None:
+        return downloaded
+
     data_uri = block.get("image_url") or block.get("file_data")
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
         if block.get("file_id"):
@@ -217,6 +244,7 @@ async def resolve_file_id_block(
     *,
     session_id: str,
     client: httpx.AsyncClient,
+    to_disk: bool = False,
 ) -> dict[str, object] | None:
     """
     Fetch a ``file_id`` attachment's bytes and inline them as a data URI.
@@ -231,9 +259,11 @@ async def resolve_file_id_block(
         is true.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
-    :returns: The rebuilt block without ``file_id``, or ``None`` when the
-        fetch failed — callers keep the original block so a visible
-        marker can surface downstream.
+    :param to_disk: Materialize the payload beneath the runner's private
+        attachment root and return an internal path instead of a base64 URI.
+    :returns: The rebuilt block without ``file_id``, or ``None`` when the fetch
+        failed — callers keep the original block so a visible marker can
+        surface downstream.
     """
     file_id = str(block.get("file_id"))
     base = (
@@ -273,8 +303,34 @@ async def resolve_file_id_block(
         content_type = content_resp.headers.get("content-type") or "application/octet-stream"
     # Strip any charset suffix: data URIs need the media type hint.
     content_type = content_type.split(";", 1)[0]
-    encoded = base64.b64encode(content_resp.content).decode("ascii")
     new_block = {k: v for k, v in block.items() if k != "file_id"}
+    if to_disk:
+        filename = meta.get("name") or meta.get("filename") or block.get("filename")
+        if not isinstance(filename, str) or not filename:
+            filename = "attachment"
+        filename = _MARKER_UNSAFE.sub("_", Path(filename).name) or "attachment"
+        session_key = hashlib.sha256(session_id.encode()).hexdigest()[:20]
+        file_key = hashlib.sha256(file_id.encode()).hexdigest()[:20]
+        destination_dir = _runner_attachment_root() / session_key / file_key
+        try:
+            destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination = destination_dir / filename
+            if not _holds_bytes(destination, content_resp.content):
+                destination.write_bytes(content_resp.content)
+            destination.chmod(0o600)
+        except OSError:
+            _logger.warning(
+                "failed to materialize file_id=%s for session=%s",
+                file_id,
+                session_id,
+                exc_info=True,
+            )
+            return None
+        new_block[_LOCAL_PATH_FIELD] = str(destination.resolve())
+        new_block["content_type"] = content_type
+        return new_block
+
+    encoded = base64.b64encode(content_resp.content).decode("ascii")
     if block.get("type") == "input_image":
         new_block["image_url"] = f"data:{content_type};base64,{encoded}"
     else:

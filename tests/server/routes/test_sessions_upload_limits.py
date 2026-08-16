@@ -75,16 +75,23 @@ def test_upload_small_text_file_succeeds(upload_client: tuple[TestClient, str]) 
     assert body["name"] == "notes.txt"
 
 
-def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) -> None:
-    """A pptx (binary office doc) is rejected with 415, not stored."""
+def test_upload_accepts_arbitrary_binary_type(upload_client: tuple[TestClient, str]) -> None:
+    """A binary office document is retained as a session resource."""
     client, session_id = upload_client
     pptx_mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     resp = client.post(
         f"/v1/sessions/{session_id}/resources/files",
         files={"file": ("deck.pptx", b"PK\x03\x04 fake pptx bytes", pptx_mime)},
     )
-    assert resp.status_code == 415, resp.text
-    assert "Unsupported attachment type" in resp.text
+    assert resp.status_code in (200, 201), resp.text
+    body = resp.json()
+    assert body["name"] == "deck.pptx"
+    assert body["id"]
+    content = client.get(
+        f"/v1/sessions/{session_id}/resources/files/{body['id']}/content"
+    )
+    assert content.status_code == 200
+    assert content.content == b"PK\x03\x04 fake pptx bytes"
 
 
 def test_upload_rejects_oversized_image(upload_client: tuple[TestClient, str]) -> None:

@@ -967,11 +967,11 @@ def test_attachment_upload_limit_allowed_types(content_type: str, expected_mb: i
         "video/mp4",
     ],
 )
-def test_attachment_upload_limit_rejects_unsupported_types(content_type: str) -> None:
-    """Office/binary/media types are not uploadable (None ⇒ caller 415s)."""
+def test_attachment_upload_limit_accepts_binary_types(content_type: str) -> None:
+    """Office, archive, and media files use the generic attachment cap."""
     from omnigent.runtime.content_resolver import attachment_upload_limit
 
-    assert attachment_upload_limit(content_type) is None
+    assert attachment_upload_limit(content_type) == 25 * 1024 * 1024
 
 
 def test_attachment_upload_limits_are_under_global_ceiling() -> None:

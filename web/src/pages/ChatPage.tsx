@@ -5188,9 +5188,8 @@ export function Composer({
   const [isDragActive, setIsDragActive] = useState(false);
 
   const addFiles = (incoming: File[]) => {
-    // Reject unsupported types (only images, PDF, and text/code) and
-    // oversized files up front — before the upload — with a friendly
-    // message. The server enforces the same limits authoritatively.
+    // Every MIME is attachable; reject only oversized files up front. The
+    // server enforces the same limits authoritatively.
     const { accepted, errors } = validateAttachments(incoming);
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
@@ -5476,7 +5475,6 @@ export function Composer({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*,application/json"
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {
@@ -5719,7 +5717,7 @@ export function Composer({
             ))}
           </div>
         )}
-        {/* Rejected-attachment feedback: unsupported type or too large */}
+        {/* Rejected-attachment feedback: file exceeds its upload cap. */}
         {attachmentError !== null && (
           <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
             {attachmentError}
