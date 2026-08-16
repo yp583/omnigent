@@ -9,6 +9,10 @@ import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 
+const useSessionMockState = vi.hoisted(() => ({
+  session: { hostId: null } as Record<string, unknown>,
+}));
+
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
@@ -25,7 +29,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // (no host bound) without needing a QueryClient provider around these renders.
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
-  useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
+  useSession: () => ({ session: useSessionMockState.session, isLoading: false, error: null }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
@@ -47,10 +51,12 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   }),
 }));
 import type { ElicitationBlock } from "@/lib/blocks";
+import type { PostEventResponse } from "@/lib/sessionsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
 import type { Session } from "@/lib/types";
 import type { QueuedMessage } from "@/store/chatStore";
+import * as sessionsApi from "@/lib/sessionsApi";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -1668,9 +1674,18 @@ describe("Composer config gear", () => {
       nativeVendorOwnsModel: false,
       selectedEffort: null,
       costControlModeOverride: null,
+      sessionHarness: null,
+      status: "idle",
+      sessionStatus: "idle",
       // Opening the gear re-reads the routing switches; stub the fetch away.
       refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
     });
+    useSessionMockState.session = {
+      hostId: null,
+      permissionLevel: null,
+      terminalLaunchArgs: null,
+      labels: {},
+    };
   });
 
   afterEach(() => {
@@ -1742,7 +1757,7 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Model:");
   });
 
-  it("shows a hover summary with Harness/Model/Effort rows and no Permissions row", async () => {
+  it("omits the Permissions row for an SDK harness with no native mode mapping", async () => {
     useChatStore.setState({ selectedEffort: "high", sessionHarness: "claude-sdk" });
     renderWithTooltips(
       <Composer
@@ -1761,8 +1776,64 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Harness:");
     expect(tip.textContent).toContain("Model:");
     expect(tip.textContent).toContain("Effort:");
-    // Effort is switchable in-session; permission mode is not, so it must be absent.
+    // SDK harnesses do not expose a native CLI permission mapping.
     expect(tip.textContent).not.toContain("Permissions");
+  });
+
+  it("changes an idle native session's permission mode and resumes it with new argv", async () => {
+    const calls: string[] = [];
+    const updateSession = vi.spyOn(sessionsApi, "updateSession").mockImplementation(async () => {
+      calls.push("update");
+      return { id: "conv_test" } as Session;
+    });
+    const stopSession = vi.spyOn(sessionsApi, "stopSession").mockImplementation(async () => {
+      calls.push("stop");
+      return {} as PostEventResponse;
+    });
+    const retrySession = vi.spyOn(sessionsApi, "retrySession").mockImplementation(async () => {
+      calls.push("retry");
+      return {} as PostEventResponse;
+    });
+    useSessionMockState.session = {
+      hostId: null,
+      permissionLevel: 4,
+      terminalLaunchArgs: ["--model", "opus", "--permission-mode", "plan"],
+      labels: {},
+    };
+    useChatStore.setState({
+      sessionHarness: "claude-native",
+      status: "idle",
+      sessionStatus: "idle",
+    });
+
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: false,
+          costRoutingEligible: false,
+        })}
+      />,
+    );
+
+    expect(gear()).not.toBeNull();
+    fireEvent.focus(gear()!);
+    expect(await screen.findByTestId("composer-config-gear-tooltip")).toHaveTextContent(
+      "Permissions: Plan",
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    fireEvent.click(screen.getByTestId("composer-config-permission"));
+    fireEvent.click(screen.getByRole("option", { name: "Accept edits" }));
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+
+    await waitFor(() => expect(retrySession).toHaveBeenCalledWith("conv_test"));
+    expect(updateSession).toHaveBeenCalledWith("conv_test", {
+      terminalLaunchArgs: ["--model", "opus", "--permission-mode", "acceptEdits"],
+    });
+    expect(stopSession).toHaveBeenCalledWith("conv_test");
+    expect(calls).toEqual(["update", "stop", "retry"]);
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {

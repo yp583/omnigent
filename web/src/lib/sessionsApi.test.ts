@@ -88,7 +88,9 @@ describe("createSession", () => {
       llmModel: undefined,
       harness: null,
       modelOverride: undefined,
+      terminalLaunchArgs: null,
       costControlModeOverride: undefined,
+      subagentRoutingOverride: undefined,
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
@@ -463,6 +465,27 @@ describe("runner binding", () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ collaboration_mode: "plan" });
     expect(session.labels?.["omnigent.codex_native.collaboration_mode"]).toBe("plan");
+  });
+
+  it("PATCHes terminal_launch_args for a per-session native permission mode", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        terminal_launch_args: ["--permission-mode", "acceptEdits"],
+      }),
+    );
+
+    const session = await updateSession("conv_abc", {
+      terminalLaunchArgs: ["--permission-mode", "acceptEdits"],
+    });
+
+    expect(JSON.parse(fetchMock.mock.calls[0]![1]!.body as string)).toEqual({
+      terminal_launch_args: ["--permission-mode", "acceptEdits"],
+    });
+    expect(session.terminalLaunchArgs).toEqual(["--permission-mode", "acceptEdits"]);
   });
 
   it("surfaces AP error messages from failed PATCHes", async () => {
