@@ -15,6 +15,7 @@ import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHeal
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
+  fetchFileContent,
   fileContentToBlob,
   triggerBrowserDownload,
   useFileContent,
@@ -270,6 +271,15 @@ describe("downloadWorkspaceFile", () => {
     vi.unstubAllGlobals();
   });
 
+  it("encodes an absolute runner path so proxies preserve its leading slash", async () => {
+    await downloadWorkspaceFile("sess_123", "/home/ubuntu/silico/demo.webm");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_123/resources/environments/default/filesystem/%2Fhome/ubuntu/silico/demo.webm",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
   it("propagates fetch errors to the caller", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: false,
@@ -278,6 +288,17 @@ describe("downloadWorkspaceFile", () => {
     } as Response);
 
     await expect(downloadWorkspaceFile("sess_x", "missing.txt")).rejects.toThrow("404");
+  });
+});
+
+describe("fetchFileContent expanded media reads", () => {
+  it("requests the caller-provided bounded byte cap", async () => {
+    await fetchFileContent("sess_media", "videos/demo.webm", { maxBytes: 100 * 1024 * 1024 });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_media/resources/environments/default/filesystem/videos/demo.webm?max_bytes=104857600",
+      expect.objectContaining({ cache: "no-store" }),
+    );
   });
 });
 

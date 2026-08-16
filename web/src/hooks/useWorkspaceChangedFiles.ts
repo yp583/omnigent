@@ -671,6 +671,94 @@ export function toWorkspaceRelativePath(
 }
 
 /**
+ * Resolve a link found inside a workspace document to the path understood by
+ * FileViewer.
+ *
+ * Markdown previews run at the Omnigent web origin, so following an absolute
+ * runner path such as ``/home/ubuntu/project/demo.webm`` as a normal anchor
+ * incorrectly requests that path from the web server and returns a JSON 404.
+ * This resolver keeps HTTP/mail/fragment links external, but turns filesystem
+ * links into either a workspace-relative path (preferred) or an owner-gated
+ * absolute path that the environment filesystem API can authorize.
+ *
+ * Relative links are resolved beside the document containing them, matching
+ * normal Markdown semantics (``reports/index.md`` + ``./demo.webm``).
+ */
+export function resolveSessionFileHref(
+  href: string,
+  documentPath: string,
+  workspaceRoot: string | null,
+  workspaceHome: string | null,
+): string | null {
+  let candidate = href.trim();
+  if (!candidate || candidate.startsWith("#") || candidate.startsWith("//")) return null;
+
+  // file:///... is a common shape in generated reports. It is safe to accept
+  // only local/empty-host file URLs; the server still enforces filesystem
+  // reach and owner permissions when FileViewer fetches the resolved path.
+  if (/^file:/i.test(candidate)) {
+    try {
+      const url = new URL(candidate);
+      if (url.hostname && url.hostname !== "localhost") return null;
+      candidate = url.pathname;
+    } catch {
+      return null;
+    }
+  } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(candidate)) {
+    return null;
+  }
+
+  // Query strings and fragments have no meaning to the filesystem endpoint.
+  // Leave them on the ordinary-link path rather than silently opening a
+  // different file than the document named.
+  if (candidate.includes("?") || candidate.includes("#")) return null;
+  try {
+    candidate = decodeURIComponent(candidate);
+  } catch {
+    return null;
+  }
+  if (!candidate || candidate.includes("\0") || candidate.endsWith("/")) return null;
+
+  if (candidate === "~" || candidate.startsWith("~/")) {
+    if (!workspaceHome) return null;
+    candidate = workspaceHome.replace(/\/+$/, "") + candidate.slice(1);
+  }
+
+  const documentIsAbsolute = documentPath.startsWith("/");
+  const candidateIsAbsolute = candidate.startsWith("/");
+  const baseSegments = candidateIsAbsolute
+    ? []
+    : (documentIsAbsolute ? documentPath : documentPath.replace(/^\/+/, ""))
+        .split("/")
+        .slice(0, -1);
+  const normalized = normalizeLinkedPath([...baseSegments, ...candidate.split("/")]);
+  if (normalized === null) return null;
+
+  const absolute = candidateIsAbsolute || documentIsAbsolute;
+  const resolved = `${absolute ? "/" : ""}${normalized}`;
+  if (!absolute) return resolved;
+
+  // Prefer the historical workspace-relative wire form when possible. It is
+  // available to session collaborators and avoids the stricter owner-only
+  // authorization applied to absolute filesystem browsing.
+  return toWorkspaceRelativePath(resolved, workspaceRoot, workspaceHome) ?? resolved;
+}
+
+function normalizeLinkedPath(segments: string[]): string | null {
+  const normalized: string[] = [];
+  for (const segment of segments) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (normalized.length === 0) return null;
+      normalized.pop();
+      continue;
+    }
+    normalized.push(segment);
+  }
+  return normalized.length > 0 ? normalized.join("/") : null;
+}
+
+/**
  * True when a relative path has any empty, ``.``, or ``..`` segment — i.e. it
  * is non-canonical and could traverse outside its base once resolved.
  */

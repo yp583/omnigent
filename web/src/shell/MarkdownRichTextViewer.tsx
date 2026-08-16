@@ -26,6 +26,7 @@ import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { resolveSessionFileHref } from "@/hooks/useWorkspaceChangedFiles";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -43,6 +44,7 @@ import {
   type SearchDecorationState,
 } from "./TipTapSearchExtension";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
+import { useFileViewer, useWorkspacePaths } from "./FileViewerContext";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import {
@@ -236,6 +238,8 @@ function MarkdownRichTextViewerInner({
   setContentRef,
 }: InnerProps) {
   const [isCopied, setIsCopied] = useState(false);
+  const openFile = useFileViewer();
+  const { root: workspaceRoot, home: workspaceHome } = useWorkspacePaths();
   const copyTimeoutRef = useRef<number>(0);
   useEffect(
     () => () => {
@@ -484,7 +488,13 @@ function MarkdownRichTextViewerInner({
           const anchor = (e.target as Element).closest("a[href]");
           if (anchor) {
             e.preventDefault();
-            window.open(anchor.getAttribute("href")!, "_blank", "noopener,noreferrer");
+            const href = anchor.getAttribute("href")!;
+            const filePath = resolveSessionFileHref(href, path, workspaceRoot, workspaceHome);
+            if (filePath && openFile) {
+              openFile(filePath);
+            } else {
+              window.open(href, "_blank", "noopener,noreferrer");
+            }
           }
         }}
       >

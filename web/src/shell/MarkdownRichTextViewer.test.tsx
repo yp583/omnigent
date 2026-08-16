@@ -13,6 +13,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { FileViewerContext } from "./FileViewerContext";
 
 // ── Module mocks ──────────────────────────────────────────────────────────
 
@@ -109,24 +110,36 @@ function setupEditHooks(
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
 }
 
+const openFile = vi.fn();
+const FILE_VIEWER = {
+  openFile,
+  isChangedPath: () => false,
+  conversationId: "conv_1",
+  workspaceRoot: "/home/ubuntu/silico",
+  workspaceHome: "/home/ubuntu",
+};
+
 function renderViewer(content: string, truncated = false) {
   return render(
-    <MarkdownRichTextViewer
-      content={content}
-      conversationId="conv_1"
-      path="/test.md"
-      isSettled={true}
-      truncated={truncated}
-      comments={[]}
-      activeSelection={null}
-      onSetActiveSelection={() => {}}
-    />,
+    <FileViewerContext.Provider value={FILE_VIEWER}>
+      <MarkdownRichTextViewer
+        content={content}
+        conversationId="conv_1"
+        path="reports/index.md"
+        isSettled={true}
+        truncated={truncated}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+      />
+    </FileViewerContext.Provider>,
   );
 }
 
 // ── Test suite ────────────────────────────────────────────────────────────
 
 beforeEach(() => {
+  openFile.mockReset();
   setupReadOnlyHooks();
 });
 
@@ -290,11 +303,12 @@ describe("MarkdownRichTextViewer link following", () => {
   function clickLink(
     container: HTMLElement,
     eventInit: Parameters<typeof fireEvent.click>[1] = {},
+    href = HREF,
   ) {
     const scroll = container.querySelector(".overflow-auto");
     if (!scroll) throw new Error("scroll container not found");
     const anchor = document.createElement("a");
-    anchor.setAttribute("href", HREF);
+    anchor.setAttribute("href", href);
     scroll.appendChild(anchor);
     fireEvent.click(anchor, eventInit);
   }
@@ -335,6 +349,18 @@ describe("MarkdownRichTextViewer link following", () => {
     open.mockClear();
     clickLink(container, { ctrlKey: true });
     expect(open).toHaveBeenCalledWith(HREF, "_blank", "noopener,noreferrer");
+  });
+
+  it("opens an absolute runner file in FileViewer instead of the web origin", () => {
+    const browserOpen = vi.fn();
+    vi.stubGlobal("open", browserOpen);
+    setupReadOnlyHooks();
+    const { container } = renderViewer("[video](/home/ubuntu/silico/persona-videos/demo.webm)");
+
+    clickLink(container, {}, "/home/ubuntu/silico/persona-videos/demo.webm");
+
+    expect(openFile).toHaveBeenCalledWith("persona-videos/demo.webm");
+    expect(browserOpen).not.toHaveBeenCalled();
   });
 });
 

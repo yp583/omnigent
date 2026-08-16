@@ -2610,6 +2610,7 @@ def create_runner_app(
         FilesystemEntry,
         ResourceError,
     )
+    from omnigent.runner.environment_filesystem import MAX_BROWSER_FILE_BYTES
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -3327,7 +3328,6 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
-
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -5324,7 +5324,6 @@ def create_runner_app(
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
-
         _seq = _ingest_next_seq.get(session_id, 0)
         _ingest_next_seq[session_id] = _seq + 1
         _cond = _ingest_cond.get(session_id)
@@ -8117,6 +8116,7 @@ def create_runner_app(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        max_bytes: int | None = Query(default=None, ge=1, le=MAX_BROWSER_FILE_BYTES),
     ) -> JSONResponse:
         await _require_os_env(session_id)
         return await _fs_list_or_read(
@@ -8127,6 +8127,7 @@ def create_runner_app(
             after=after,
             before=before,
             order=order,
+            max_bytes=max_bytes,
         )
 
     @app.put(
@@ -8634,6 +8635,7 @@ def create_runner_app(
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        max_bytes: int | None = None,
     ) -> JSONResponse:
         from omnigent.runner.environment_filesystem import (
             CallerProcessFilesystem,
@@ -8673,7 +8675,7 @@ def create_runner_app(
                 },
             )
 
-        content = await fs.read(path)
+        content = await fs.read(path, max_bytes=max_bytes)
         content_type_guess, _ = mimetypes.guess_type(path)
         payload: dict[str, object] = {
             "object": "session.environment.filesystem.file_content",

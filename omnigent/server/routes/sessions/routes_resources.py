@@ -32,6 +32,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
+from omnigent.runner.environment_filesystem import MAX_BROWSER_FILE_BYTES
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -251,6 +252,7 @@ def register_resources_routes(
         path: str,
         conversation: Conversation,
         params: dict[str, str] | None = None,
+        timeout: float = 10.0,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -259,6 +261,8 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
+        :param timeout: Runner request timeout in seconds. Large bounded media
+            reads use a longer timeout than metadata and text reads.
         :returns: Parsed JSON response body.
         :raises HTTPException: 502 on runner failure.
         """
@@ -272,7 +276,7 @@ def register_resources_routes(
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.get(path, params=params, timeout=10.0)
+            resp = await runner_client.get(path, params=params, timeout=timeout)
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
@@ -315,6 +319,7 @@ def register_resources_routes(
         host_params: dict[str, Any],
         runner_path: str,
         runner_params: dict[str, str] | None = None,
+        runner_timeout: float = 10.0,
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
@@ -334,6 +339,7 @@ def register_resources_routes(
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.
+        :param runner_timeout: Runner request timeout in seconds.
         :param host_workspace_resolver: Resolves the absolute root the host
             reader should be rooted at, for an absolute browse target.
             Awaited ONLY when the fallback is actually taken: a live runner
@@ -353,6 +359,7 @@ def register_resources_routes(
                 runner_path,
                 conversation,
                 params=runner_params,
+                timeout=runner_timeout,
             )
         except OmnigentError as exc:
             # Only the runner-offline case is a candidate for the host
@@ -1978,6 +1985,7 @@ def register_resources_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        max_bytes: int | None = Query(default=None, ge=1, le=MAX_BROWSER_FILE_BYTES),
     ) -> Any:
         """
         Read a file or list a directory in an environment.
@@ -1991,6 +1999,8 @@ def register_resources_routes(
         :param after: Cursor entry id for forward pagination.
         :param before: Cursor entry id for backward pagination.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param max_bytes: Optional bounded file-read cap, up to 100 MiB. Used
+            by browser media previews; directory listings ignore it.
         :returns: File content or directory listing.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
@@ -1998,6 +2008,8 @@ def register_resources_routes(
             params["after"] = after
         if before is not None:
             params["before"] = before
+        if max_bytes is not None:
+            params["max_bytes"] = str(max_bytes)
 
         # A leading slash means an absolute location rather than a path under
         # the workspace, so it is owner-only: the workspace is the session's
@@ -2042,8 +2054,10 @@ def register_resources_routes(
                     "after": after,
                     "before": before,
                     "order": order,
+                    "max_bytes": max_bytes,
                 },
                 runner_path=path,
+                runner_timeout=60.0 if max_bytes is not None else 10.0,
                 host_workspace_resolver=resolver,
             ),
         )

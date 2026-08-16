@@ -52,6 +52,10 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OpResult, OSEnvironment
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Explicit browser media reads may raise the bounded cap to this value. The
+# ceiling stays server-owned so a query cannot make the runner buffer an
+# unbounded file through the JSON/base64 filesystem transport.
+MAX_BROWSER_FILE_BYTES = 100 * 1024 * 1024  # 100 MiB
 # Cap on entries a single search may examine. Distinct from the result
 # cap: a query matching little or nothing never fills the results, so
 # without this a search from a large directory would walk it entirely.

@@ -21,6 +21,7 @@ import {
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
   relativizeToWorkspace,
+  resolveSessionFileHref,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
   toWorkspaceRelativePath,
@@ -843,6 +844,57 @@ describe("toWorkspaceRelativePath", () => {
     // home "/" + "/ws/foo.md" must not become "//ws/foo.md" (which wouldn't
     // match root "/ws"). Guards the trailing-slash strip on home expansion.
     expect(toWorkspaceRelativePath("~/ws/foo.md", "/ws", "/")).toBe("foo.md");
+  });
+});
+
+describe("resolveSessionFileHref", () => {
+  const ROOT = "/home/ubuntu/silico";
+  const HOME = "/home/ubuntu";
+
+  it.each([
+    [
+      "/home/ubuntu/silico/persona-videos/demo.webm",
+      "reports/index.md",
+      "persona-videos/demo.webm",
+      "absolute runner path under the workspace",
+    ],
+    [
+      "../persona-videos/demo.webm",
+      "reports/index.md",
+      "persona-videos/demo.webm",
+      "relative sibling path",
+    ],
+    [
+      "./demo%20clip.webm",
+      "persona-videos/index.md",
+      "persona-videos/demo clip.webm",
+      "URL-encoded filename",
+    ],
+    [
+      "file:///home/ubuntu/silico/persona-videos/demo.webm",
+      "reports/index.md",
+      "persona-videos/demo.webm",
+      "local file URL",
+    ],
+    [
+      "/home/ubuntu/shared/demo.webm",
+      "reports/index.md",
+      "/home/ubuntu/shared/demo.webm",
+      "owner-gated absolute path outside the workspace",
+    ],
+  ])("resolves %s from %s -> %s (%s)", (href, documentPath, expected) => {
+    expect(resolveSessionFileHref(href, documentPath, ROOT, HOME)).toBe(expected);
+  });
+
+  it.each([
+    "https://example.com/demo.webm",
+    "mailto:person@example.com",
+    "#results",
+    "//cdn.example.com/demo.webm",
+    "javascript:alert(1)",
+    "../../../escape.webm",
+  ])("leaves non-file or escaping href %s alone", (href) => {
+    expect(resolveSessionFileHref(href, "reports/index.md", ROOT, HOME)).toBeNull();
   });
 });
 

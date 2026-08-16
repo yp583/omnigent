@@ -10,6 +10,7 @@ the subprocess/os codepaths are exercised end to end.
 
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 from pathlib import Path
@@ -129,6 +130,21 @@ def test_read_oversize_file_is_capped_and_flagged(tmp_path: Path, monkeypatch) -
     assert result["truncated"] is True
     assert result["content"] == "01234567"  # exactly the first cap bytes
     assert result["bytes"] == 8
+
+
+def test_read_honors_explicit_bounded_byte_cap(tmp_path: Path, monkeypatch) -> None:
+    """A media preview can opt into a larger, still-bounded file read."""
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 8)
+    media = b"\xff\xfe\xfd\xfc0123456789ab"
+    (tmp_path / "demo.webm").write_bytes(media)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("demo.webm", max_bytes=16)
+
+    assert result["truncated"] is False
+    assert result["bytes"] == 16
+    assert result["encoding"] == "base64"
+    assert base64.b64decode(result["content"]) == media
 
 
 def test_oversize_text_split_on_codepoint_stays_text(tmp_path: Path, monkeypatch) -> None:

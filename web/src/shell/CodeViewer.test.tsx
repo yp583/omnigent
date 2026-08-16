@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import { CodeViewer } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
+import { FileViewerContext } from "./FileViewerContext";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -83,7 +84,30 @@ function makePdfQuery(
   } as unknown as ReturnType<typeof useFileContent>;
 }
 
+function makeMediaQuery(truncated = false): ReturnType<typeof useFileContent> {
+  return {
+    data: {
+      content: "AAAA",
+      encoding: "base64",
+      content_type: "video/webm",
+      truncated,
+    },
+    isLoading: false,
+    isError: false,
+    isSuccess: true,
+    error: null,
+  } as unknown as ReturnType<typeof useFileContent>;
+}
+
 const noopRef = { current: null };
+const previewOpenFile = vi.fn();
+const PREVIEW_FILE_VIEWER = {
+  openFile: previewOpenFile,
+  isChangedPath: () => false,
+  conversationId: "conv_1",
+  workspaceRoot: "/home/ubuntu/silico",
+  workspaceHome: "/home/ubuntu",
+};
 
 function renderViewer(
   content: string,
@@ -280,6 +304,31 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(container.querySelector("h2")?.textContent).toBe("Subtitle");
   });
 
+  it("opens an absolute runner-file link in FileViewer instead of navigating", () => {
+    previewOpenFile.mockReset();
+    const { container } = render(
+      <FileViewerContext.Provider value={PREVIEW_FILE_VIEWER}>
+        <CodeViewer
+          conversationId="conv_1"
+          path="reports/index.md"
+          fileQuery={makeFileQuery("[video](/home/ubuntu/silico/persona-videos/demo.webm)")}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen={true}
+          searchOpen={false}
+          setSearchOpen={() => {}}
+          searchInputRef={noopRef}
+          viewMode="preview"
+        />
+      </FileViewerContext.Provider>,
+    );
+
+    fireEvent.click(container.querySelector("a")!);
+
+    expect(previewOpenFile).toHaveBeenCalledWith("persona-videos/demo.webm");
+  });
+
   it("renders bullet and ordered lists", () => {
     const { container } = renderMd("- one\n- two\n\n1. first\n2. second");
     expect(container.querySelectorAll("ul li")).toHaveLength(2);
@@ -402,6 +451,50 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(img).not.toBeNull();
     expect(img?.style.width).toBe("200px");
     expect(img?.style.height).toBe("100px");
+  });
+});
+
+describe("CodeViewer media rendering", () => {
+  beforeEach(() => {
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn(() => "blob:media-preview"),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderMedia(truncated = false) {
+    return render(
+      <CodeViewer
+        conversationId="conv_1"
+        path="persona-videos/demo.webm"
+        fileQuery={makeMediaQuery(truncated)}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen={true}
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="source"
+      />,
+    );
+  }
+
+  it("renders a complete WebM in the browser video player", async () => {
+    renderMedia();
+    const video = await screen.findByLabelText("Video preview: demo.webm");
+    expect(video).toHaveAttribute("src", "blob:media-preview");
+    expect(screen.queryByText(/binary file/i)).toBeNull();
+  });
+
+  it("does not mount a corrupt player for a server-truncated video", () => {
+    renderMedia(true);
+    expect(screen.queryByLabelText("Video preview: demo.webm")).toBeNull();
+    expect(screen.getByText(/too large to preview completely/i)).toBeDefined();
   });
 });
 

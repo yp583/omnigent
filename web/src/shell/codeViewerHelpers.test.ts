@@ -5,6 +5,7 @@ import {
   getSelectionOffsets,
   indexToLine,
   getModelFormat,
+  getBrowserMediaKind,
   isBinaryPath,
   isImageFile,
   isModelFile,
@@ -215,6 +216,21 @@ describe("isPdfFile", () => {
     expect(isPdfFile("report.pdf", null)).toBe(true);
     expect(isPdfFile("report.pdf", undefined)).toBe(true);
     expect(isPdfFile("notes.txt", null)).toBe(false);
+  });
+});
+
+describe("getBrowserMediaKind", () => {
+  it.each([
+    ["recording.webm", null, "video"],
+    ["recording.MP4", undefined, "video"],
+    ["voice.mp3", null, "audio"],
+    ["blob", "video/webm", "video"],
+    ["blob.bin", "audio/ogg", "audio"],
+    ["recording.webm", "application/octet-stream", "video"],
+    ["recording.webm", "text/plain", null],
+    ["notes.txt", null, null],
+  ])("classifies %s (%s) as %s", (path, contentType, expected) => {
+    expect(getBrowserMediaKind(path, contentType)).toBe(expected);
   });
 });
 

@@ -145,6 +145,27 @@ export function isPdfFile(path: string, contentType?: string | null): boolean {
   return path.split(".").pop()?.toLowerCase() === "pdf";
 }
 
+export type BrowserMediaKind = "audio" | "video";
+
+const VIDEO_EXTENSIONS = new Set(["mp4", "webm", "ogv", "mov", "m4v"]);
+const AUDIO_EXTENSIONS = new Set(["mp3", "wav", "ogg", "oga", "m4a", "aac", "flac"]);
+
+/** Return the browser-native media player suitable for a file, if any. */
+export function getBrowserMediaKind(
+  path: string,
+  contentType?: string | null,
+): BrowserMediaKind | null {
+  if (contentType?.startsWith("video/")) return "video";
+  if (contentType?.startsWith("audio/")) return "audio";
+  // A generic binary MIME carries no useful classification, so fall back to
+  // the extension. A specific non-media MIME remains authoritative.
+  if (contentType && contentType !== "application/octet-stream") return null;
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  if (VIDEO_EXTENSIONS.has(ext)) return "video";
+  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
+  return null;
+}
+
 // 3D model formats we render in an interactive WebGL preview (three.js). Scoped
 // deliberately to the three loaders we ship — STL, 3MF, OBJ — and nothing else.
 export type ModelFormat = "stl" | "3mf" | "obj";

@@ -129,6 +129,7 @@ class WorkspaceReader:
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        max_bytes: int | None = None,
     ) -> _WorkspacePayload:
         """List a directory or read a file, mirroring ``_fs_list_or_read``.
 
@@ -137,13 +138,15 @@ class WorkspaceReader:
         :param after: Forward-pagination cursor entry id.
         :param before: Backward-pagination cursor entry id.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param max_bytes: Optional bounded file-read cap. Directory listings
+            ignore it; the public API limits it to 100 MiB.
         :returns: A directory-listing dict or a file-content dict.
         :raises WorkspaceReaderError: On invalid path or missing file.
         """
         resolved = self._resolve(path)
         if resolved.is_dir():
             return self._list_dir(path, resolved, limit, after, before, order)
-        return self._read_file(path, resolved)
+        return self._read_file(path, resolved, max_bytes=max_bytes)
 
     def _list_dir(
         self,
@@ -221,27 +224,29 @@ class WorkspaceReader:
         resolved: Path,
         *,
         limit: int | None = _DEFAULT_READ_LIMIT,
+        max_bytes: int | None = None,
     ) -> _WorkspacePayload:
         """Build the file-content payload for a resolved file.
 
         Text files are UTF-8 decoded and line-capped at ``limit``; binary
-        files are base64-encoded.  Both are byte-capped at
-        :data:`_MAX_READ_BYTES`.  Shape matches the runner's file-content
+        files are base64-encoded. Both are byte-capped at ``max_bytes`` or
+        :data:`_MAX_READ_BYTES`. Shape matches the runner's file-content
         response, including the mimetype guess.
 
-        Reads at most ``_MAX_READ_BYTES`` from disk (like the runner's
-        bounded read) rather than slurping the whole file, so opening a
-        multi-GB file in the viewer can't OOM the host process.
+        Reads only the active byte cap from disk (like the runner's bounded
+        read) rather than slurping the whole file, so opening a multi-GB file
+        in the viewer cannot OOM the host process.
         """
+        byte_cap = max_bytes or _MAX_READ_BYTES
         try:
             with resolved.open("rb") as fh:
                 # One extra byte lets us detect (and flag) truncation
                 # without loading the rest of a large file into memory.
-                capped = fh.read(_MAX_READ_BYTES + 1)
+                capped = fh.read(byte_cap + 1)
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
 
-        return self._file_content_payload(rel, capped, limit=limit)
+        return self._file_content_payload(rel, capped, limit=limit, max_bytes=byte_cap)
 
     def _file_content_payload(
         self,
@@ -249,13 +254,14 @@ class WorkspaceReader:
         raw: bytes,
         *,
         limit: int | None,
+        max_bytes: int = _MAX_READ_BYTES,
     ) -> _WorkspacePayload:
         """Assemble the file-content dict from raw bytes."""
         content_type_guess, _ = mimetypes.guess_type(rel)
         truncated = False
         capped = raw
-        if len(capped) > _MAX_READ_BYTES:
-            capped = capped[:_MAX_READ_BYTES]
+        if len(capped) > max_bytes:
+            capped = capped[:max_bytes]
             truncated = True
 
         text: str | None = None

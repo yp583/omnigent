@@ -172,6 +172,23 @@ async def test_read_file_content(
 
 
 @pytest.mark.asyncio
+async def test_read_file_content_honors_bounded_max_bytes(
+    client: httpx.AsyncClient,
+) -> None:
+    """The runner forwards a requested media byte cap into its filesystem."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt?max_bytes=5"
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["content"] == "hello"
+    assert body["bytes"] == 5
+    assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
 async def test_read_binary_file_content(
     client: httpx.AsyncClient,
 ) -> None:

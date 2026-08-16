@@ -25,15 +25,29 @@ export interface FileContentResponse {
   truncated?: boolean;
 }
 
+export interface FileContentOptions {
+  /** Request a larger bounded read, used for browser-playable media. */
+  maxBytes?: number;
+}
+
 export async function fetchFileContent(
   conversationId: string,
   path: string,
+  options: FileContentOptions = {},
 ): Promise<FileContentResponse> {
-  // Encode each path segment individually so slashes remain structural.
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  const url =
+  // Encode each path segment individually so slashes remain structural. An
+  // absolute runner path needs its leading slash encoded: a literal double
+  // slash is commonly collapsed by proxies before FastAPI can distinguish it
+  // from a workspace-relative path.
+  const absolute = path.startsWith("/");
+  const encodedTail = path.replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
+  const encodedPath = absolute ? `%2F${encodedTail}` : encodedTail;
+  let url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}`;
+  if (options.maxBytes !== undefined) {
+    url += `?max_bytes=${encodeURIComponent(String(options.maxBytes))}`;
+  }
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as FileContentResponse;
@@ -113,7 +127,11 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * once at end-of-turn, avoiding continuous refetches that would reset the
  * editor's scroll and cursor position.
  */
-export function useFileContent(conversationId: string | undefined, path: string | null) {
+export function useFileContent(
+  conversationId: string | undefined,
+  path: string | null,
+  options: FileContentOptions = {},
+) {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =
@@ -143,7 +161,7 @@ export function useFileContent(conversationId: string | undefined, path: string 
 
   return useQuery({
     queryKey: ["file-content", conversationId, path],
-    queryFn: () => fetchFileContent(conversationId!, path!),
+    queryFn: () => fetchFileContent(conversationId!, path!, options),
     enabled: !!conversationId && !!path && serveable !== false,
     staleTime: 5_000,
   });

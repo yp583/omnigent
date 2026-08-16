@@ -2825,6 +2825,36 @@ async def test_filesystem_path_omits_absent_cursors(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_path_forwards_bounded_media_read_cap(
+    client: httpx.AsyncClient,
+) -> None:
+    """A media preview's max_bytes reaches the runner unchanged."""
+    fake_runner = _FakeRunnerClient(payload=_fs_binary_read_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/videos/demo.webm?max_bytes=104857600"
+    )
+
+    assert resp.status_code == 200
+    assert "max_bytes=104857600" in fake_runner.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_path_rejects_unbounded_media_read_cap(
+    client: httpx.AsyncClient,
+) -> None:
+    """The public route rejects reads above the server-owned 100 MiB cap."""
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/videos/demo.webm?max_bytes=104857601"
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_filesystem_read_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:

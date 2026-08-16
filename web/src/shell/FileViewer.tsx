@@ -88,6 +88,7 @@ import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
+  getBrowserMediaKind,
   isImageFile,
   isModelFile,
   isNotebookPath,
@@ -370,7 +371,11 @@ function FileViewerBody({
   // visible. No-op off iOS / with the keyboard closed. Not needed frameless
   // (embedded in the desktop aside, never a fixed overlay).
   const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
-  const fileQuery = useFileContent(conversationId, path);
+  // Ordinary text/image reads retain the conservative 10 MiB server default.
+  // Browser-playable recordings need enough headroom to return a complete
+  // short demo; the server independently enforces this same hard maximum.
+  const mediaPreviewMaxBytes = getBrowserMediaKind(path) ? 100 * 1024 * 1024 : undefined;
+  const fileQuery = useFileContent(conversationId, path, { maxBytes: mediaPreviewMaxBytes });
   const diffQuery = useFileDiff(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
@@ -629,6 +634,7 @@ function FileViewerBody({
   // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
   const isPdf = isPdfFile(path, fileQuery.data?.content_type);
+  const isMedia = getBrowserMediaKind(path, fileQuery.data?.content_type) !== null;
   // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
@@ -637,6 +643,7 @@ function FileViewerBody({
   const isDiffAvailable =
     !isImage &&
     !isPdf &&
+    !isMedia &&
     !isModel &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =

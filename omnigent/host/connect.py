@@ -2367,12 +2367,14 @@ class HostProcess:
 
         r = cast("WorkspaceReader", reader)
         if op == "list_or_read":
+            raw_max_bytes = params.get("max_bytes")
             return r.list_or_read(
                 str(params.get("path", "")),
                 limit=_coerce_int(params.get("limit", 20)),
                 after=cast("str | None", params.get("after")),
                 before=cast("str | None", params.get("before")),
                 order=str(params.get("order", "desc")),
+                max_bytes=(_coerce_int(raw_max_bytes) if raw_max_bytes is not None else None),
             )
         if op == "changes":
             return r.changes(session_id)

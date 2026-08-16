@@ -51,12 +51,14 @@ import {
   type useFileContent,
 } from "@/hooks/useFileContent";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { resolveSessionFileHref } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
   type ActiveSelection,
   type SaveStatus,
   detectLang,
+  getBrowserMediaKind,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
@@ -74,6 +76,7 @@ import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
+import { useFileViewer, useWorkspacePaths } from "./FileViewerContext";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
 // actually viewed, so the initial bundle and markdown/preview paths don't pay
@@ -181,18 +184,31 @@ const MARKDOWN_COMPONENTS: Components = {
 
 function MarkdownPreview({
   content,
+  path,
   rootRef,
   onScroll,
 }: {
   content: string;
+  path: string;
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
 }) {
+  const openFile = useFileViewer();
+  const { root: workspaceRoot, home: workspaceHome } = useWorkspacePaths();
   return (
     <div
       ref={rootRef}
       data-preview-scroll
       onScroll={onScroll}
+      onClick={(event) => {
+        const anchor = (event.target as Element).closest("a[href]");
+        if (!anchor || !openFile) return;
+        const href = anchor.getAttribute("href")!;
+        const filePath = resolveSessionFileHref(href, path, workspaceRoot, workspaceHome);
+        if (!filePath) return;
+        event.preventDefault();
+        openFile(filePath);
+      }}
       className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
     >
       <ReactMarkdown
@@ -212,6 +228,7 @@ function MarkdownPreview({
 // recompute when the rendered document changes.
 function PreviewWithSearch({
   content,
+  path,
   isNotebook,
   truncated,
   searchOpen,
@@ -221,6 +238,7 @@ function PreviewWithSearch({
   scrollReady,
 }: {
   content: string;
+  path: string;
   isNotebook: boolean;
   truncated: boolean;
   searchOpen: boolean;
@@ -247,7 +265,7 @@ function PreviewWithSearch({
   const preview = isNotebook ? (
     <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   ) : (
-    <MarkdownPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
+    <MarkdownPreview content={content} path={path} rootRef={previewRef} onScroll={handleScroll} />
   );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
@@ -327,6 +345,49 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
     <div className="flex h-full flex-col">
       <TruncatedBanner />
       {body}
+    </div>
+  );
+}
+
+function MediaViewer({ data, path }: { data: FileContentResponse; path: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const mediaKind = getBrowserMediaKind(path, data.content_type);
+
+  useEffect(() => {
+    if (data.truncated || !mediaKind) {
+      setUrl(null);
+      return;
+    }
+    const objectUrl = URL.createObjectURL(fileContentToBlob(data));
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [data, mediaKind]);
+
+  if (data.truncated) {
+    return (
+      <div className="flex h-full flex-col">
+        <TruncatedBanner />
+        <div className="flex flex-1 items-center justify-center p-8 text-ui text-muted-foreground">
+          Media is too large to preview completely.
+        </div>
+      </div>
+    );
+  }
+  if (!url || !mediaKind) return null;
+  const filename = path.split("/").pop() ?? path;
+  return (
+    <div className="flex h-full items-center justify-center overflow-auto bg-black/5 p-4 dark:bg-black/20">
+      {mediaKind === "video" ? (
+        <video
+          src={url}
+          controls
+          preload="metadata"
+          aria-label={`Video preview: ${filename}`}
+          className="max-h-full max-w-full rounded bg-black shadow-sm"
+        />
+      ) : (
+        <audio src={url} controls preload="metadata" aria-label={`Audio preview: ${filename}`} />
+      )}
     </div>
   );
 }
@@ -706,6 +767,9 @@ export function CodeViewer({
       </Suspense>
     );
   }
+  if (fileQuery.data && getBrowserMediaKind(path, fileQuery.data.content_type)) {
+    return <MediaViewer data={fileQuery.data} path={path} />;
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
@@ -754,6 +818,7 @@ export function CodeViewer({
     return (
       <PreviewWithSearch
         content={content}
+        path={path}
         isNotebook={isNotebookPath(path)}
         truncated={truncated}
         searchOpen={searchOpen}
