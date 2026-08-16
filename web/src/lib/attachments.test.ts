@@ -45,12 +45,12 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
   });
 
-  it("rejects office/binary types", () => {
+  it("classifies office/binary types for runner materialization", () => {
     const pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-    expect(classifyAttachment(makeFile("deck.pptx", pptx))).toBeNull();
-    expect(classifyAttachment(makeFile("a.zip", "application/zip"))).toBeNull();
-    expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBeNull();
-    expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBeNull();
+    expect(classifyAttachment(makeFile("deck.pptx", pptx))).toBe("binary");
+    expect(classifyAttachment(makeFile("a.zip", "application/zip"))).toBe("binary");
+    expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBe("binary");
+    expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBe("binary");
   });
 });
 
@@ -62,12 +62,11 @@ describe("validateAttachments", () => {
     expect(errors).toHaveLength(0);
   });
 
-  it("rejects unsupported types with a message", () => {
+  it("accepts arbitrary binary types within the global limit", () => {
     const pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     const { accepted, errors } = validateAttachments([makeFile("deck.pptx", pptx)]);
-    expect(accepted).toHaveLength(0);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("deck.pptx");
+    expect(accepted).toHaveLength(1);
+    expect(errors).toHaveLength(0);
   });
 
   it("rejects files over their per-type size limit", () => {
@@ -82,7 +81,7 @@ describe("validateAttachments", () => {
     const badType = makeFile("a.zip", "application/zip");
     const tooBig = makeFile("big.pdf", "application/pdf", ATTACHMENT_SIZE_LIMITS_MB.pdf * MB + 1);
     const { accepted, errors } = validateAttachments([ok, badType, tooBig]);
-    expect(accepted).toEqual([ok]);
-    expect(errors).toHaveLength(2);
+    expect(accepted).toEqual([ok, badType]);
+    expect(errors).toHaveLength(1);
   });
 });

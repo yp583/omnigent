@@ -4055,8 +4055,6 @@ async def _forward_native_terminal_message(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
-    file_store: FileStore | None = None,
-    artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
 ) -> None:
     """
@@ -4072,11 +4070,6 @@ async def _forward_native_terminal_message(
         ``"conv_abc123"``.
     :param conv: Conversation row for *session_id*.
     :param body: Sessions API message event to inject.
-    :param file_store: Optional file metadata store for resolving
-        ``file_id`` references in ``input_image`` / ``input_file``
-        content blocks.
-    :param artifact_store: Optional binary content store for
-        fetching file bytes during resolution.
     :param model_override: Routed model to apply for this turn, carried
         in-band on the message so the executor applies ``/model`` and the
         inject under one lock (no separate racing ``model_change``).
@@ -4096,28 +4089,10 @@ async def _forward_native_terminal_message(
         else type(event.get("content")).__name__,
         event.get("model_override"),
     )
-    if (
-        file_store is not None
-        and artifact_store is not None
-        and isinstance(event.get("content"), list)
-    ):
-        from omnigent.runtime.content_resolver import (
-            _resolve_message_content,
-        )
-
-        try:
-            event["content"] = _resolve_message_content(
-                event["content"],
-                file_store,
-                artifact_store,
-                session_id=session_id,
-            )
-        except (ValueError, KeyError):
-            _logger.warning(
-                "File reference resolution failed for native session=%s",
-                session_id,
-                exc_info=True,
-            )
+    # Keep file_id references intact for native sessions. The selected runner
+    # downloads them directly into its private attachment directory and gives
+    # the coding agent a local path. This avoids a 4/3 base64 expansion in the
+    # server-to-runner JSON body and works for arbitrary binary formats.
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
@@ -5518,8 +5493,6 @@ async def _dispatch_session_event_to_runner_impl(
                 session_id,
                 conv,
                 body,
-                file_store=file_store,
-                artifact_store=artifact_store,
                 # The executor speaks the pane's own vocabulary, so it takes the
                 # routed id; ``None`` when the pane has no spelling for it.
                 model_override=(

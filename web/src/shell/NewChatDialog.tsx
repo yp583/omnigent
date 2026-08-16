@@ -1827,10 +1827,8 @@ export function NewChatLandingScreen() {
   const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Reject unsupported types (only images, PDF, and text/code) and oversized
-  // files here, before the session exists. Without this the upload only fails
-  // after the session is created and navigated into, where the first turn's
-  // 415 strands the typed message in a session the user never wanted.
+  // Every MIME is attachable; reject only oversized files before the session
+  // exists so the first turn cannot strand a too-large attachment.
   const addFiles = (incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming);
     if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
@@ -3989,7 +3987,6 @@ export function NewChatLandingScreen() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/*,application/pdf,text/*,application/json"
               className="hidden"
               data-testid="new-chat-landing-file-input"
               onChange={(e) => {
@@ -4057,7 +4054,7 @@ export function NewChatLandingScreen() {
                 ))}
               </div>
             )}
-            {/* Rejected-attachment feedback: unsupported type or too large */}
+            {/* Rejected-attachment feedback: file exceeds its upload cap. */}
             {attachmentError !== null && (
               <div
                 className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap"

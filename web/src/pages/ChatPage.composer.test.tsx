@@ -1559,9 +1559,7 @@ describe("Composer file-attachment focus", () => {
     expect(document.activeElement).toBe(ta);
   });
 
-  it("does not focus the textarea when the attachment is rejected", () => {
-    // An unsupported type is dropped by validateAttachments, so no file is
-    // added — and with nothing attached there's no reason to yank focus back.
+  it("focuses the textarea after an arbitrary binary is attached", () => {
     render(<Composer {...composerProps()} />);
     const ta = textarea();
     ta.blur();
@@ -1570,21 +1568,7 @@ describe("Composer file-attachment focus", () => {
     const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
 
-    expect(document.activeElement).not.toBe(ta);
-  });
-
-  it("clears the rejection notice once the user types", () => {
-    // The rejected file is never attached, so there is no chip to remove and
-    // nothing else clears the notice. Left sticky it reads as a blocker on a
-    // composer that can actually be submitted.
-    render(<Composer {...composerProps()} />);
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
-    fireEvent.change(fileInput(), { target: { files: [bad] } });
-    expect(screen.getByText(/can't be attached/)).toBeTruthy();
-
-    fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
-
-    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(document.activeElement).toBe(ta);
   });
 });
 

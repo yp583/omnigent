@@ -132,25 +132,22 @@ _TEXT_LIKE_APPLICATION_MIMES: frozenset[str] = frozenset(
 )
 
 
-def attachment_upload_limit(content_type: str) -> int | None:
+def attachment_upload_limit(content_type: str) -> int:
     """
-    Max upload size (bytes) for *content_type*, or ``None`` if the type is
-    not an allowed attachment.
+    Max upload size (bytes) for *content_type*.
 
     Allowed: images, PDF, and text-like files (``text/*`` plus a few
     text-bearing ``application/*`` types — JSON, JS, JSONL, notebooks).
-    Office / binary formats (pptx, docx, xlsx, zip, …) return ``None`` and
-    are rejected at upload: the model can't read their raw bytes
-    (Anthropic's base64 ``document`` source accepts only PDF), so inlining
-    them only produces garbled UTF-8 or — for large files — an oversized,
-    context-blowing request. Callers reject ``None`` with HTTP 415.
+    Office / binary formats (pptx, docx, xlsx, zip, …) use the global cap.
+    Native harnesses download those files to the runner and receive a local
+    path; they are never blindly decoded as text. SDK harnesses retain their
+    provider-specific inline behavior for formats they support.
 
     :param content_type: The resolved MIME type, e.g. ``"image/png"``.
         Use :func:`_resolve_content_type` to derive it from the upload's
         declared type + filename first.
-    :returns: The per-type byte limit (still subject to
-        :data:`MAX_ATTACHMENT_UPLOAD_BYTES`), or ``None`` when the type is
-        not an allowed attachment.
+    :returns: The per-type byte limit, bounded by
+        :data:`MAX_ATTACHMENT_UPLOAD_BYTES`.
     """
     if content_type.startswith("image/"):
         return MAX_IMAGE_UPLOAD_BYTES
@@ -158,7 +155,7 @@ def attachment_upload_limit(content_type: str) -> int | None:
         return MAX_PDF_UPLOAD_BYTES
     if content_type.startswith("text/") or content_type in _TEXT_LIKE_APPLICATION_MIMES:
         return MAX_TEXT_UPLOAD_BYTES
-    return None
+    return MAX_ATTACHMENT_UPLOAD_BYTES
 
 
 # Extensions accepted as text/code attachments even when the upload's

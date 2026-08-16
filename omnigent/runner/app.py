@@ -917,6 +917,7 @@ async def _resolve_forwarded_message_content(
     *,
     session_id: str,
     server_client: httpx.AsyncClient,
+    materialize_to_disk: bool = False,
 ) -> list[_JsonObject]:
     """Resolve server-uploaded ``file_id`` blocks inside the runner.
 
@@ -935,7 +936,10 @@ async def _resolve_forwarded_message_content(
         new_block = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
             new_block = await resolve_file_id_block(
-                block, session_id=session_id, client=server_client
+                block,
+                session_id=session_id,
+                client=server_client,
+                to_disk=materialize_to_disk,
             )
         if new_block is None:
             resolved.append(block)
@@ -6672,6 +6676,7 @@ def create_runner_app(
                         _raw_content,
                         session_id=conversation_id,
                         server_client=server_client,
+                        materialize_to_disk=_is_native_harness(conversation_id),
                     )
 
                 if conversation_id in _active_turns:
