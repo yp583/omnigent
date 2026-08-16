@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ConductorPage } from "./ConductorPage";
@@ -46,6 +46,22 @@ function renderPage() {
     <QueryClientProvider client={client}>
       <MemoryRouter>
         <ConductorPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+function renderRoutedPage() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/conductor"]}>
+        <Routes>
+          <Route path="/conductor" element={<ConductorPage />} />
+          <Route path="/conductor/:conversationId" element={<div>Conductor chat</div>} />
+        </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -99,7 +115,7 @@ describe("ConductorPage", () => {
     await waitFor(() => expect(conductorApi.bindConductor).toHaveBeenCalledWith(session.id));
   });
 
-  it("shows owned work and steers the selected session", async () => {
+  it("opens the bound Conductor as a chat", async () => {
     vi.mocked(conductorApi.getConductorDashboard).mockResolvedValue({
       conductor: {
         conversationId: "conductor-session",
@@ -111,24 +127,8 @@ describe("ConductorPage", () => {
       memoryProviders: ["markdown"],
       sessions: [session],
     });
-    renderPage();
+    renderRoutedPage();
 
-    expect(await screen.findByText("Session ledger")).toBeInTheDocument();
-    expect(screen.getByText("Fix onboarding")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Steer" }));
-    fireEvent.change(screen.getByLabelText("Message Fix onboarding"), {
-      target: { value: "Run the focused tests first" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Send steering message" }));
-
-    await waitFor(() =>
-      expect(sessionsApi.postEvent).toHaveBeenCalledWith(session.id, {
-        type: "message",
-        data: {
-          role: "user",
-          content: [{ type: "input_text", text: "Run the focused tests first" }],
-        },
-      }),
-    );
+    expect(await screen.findByText("Conductor chat")).toBeInTheDocument();
   });
 });

@@ -285,15 +285,16 @@ interface SidebarProps {
 }
 
 /**
- * Which top-level nav button (New session / Inbox) is active for the current
+ * Which top-level nav button is active for the current
  * route.
  *
  * The inbox route has no param to key off, and the sidebar is basename-agnostic
  * (in embedded mode the routing seam rebases `to="/inbox"` → `${basename}/inbox`
  * behind its back), so `useMatch` / `NavLink` can't be used without knowing the
- * mount path. Instead compare the active route's last non-empty path segment,
- * which is `inbox` in both standalone and embedded modes. Conversation ids are
- * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
+ * mount path. Instead inspect the active route's non-empty path segments,
+ * which preserves the same result in standalone and embedded modes. Conductor
+ * owns a nested chat route (`/conductor/:conversationId`), so it is active when
+ * that segment occurs anywhere rather than only when it is the leaf.
  */
 function useActiveNavItem(): {
   isNewChatPage: boolean;
@@ -305,9 +306,10 @@ function useActiveNavItem(): {
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
-  const leaf = location.pathname.split("/").filter(Boolean).at(-1);
+  const segments = location.pathname.split("/").filter(Boolean);
+  const leaf = segments.at(-1);
   const isInboxPage = leaf === "inbox";
-  const isConductorPage = leaf === "conductor";
+  const isConductorPage = segments.includes("conductor");
   const isTasksPage = leaf === "tasks";
   const isUsagePage = leaf === "usage";
   const isNewSessionRoute =

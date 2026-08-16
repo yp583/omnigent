@@ -1,5 +1,6 @@
 import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Navigate } from "react-router-dom";
 import {
   ArrowUpRightIcon,
   BotIcon,
@@ -43,7 +44,7 @@ import {
   type PullRequestSummary,
 } from "@/lib/nativeBridge";
 import { relativeTime } from "@/lib/relativeTime";
-import { Link } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
 import { postEvent } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
 
@@ -51,6 +52,7 @@ const DASHBOARD_KEY = ["conductor", "dashboard"] as const;
 const MEMORY_KEY = ["conductor", "memory"] as const;
 
 export function ConductorPage() {
+  const [searchParams] = useSearchParams();
   const dashboard = useQuery({
     queryKey: DASHBOARD_KEY,
     queryFn: getConductorDashboard,
@@ -70,7 +72,13 @@ export function ConductorPage() {
   if (!dashboard.data.conductor) {
     return <ConductorSetup sessions={dashboard.data.sessions} />;
   }
-  return <ConductorWorkspace dashboard={dashboard.data} />;
+  if (searchParams.get("view") === "overview") {
+    return <ConductorWorkspace dashboard={dashboard.data} />;
+  }
+  // Conductor is a persistent chat agent, not a dashboard the user has to
+  // operate. Once its transcript is bound, the top-level nav opens that chat
+  // directly; the session itself can inspect and steer the owner-wide ledger.
+  return <Navigate to={`/conductor/${dashboard.data.conductor.conversationId}`} replace />;
 }
 
 function ConductorSetup({ sessions }: { sessions: ConductorSession[] }) {
