@@ -11,7 +11,14 @@ from starlette.requests import HTTPConnection
 
 from omnigent.conductor import MarkdownArtifactMemoryProvider, MemoryProviderRegistry
 from omnigent.errors import OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    AuthProvider,
+)
 from omnigent.server.routes.conductor import create_conductor_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -184,7 +191,7 @@ def test_legacy_ordinary_binding_is_hidden_and_repaired(db_uri: str, tmp_path: P
     assert conversations.get_conversation(conductor.id).labels["omnigent.conductor"] == "true"  # type: ignore[union-attr]
 
 
-def test_runtime_authorization_rejects_shared_and_foreign_sessions(
+def test_shared_sessions_are_listed_readable_and_steerable_only_with_edit(
     db_uri: str, tmp_path: Path
 ) -> None:
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -220,11 +227,22 @@ def test_runtime_authorization_rejects_shared_and_foreign_sessions(
     alice = {"X-Forwarded-Email": "alice@example.com"}
     conductor = conversations.create_conversation(agent_id=CONDUCTOR_AGENT_ID)
     owned = conversations.create_conversation(agent_id=ORDINARY_AGENT_ID)
-    foreign = conversations.create_conversation(agent_id="c" * 32)
+    shared = conversations.create_conversation(agent_id="c" * 32, title="Team review")
+    shared_child = conversations.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=shared.id,
+        agent_id="d" * 32,
+        title="worker:shared-child",
+    )
+    foreign = conversations.create_conversation(agent_id="e" * 32)
+    public_only = conversations.create_conversation(agent_id="f" * 32)
     permissions.grant("alice@example.com", conductor.id, LEVEL_OWNER)
     permissions.grant("alice@example.com", owned.id, LEVEL_OWNER)
+    permissions.grant("bob@example.com", shared.id, LEVEL_OWNER)
+    permissions.grant("alice@example.com", shared.id, LEVEL_READ)
     permissions.grant("bob@example.com", foreign.id, LEVEL_OWNER)
-    permissions.grant("alice@example.com", foreign.id, LEVEL_READ)
+    permissions.grant("bob@example.com", public_only.id, LEVEL_OWNER)
+    permissions.grant(RESERVED_USER_PUBLIC, public_only.id, LEVEL_READ)
     assert (
         client.put(
             "/v1/conductor", json={"conversation_id": conductor.id}, headers=alice
@@ -232,15 +250,74 @@ def test_runtime_authorization_rejects_shared_and_foreign_sessions(
         == 200
     )
 
-    allowed = client.get(
+    sessions = {
+        item["id"]: item for item in client.get("/v1/conductor", headers=alice).json()["sessions"]
+    }
+    assert set(sessions) == {owned.id, shared.id}
+    assert sessions[owned.id]["access_scope"] == "personal"
+    assert sessions[owned.id]["owner_user_id"] == "alice@example.com"
+    assert sessions[owned.id]["can_steer"] is True
+    assert sessions[shared.id]["access_scope"] == "shared"
+    assert sessions[shared.id]["owner_user_id"] == "bob@example.com"
+    assert sessions[shared.id]["permission_level"] == LEVEL_READ
+    assert sessions[shared.id]["can_steer"] is False
+    assert sessions[shared.id]["conductor_eligible"] is False
+
+    owned_read = client.get(
         f"/v1/conductor/sessions/{owned.id}/authorization",
         params={"caller_session_id": conductor.id},
         headers=alice,
     )
-    denied = client.get(
+    shared_read = client.get(
+        f"/v1/conductor/sessions/{shared_child.id}/authorization",
+        params={"caller_session_id": conductor.id, "action": "read"},
+        headers=alice,
+    )
+    shared_steer = client.get(
+        f"/v1/conductor/sessions/{shared.id}/authorization",
+        params={"caller_session_id": conductor.id, "action": "steer"},
+        headers=alice,
+    )
+    foreign_read = client.get(
         f"/v1/conductor/sessions/{foreign.id}/authorization",
         params={"caller_session_id": conductor.id},
         headers=alice,
     )
-    assert allowed.status_code == 200
-    assert denied.status_code == 404
+    public_read = client.get(
+        f"/v1/conductor/sessions/{public_only.id}/authorization",
+        params={"caller_session_id": conductor.id},
+        headers=alice,
+    )
+    assert owned_read.status_code == 200
+    assert owned_read.json()["allowed"] is True
+    assert shared_read.status_code == 200
+    assert shared_read.json()["allowed"] is True
+    assert shared_read.json()["access_scope"] == "shared"
+    assert shared_read.json()["root_conversation_id"] == shared.id
+    assert shared_steer.status_code == 200
+    assert shared_steer.json()["allowed"] is False
+    assert shared_steer.json()["can_read"] is True
+    assert foreign_read.status_code == 404
+    assert public_read.status_code == 404
+
+    permissions.grant("alice@example.com", shared.id, LEVEL_EDIT)
+    editable = client.get(
+        f"/v1/conductor/sessions/{shared.id}/authorization",
+        params={"caller_session_id": conductor.id, "action": "steer"},
+        headers=alice,
+    )
+    assert editable.status_code == 200
+    assert editable.json()["allowed"] is True
+    assert editable.json()["permission_level"] == LEVEL_EDIT
+
+    assert permissions.revoke("alice@example.com", shared.id) is True
+    revoked = client.get(
+        f"/v1/conductor/sessions/{shared.id}/authorization",
+        params={"caller_session_id": conductor.id, "action": "read"},
+        headers=alice,
+    )
+    assert revoked.status_code == 404
+    remaining_ids = {
+        item["id"] for item in client.get("/v1/conductor", headers=alice).json()["sessions"]
+    }
+    assert shared.id not in remaining_ids

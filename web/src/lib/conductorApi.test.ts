@@ -47,6 +47,10 @@ describe("Conductor API", () => {
             created_at: 11,
             updated_at: 12,
             git_branch: "feature/demo",
+            access_scope: "shared",
+            owner_user_id: "owner@example.com",
+            permission_level: 1,
+            can_steer: false,
           },
         ],
       }),
@@ -58,6 +62,10 @@ describe("Conductor API", () => {
     expect(dashboard.sessions[0]).toMatchObject({
       pendingApprovalCount: 2,
       gitBranch: "feature/demo",
+      accessScope: "shared",
+      ownerUserId: "owner@example.com",
+      permissionLevel: 1,
+      canSteer: false,
     });
   });
 

@@ -77,7 +77,7 @@ export function ConductorPage() {
   }
   // Conductor is a persistent chat agent, not a dashboard the user has to
   // operate. Once its transcript is bound, the top-level nav opens that chat
-  // directly; the session itself can inspect and steer the owner-wide ledger.
+  // directly; the session itself can inspect the permission-bounded ledger.
   return <Navigate to={`/conductor/${dashboard.data.conductor.conversationId}`} replace />;
 }
 
@@ -103,8 +103,9 @@ function ConductorSetup({ sessions }: { sessions: ConductorSession[] }) {
           Give one session the wider view.
         </h1>
         <p className="mt-6 max-w-xl text-base leading-7 text-muted-foreground">
-          Your Conductor gets a dedicated transcript and memory, watches the sessions you own, and
-          routes you to work that needs a decision. Existing work chats are never reused.
+          Your Conductor gets a dedicated transcript and memory, watches sessions you own or that
+          teammates share with you, and routes you to work that needs a decision. Existing work
+          chats are never reused.
         </p>
       </div>
 
@@ -188,6 +189,17 @@ function ConductorWorkspace({
     (count, session) => count + session.pendingApprovalCount,
     0,
   );
+  const [ledgerScope, setLedgerScope] = useState<"personal" | "shared" | "all">("personal");
+  const personalSessions = dashboard.sessions.filter(
+    (session) => session.accessScope === "personal",
+  );
+  const sharedSessions = dashboard.sessions.filter((session) => session.accessScope === "shared");
+  const visibleSessions =
+    ledgerScope === "all"
+      ? dashboard.sessions
+      : ledgerScope === "shared"
+        ? sharedSessions
+        : personalSessions;
   const queryClient = useQueryClient();
   const providerChange = useMutation({
     mutationFn: updateConductorMemoryProvider,
@@ -212,7 +224,8 @@ function ConductorWorkspace({
           </div>
           <h1 className="text-3xl font-semibold tracking-[-0.035em]">Conductor</h1>
           <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
-            One operational view across your sessions. Shared sessions stay outside this scope.
+            One operational view across your sessions and chats teammates explicitly shared with
+            you.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
@@ -248,29 +261,52 @@ function ConductorWorkspace({
         </div>
       </header>
 
-      <ConductorPullRequests sessions={dashboard.sessions} />
+      <ConductorPullRequests sessions={personalSessions} />
 
       <div className="grid gap-10 pt-8 lg:grid-cols-[minmax(0,1.55fr)_minmax(19rem,0.85fr)]">
         <section aria-labelledby="active-work-heading">
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <h2
               id="active-work-heading"
               className="text-xs font-semibold tracking-[0.12em] uppercase"
             >
               Session ledger
             </h2>
-            <span className="text-xs text-muted-foreground">{dashboard.sessions.length} owned</span>
+            <div className="flex items-center gap-1" aria-label="Session scope">
+              {(
+                [
+                  ["personal", `Mine ${personalSessions.length}`],
+                  ["shared", `Shared ${sharedSessions.length}`],
+                  ["all", `All ${dashboard.sessions.length}`],
+                ] as const
+              ).map(([scope, label]) => (
+                <Button
+                  key={scope}
+                  type="button"
+                  size="sm"
+                  variant={ledgerScope === scope ? "secondary" : "ghost"}
+                  aria-pressed={ledgerScope === scope}
+                  onClick={() => setLedgerScope(scope)}
+                >
+                  {label}
+                </Button>
+              ))}
+            </div>
           </div>
           <div className="divide-y border-y">
-            {dashboard.sessions.length === 0 ? (
+            {visibleSessions.length === 0 ? (
               <div className="py-12">
-                <p className="text-sm font-medium">No other sessions yet.</p>
+                <p className="text-sm font-medium">
+                  {ledgerScope === "shared" ? "No chats shared with you." : "No sessions here yet."}
+                </p>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  New work will appear here as soon as you start it.
+                  {ledgerScope === "shared"
+                    ? "A teammate’s chat appears here after they share it directly with you."
+                    : "New work will appear here as soon as you start it."}
                 </p>
               </div>
             ) : (
-              dashboard.sessions.map((session) => (
+              visibleSessions.map((session) => (
                 <SessionLedgerRow key={session.id} session={session} />
               ))
             )}
@@ -326,6 +362,11 @@ function SessionLedgerRow({ session }: { session: ConductorSession }) {
                 Needs response
               </span>
             )}
+            {session.accessScope === "shared" && (
+              <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+                {session.canSteer ? "Shared · can steer" : "Shared · read only"}
+              </span>
+            )}
           </div>
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
             {session.gitBranch && (
@@ -335,13 +376,18 @@ function SessionLedgerRow({ session }: { session: ConductorSession }) {
               </span>
             )}
             <span>{relativeTime(session.updatedAt * 1000)}</span>
+            {session.accessScope === "shared" && session.ownerUserId && (
+              <span className="truncate">Shared by {session.ownerUserId}</span>
+            )}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <Button variant="ghost" size="sm" onClick={() => setSteering((value) => !value)}>
-            <MessageSquareTextIcon className="size-3.5" />
-            Steer
-          </Button>
+          {session.canSteer && (
+            <Button variant="ghost" size="sm" onClick={() => setSteering((value) => !value)}>
+              <MessageSquareTextIcon className="size-3.5" />
+              Steer
+            </Button>
+          )}
           <Button asChild variant={session.pendingApprovalCount ? "outline" : "ghost"} size="sm">
             <Link to={`/c/${session.id}`}>{session.pendingApprovalCount ? "Review" : "Open"}</Link>
           </Button>

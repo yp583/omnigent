@@ -38,6 +38,10 @@ const session: conductorApi.ConductorSession = {
   taskSummary: null,
   agentName: "conductor",
   conductorEligible: true,
+  accessScope: "personal",
+  ownerUserId: "me@example.com",
+  permissionLevel: 4,
+  canSteer: true,
 };
 
 function renderPage() {
@@ -63,6 +67,21 @@ function renderRoutedPage() {
         <Routes>
           <Route path="/conductor" element={<ConductorPage />} />
           <Route path="/conductor/:conversationId" element={<div>Conductor chat</div>} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+function renderOverviewPage() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/conductor?view=overview"]}>
+        <Routes>
+          <Route path="/conductor" element={<ConductorPage />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -155,5 +174,44 @@ describe("ConductorPage", () => {
     renderRoutedPage();
 
     expect(await screen.findByText("Conductor chat")).toBeInTheDocument();
+  });
+
+  it("separates shared chats and hides steering for read-only grants", async () => {
+    const sharedSession: conductorApi.ConductorSession = {
+      ...session,
+      id: "shared-session",
+      title: "Team launch review",
+      accessScope: "shared",
+      ownerUserId: "teammate@example.com",
+      permissionLevel: 1,
+      canSteer: false,
+      conductorEligible: false,
+    };
+    vi.mocked(conductorApi.getConductorDashboard).mockResolvedValue({
+      conductor: {
+        conversationId: "conductor-session",
+        memoryProvider: "markdown",
+        config: {},
+        createdAt: 1,
+        updatedAt: null,
+      },
+      memoryProviders: ["markdown"],
+      sessions: [session, sharedSession],
+    });
+    renderOverviewPage();
+
+    expect(await screen.findByText("Fix onboarding")).toBeInTheDocument();
+    expect(screen.queryByText("Team launch review")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Shared 1" }));
+    expect(await screen.findByText("Team launch review")).toBeInTheDocument();
+    expect(screen.getByText("Shared · read only")).toBeInTheDocument();
+    expect(screen.getByText("Shared by teammate@example.com")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Steer" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Open" })).toHaveAttribute("href", "/c/shared-session");
+
+    fireEvent.click(screen.getByRole("button", { name: "All 2" }));
+    expect(screen.getByText("Fix onboarding")).toBeInTheDocument();
+    expect(screen.getByText("Team launch review")).toBeInTheDocument();
   });
 });

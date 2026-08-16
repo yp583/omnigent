@@ -31,7 +31,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -2200,6 +2200,7 @@ async def _send_to_existing_session(
                 target_session_id,
                 conversation_id=conversation_id,
                 server_client=server_client,
+                action="steer",
             )
             if denied is not None:
                 return denied
@@ -3739,8 +3740,9 @@ async def _authorize_conductor_target(
     *,
     conversation_id: str,
     server_client: httpx.AsyncClient,
+    action: Literal["read", "steer"],
 ) -> str | None:
-    """Ask the server to prove the active Conductor owns a target's root.
+    """Ask the server to prove the active Conductor can read or steer a target.
 
     ``None`` means authorized. A JSON error string is returned for every
     failure so callers fail closed without leaking a foreign session's
@@ -3749,15 +3751,29 @@ async def _authorize_conductor_target(
     try:
         response = await server_client.get(
             f"/v1/conductor/sessions/{target_session_id}/authorization",
-            params={"caller_session_id": conversation_id},
+            params={"caller_session_id": conversation_id, "action": action},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"conductor authorization failed: {exc}"})
-    if response.status_code == 200 and response.json().get("allowed") is True:
-        return None
+    if response.status_code == 200:
+        authorization = response.json()
+        if authorization.get("allowed") is True:
+            return None
+        if action == "steer" and authorization.get("can_read") is True:
+            return json.dumps(
+                {
+                    "error": "session_read_only",
+                    "session_id": target_session_id,
+                    "message": (
+                        "This session was shared read-only. Its owner must grant edit "
+                        "access before Conductor can steer it."
+                    ),
+                }
+            )
+        return json.dumps({"error": "session_not_accessible", "session_id": target_session_id})
     if response.status_code == 404:
-        return json.dumps({"error": "session_not_owned", "session_id": target_session_id})
+        return json.dumps({"error": "session_not_accessible", "session_id": target_session_id})
     if response.status_code in (401, 403):
         return json.dumps({"error": "active_conductor_required"})
     return json.dumps(
@@ -3773,7 +3789,7 @@ async def _conductor_session_list_via_rest(
     server_client: httpx.AsyncClient,
     agent_name: object = None,
 ) -> str:
-    """Return child sessions plus the active Conductor's owner-only ledger."""
+    """Return children plus the active Conductor's permission-aware ledger."""
     try:
         response = await server_client.get("/v1/conductor", timeout=30.0)
     except Exception as exc:  # noqa: BLE001
@@ -3790,7 +3806,7 @@ async def _conductor_session_list_via_rest(
     sessions = [
         {
             "session_id": row.get("id"),
-            "agent_name": None,
+            "agent_name": row.get("agent_name"),
             "title": row.get("title"),
             "status": row.get("status"),
             "runner_id": None,
@@ -3800,11 +3816,13 @@ async def _conductor_session_list_via_rest(
             "git_branch": row.get("git_branch"),
             "pending_approval_count": row.get("pending_approval_count"),
             "task_summary": row.get("task_summary"),
+            "access_scope": row.get("access_scope"),
+            "owner_user_id": row.get("owner_user_id"),
+            "permission_level": row.get("permission_level"),
+            "can_steer": row.get("can_steer"),
         }
         for row in rows
-        # The dashboard currently has no agent-name projection. If an agent
-        # filter was requested, fail narrow instead of returning false matches.
-        if not (isinstance(agent_name, str) and agent_name)
+        if not (isinstance(agent_name, str) and agent_name) or row.get("agent_name") == agent_name
     ]
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
     return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
@@ -3974,6 +3992,7 @@ async def _execute_session_query_tool(
                 target,
                 conversation_id=conversation_id,
                 server_client=server_client,
+                action="read",
             )
             if denied is not None:
                 return denied

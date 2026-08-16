@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 
 from omnigent.conductor import MarkdownArtifactMemoryProvider, MemoryProviderRegistry
 from omnigent.entities import Conductor, Conversation, MemoryDocument, MemoryRevision
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.schemas import (
     BindConductorRequest,
@@ -77,7 +83,7 @@ def create_conductor_router(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
 ) -> APIRouter:
-    """Build the Conductor API with strict owner-only session scope."""
+    """Build the Conductor API with permission-aware cross-session scope."""
     router = APIRouter()
 
     def _provider_for(conductor: Conductor):
@@ -109,47 +115,97 @@ def create_conductor_router(
         assert conductor is not None
         return conductor
 
-    def _owned_sessions(user_id: str | None, conductor_id: str | None) -> list[dict[str, Any]]:
+    def _accessible_sessions(
+        user_id: str | None, conductor_id: str | None
+    ) -> list[dict[str, Any]]:
+        scope_user = _scope_user(user_id)
         page = conversation_store.list_conversations(
             limit=200,
             kind="default",
             has_agent_id=True,
-            owned_by=user_id if permission_store is not None else None,
+            accessible_by=scope_user if permission_store is not None else None,
             include_archived=False,
             order="desc",
             sort_by="updated_at",
         )
+        sessions = [session for session in page.data if session.id != conductor_id]
         agent_names = agent_store.get_names(
-            list({session.agent_id for session in page.data if session.agent_id is not None})
+            list({session.agent_id for session in sessions if session.agent_id is not None})
         )
-        return [
-            {
-                "id": session.id,
-                "title": session.title,
-                "status": session.live_status or "idle",
-                "pending_approval_count": session.pending_elicitation_count or 0,
-                "updated_at": session.updated_at,
-                "created_at": session.created_at,
-                "workspace": session.workspace,
-                "git_branch": session.git_branch,
-                "task_summary": session.task_summary,
-                "agent_name": agent_names.get(session.agent_id or ""),
-                "conductor_eligible": agent_names.get(session.agent_id or "")
-                == CONDUCTOR_AGENT_NAME,
-            }
-            for session in page.data
-            if session.id != conductor_id
-        ]
+        grants_by_session = (
+            permission_store.list_for_sessions([session.id for session in sessions])
+            if permission_store is not None
+            else {}
+        )
+        user_is_admin = (
+            permission_store.is_admin(scope_user) if permission_store is not None else False
+        )
+        rows: list[dict[str, Any]] = []
+        for session in sessions:
+            if permission_store is None:
+                access_scope = "personal"
+                owner: str | None = scope_user
+                permission_level = LEVEL_OWNER
+            else:
+                grants = grants_by_session.get(session.id, [])
+                owner = next(
+                    (grant.user_id for grant in grants if grant.level >= LEVEL_OWNER),
+                    None,
+                )
+                direct_level = next(
+                    (grant.level for grant in grants if grant.user_id == scope_user),
+                    None,
+                )
+                permission_level = LEVEL_OWNER if user_is_admin else direct_level or 0
+                access_scope = "personal" if owner in (None, scope_user) else "shared"
+            agent_name = agent_names.get(session.agent_id or "")
+            rows.append(
+                {
+                    "id": session.id,
+                    "title": session.title,
+                    "status": session.live_status or "idle",
+                    "pending_approval_count": session.pending_elicitation_count or 0,
+                    "updated_at": session.updated_at,
+                    "created_at": session.created_at,
+                    "workspace": session.workspace,
+                    "git_branch": session.git_branch,
+                    "task_summary": session.task_summary,
+                    "agent_name": agent_name,
+                    "conductor_eligible": (
+                        access_scope == "personal" and agent_name == CONDUCTOR_AGENT_NAME
+                    ),
+                    "access_scope": access_scope,
+                    "owner_user_id": owner,
+                    "permission_level": permission_level,
+                    "can_steer": permission_level >= LEVEL_EDIT,
+                }
+            )
+        return rows
 
-    def _owned_target(user_id: str | None, target_id: str) -> Conversation | None:
-        """Return a private target, including descendants of an owned root."""
+    def _target_access(
+        user_id: str | None, target_id: str
+    ) -> tuple[Conversation, str, str | None, int, bool] | None:
+        """Resolve current read/steer access to a target's permission root."""
         target = conversation_store.get_conversation(target_id)
         if target is None:
             return None
         if permission_store is None:
-            return target
-        owner = conversation_store.get_session_owner(target.root_conversation_id or target.id)
-        return target if user_id is not None and owner == user_id else None
+            return target, "personal", _scope_user(user_id), LEVEL_OWNER, True
+        root_id = target.root_conversation_id or target.id
+        scope_user = _scope_user(user_id)
+        direct_grant = permission_store.get(scope_user, root_id)
+        if direct_grant is None or direct_grant.level < LEVEL_READ:
+            # Conductor scope is deliberately narrower than ordinary session
+            # reads: public-link access does not count as a teammate sharing a
+            # chat directly with this user.
+            return None
+        owner = conversation_store.get_session_owner(root_id)
+        permission_level = (
+            LEVEL_OWNER if permission_store.is_admin(scope_user) else direct_grant.level
+        )
+        access_scope = "personal" if owner in (None, scope_user) else "shared"
+        can_steer = permission_level >= LEVEL_EDIT
+        return target, access_scope, owner, permission_level, can_steer
 
     def _require_active_caller(scope_user: str, caller_session_id: str) -> Conductor:
         conductor = _load(scope_user)
@@ -171,7 +227,7 @@ def create_conductor_router(
             # history; PUT repairs the row once a real Conductor chat is made.
             conductor = None
         sessions = await asyncio.to_thread(
-            _owned_sessions,
+            _accessible_sessions,
             user_id,
             conductor.conversation_id if conductor is not None else None,
         )
@@ -283,19 +339,27 @@ def create_conductor_router(
         request: Request,
         session_id: str,
         caller_session_id: str = Query(min_length=1),
+        action: Literal["read", "steer"] = Query(default="read"),
     ) -> dict[str, Any]:
-        """Authorize the active Conductor against an exactly owned session tree."""
+        """Authorize a Conductor read or steer against an accessible tree."""
         user_id = require_user(request, auth_provider)
         scope_user = _scope_user(user_id)
         conductor = await asyncio.to_thread(_require_active_caller, scope_user, caller_session_id)
         if session_id == conductor.conversation_id:
-            raise OmnigentError("The Conductor cannot steer itself", code=ErrorCode.INVALID_INPUT)
-        target = await asyncio.to_thread(_owned_target, user_id, session_id)
-        if target is None:
-            # Do not reveal whether a foreign or shared session exists.
+            raise OmnigentError("The Conductor cannot target itself", code=ErrorCode.INVALID_INPUT)
+        target_access = await asyncio.to_thread(_target_access, user_id, session_id)
+        if target_access is None:
+            # Do not reveal whether an inaccessible session exists.
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        target, access_scope, owner, permission_level, can_steer = target_access
         return {
-            "allowed": True,
+            "allowed": action == "read" or can_steer,
+            "action": action,
+            "can_read": True,
+            "can_steer": can_steer,
+            "access_scope": access_scope,
+            "owner_user_id": owner,
+            "permission_level": permission_level,
             "session_id": target.id,
             "root_conversation_id": target.root_conversation_id,
             "parent_session_id": target.parent_conversation_id,

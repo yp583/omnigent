@@ -20,6 +20,10 @@ export interface ConductorSession {
   taskSummary: string | null;
   agentName: string | null;
   conductorEligible: boolean;
+  accessScope: "personal" | "shared";
+  ownerUserId: string | null;
+  permissionLevel: number;
+  canSteer: boolean;
 }
 
 export interface ConductorDashboard {
@@ -57,6 +61,10 @@ interface SessionWire {
   task_summary?: string | null;
   agent_name?: string | null;
   conductor_eligible?: boolean;
+  access_scope?: "personal" | "shared";
+  owner_user_id?: string | null;
+  permission_level?: number;
+  can_steer?: boolean;
 }
 
 interface MemoryWire {
@@ -91,6 +99,10 @@ function parseSession(wire: SessionWire): ConductorSession {
     taskSummary: wire.task_summary ?? null,
     agentName: wire.agent_name ?? null,
     conductorEligible: wire.conductor_eligible ?? false,
+    accessScope: wire.access_scope ?? "personal",
+    ownerUserId: wire.owner_user_id ?? null,
+    permissionLevel: wire.permission_level ?? 4,
+    canSteer: wire.can_steer ?? true,
   };
 }
 

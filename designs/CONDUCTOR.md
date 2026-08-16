@@ -10,10 +10,11 @@ an owner-scoped control plane, pluggable memory, and a focused operational UI.
 - The active transcript must be a top-level session whose bound agent is named
   `conductor`; ordinary Claude, Codex, and custom-agent history is never
   eligible. The server enforces this independently of the UI.
-- The dashboard lists top-level sessions the user owns. Shared sessions never
-  enter Conductor scope.
-- The Conductor may read or steer an owned session and any descendant in that
-  session's spawn tree. It may not use a read/share grant as authority to steer.
+- The dashboard lists top-level sessions the user owns plus sessions directly
+  shared with that user. Public-link-only sessions never enter Conductor scope.
+- The Conductor may read an owned or shared session and any descendant in that
+  session's spawn tree. Steering requires edit-or-higher access; a read grant is
+  never treated as control authority.
 - Cross-session steering queues a normal user message in the target. The target
   remains independent; it is not registered as a fake Conductor child and does
   not fan results into the Conductor inbox.
@@ -30,9 +31,10 @@ not sufficient: every privileged runtime operation also proves that the caller
 conversation is the user's active Conductor binding at the server.
 
 For a target session, the server resolves its `root_conversation_id` and checks
-the exact owner grant on that root. A shared or foreign target returns the same
-not-found response as a missing target. Single-user deployments treat local
-sessions as owner-scoped.
+the caller's current grant on that root for every read or steering request. A
+foreign target returns the same not-found response as a missing target; a
+read-only shared target returns an explicit non-steerable authorization result.
+Single-user deployments treat local sessions as owner-scoped.
 
 ## Memory providers
 
@@ -52,6 +54,32 @@ The canonical starter set is:
 A future provider implements the same list/read/write/history/delete contract
 and registers under a stable name. Switching providers never replaces the
 Conductor transcript.
+
+## Shared team session sources
+
+The Conductor includes sessions that teammates explicitly share with the
+current user. Shared sessions are additional permissioned sources, not a
+widening to every session in a workspace.
+
+- The existing direct session grant is the opt-in boundary. Merely belonging to
+  a workspace and public-link access do not add a transcript to the ledger.
+- Results retain source, owner, workspace, and sharing provenance so the UI and
+  the Conductor can distinguish personal work from team context.
+- Access is checked when listing and every time content is read. Revoking the
+  underlying share removes the session from Conductor scope immediately.
+- A read grant remains read-only. The existing edit-or-higher grant is the
+  operator grant for steering; spawning, approval, and other consequential
+  actions retain their separate gates.
+- The shipped Conductor prompt forbids silently copying shared content into
+  durable personal memory. An explicit user request is required, and saved
+  material retains the source session id and owner as provenance.
+- The dashboard supports personal-only, shared-with-me, and combined views,
+  with the personal-only view as the safe default.
+
+Team-collection opt-in and global cross-session content indexing remain future
+work. The first implementation uses the existing workspace identity and direct,
+durable session grants and performs targeted transcript reads through the
+normal session authorization path.
 
 ## UI
 
