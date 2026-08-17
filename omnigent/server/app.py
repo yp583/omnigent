@@ -63,6 +63,7 @@ from omnigent.server.performance_metrics import (
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
+from omnigent.server.routes.conductor import create_conductor_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
@@ -207,6 +208,7 @@ WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_CONDUCTOR_AGENT_NAME = "conductor"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # polly's and debby's multi-file bundles are packaged under
@@ -217,6 +219,9 @@ _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+_CONDUCTOR_BUNDLE_SOURCE = resolve_repo_symlink(
+    Path(_examples_resources.__file__).parent / "conductor"
+)
 
 
 class _FastAPICallNext(Protocol):
@@ -521,6 +526,7 @@ def _ensure_default_agents(
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_conductor_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -780,6 +786,38 @@ def _ensure_default_polly_agent(
     )
 
 
+def _build_conductor_bundle() -> bytes:
+    """Build the packaged Conductor agent bundle."""
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(_CONDUCTOR_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_conductor_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the built-in owner-private Conductor agent."""
+    if not (_CONDUCTOR_BUNDLE_SOURCE / "config.yaml").is_file():
+        _logger.debug(
+            "conductor bundle not found at %s; skipping seed",
+            _CONDUCTOR_BUNDLE_SOURCE,
+        )
+        return
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CONDUCTOR_AGENT_NAME,
+        bundle_bytes=_build_conductor_bundle(),
+    )
+
+
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -792,6 +830,8 @@ def create_app(
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
     project_store: ProjectStore | None = None,
+    conductor_store: Any | None = None,
+    memory_providers: Any | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -841,6 +881,10 @@ def create_app(
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
+    :param conductor_store: Owner-scoped singleton Conductor bindings. When
+        paired with ``memory_providers``, enables the Conductor API.
+    :param memory_providers: Provider registry for Conductor memory. Kept
+        provider-neutral so deployments can inject a different backend.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -2117,6 +2161,19 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
+    if conductor_store is not None and memory_providers is not None:
+        app.include_router(
+            create_conductor_router(
+                conductor_store,
+                memory_providers,
+                conversation_store,
+                agent_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["conductor"],
+        )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.

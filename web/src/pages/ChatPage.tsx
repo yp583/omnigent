@@ -34,7 +34,7 @@ import {
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
-import { useNavigate, useParams } from "@/lib/routing";
+import { useLocation, useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   Conversation,
@@ -757,6 +757,8 @@ function TranscriptBubbleShell({
  */
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
+  const location = useLocation();
+  const isConductorChat = location.pathname.split("/").filter(Boolean).includes("conductor");
   const navigate = useNavigate();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
@@ -1340,6 +1342,7 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
+      isConductorChat={isConductorChat}
       bubbles={bubbles}
       status={status}
       isWorking={isWorking}
@@ -1683,6 +1686,8 @@ export function SelectionPopup({
 }
 
 interface MainAgentSurfaceProps {
+  /** Whether this transcript is the owner-wide Conductor chat. */
+  isConductorChat: boolean;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
    * to MainTerminalView so the inline terminal can target the right
@@ -1859,6 +1864,7 @@ export function updateWarmTerminalSurfaces(
  */
 function MainAgentSurface({
   conversationId,
+  isConductorChat,
   bubbles,
   status,
   isWorking,
@@ -2245,12 +2251,16 @@ function MainAgentSurface({
                     <ConversationEmptyState>
                       <div className="space-y-1.5">
                         <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                          What should we work on?
+                          {isConductorChat
+                            ? "What needs your attention?"
+                            : "What should we work on?"}
                         </h3>
                         <p className="text-muted-foreground text-ui">
                           {agentsError
                             ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                            : "Send a message to get started."}
+                            : isConductorChat
+                              ? "Ask about any session, decision, pull request, or next move."
+                              : "Send a message to get started."}
                         </p>
                       </div>
                     </ConversationEmptyState>

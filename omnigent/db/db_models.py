@@ -743,6 +743,81 @@ class SqlProject(OmnigentBase):
     )
 
 
+class SqlConductor(OmnigentBase):
+    """Owner-private binding between a user and their singleton Conductor chat."""
+
+    __tablename__ = "conductors"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    memory_provider: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="markdown"
+    )
+    config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ux_conductors_conversation_id",
+            "workspace_id",
+            "conversation_id",
+            unique=True,
+        ),
+    )
+
+
+class SqlMemoryDocument(OmnigentBase):
+    """Current manifest row for an owner-private Markdown memory file."""
+
+    __tablename__ = "memory_documents"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    path_hash: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    current_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class SqlMemoryRevision(OmnigentBase):
+    """Immutable revision manifest for a Markdown memory blob."""
+
+    __tablename__ = "memory_revisions"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    path_hash: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.

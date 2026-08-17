@@ -1056,6 +1056,18 @@ def test_ensure_default_polly_agent_seeds_card(seed_stores: _SeedStores) -> None
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+def test_ensure_default_conductor_agent_seeds_card(seed_stores: _SeedStores) -> None:
+    """The dedicated Conductor agent is available in the new-session picker."""
+    server_app._ensure_default_conductor_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    seeded = seed_stores.agent_store.get_by_name(server_app._CONDUCTOR_AGENT_NAME)
+    assert seeded is not None
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
 def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -> None:
     """
     Seeding registers antigravity-native-ui as a built-in the picker renders.

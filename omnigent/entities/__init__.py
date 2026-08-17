@@ -3,6 +3,7 @@
 from omnigent.entities.account import Account, AccountToken
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.comment import Comment, CommentsFingerprint
+from omnigent.entities.conductor import Conductor, MemoryDocument, MemoryRevision
 from omnigent.entities.conversation import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -47,6 +48,7 @@ __all__ = [
     "Comment",
     "CommentsFingerprint",
     "CompactionData",
+    "Conductor",
     "Conversation",
     "ConversationItem",
     "DeviceGrant",
@@ -55,6 +57,8 @@ __all__ = [
     "FunctionCallOutputData",
     "ItemData",
     "LoadedAgent",
+    "MemoryDocument",
+    "MemoryRevision",
     "MessageData",
     "NativeToolData",
     "NewConversationItem",

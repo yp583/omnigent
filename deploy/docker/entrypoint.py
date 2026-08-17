@@ -304,6 +304,28 @@ def _build_routing(
     return _build_local_llm_routing_client(server_llm), settings
 
 
+def _build_conductor(
+    database_url: str,
+    artifact_store: ArtifactStore,
+) -> tuple[Any, Any]:  # (ConductorStore, MemoryProviderRegistry)
+    """Wire the owner-private Conductor stores for a Docker deployment.
+
+    The local CLI constructs these stores before calling ``create_app``.  Keep
+    the container entrypoint on the same path so the SPA cannot ship a
+    Conductor page while the corresponding API router is silently absent.
+    """
+    from omnigent.conductor import MarkdownArtifactMemoryProvider, MemoryProviderRegistry
+    from omnigent.stores.conductor_store.sqlalchemy_store import SqlAlchemyConductorStore
+    from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
+
+    conductor_store = SqlAlchemyConductorStore(database_url)
+    memory_store = SqlAlchemyMemoryStore(database_url)
+    memory_providers = MemoryProviderRegistry(
+        [MarkdownArtifactMemoryProvider(memory_store, artifact_store)]
+    )
+    return conductor_store, memory_providers
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -361,6 +383,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # session); the startup catch-all below logs it.
     sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
     artifact_store = _select_artifact_store(resolved_config)
+    conductor_store, memory_providers = _build_conductor(database_url, artifact_store)
 
     agent_cache = AgentCache(
         artifact_store=artifact_store,
@@ -419,6 +442,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         project_store=project_store,
+        conductor_store=conductor_store,
+        memory_providers=memory_providers,
         auth_provider=auth_provider,
         account_store=account_store,
         # Non-secret auth settings from the config file (admins are the
