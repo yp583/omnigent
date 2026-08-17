@@ -50,7 +50,11 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { listPullRequests } = require("./pullRequests");
-const { startPersonalProxy } = require("./personalProxy");
+const {
+  personalProxyPortFromSettings,
+  rememberPersonalProxyPort,
+  startPersonalProxy,
+} = require("./personalProxy");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
@@ -107,7 +111,21 @@ const personalProxies = new Map();
 async function personalProxyFor(serverUrl) {
   const existing = personalProxies.get(serverUrl);
   if (existing) return existing;
-  const pending = startPersonalProxy({ staticDir: PERSONAL_WEB_DIR, serverUrl });
+  const preferredPort = personalProxyPortFromSettings(loadSettings(), serverUrl);
+  const pending = startPersonalProxy({
+    staticDir: PERSONAL_WEB_DIR,
+    serverUrl,
+    preferredPort,
+  }).then((proxy) => {
+    // The SPA stores its theme and other local UI preferences in localStorage,
+    // whose origin includes this loopback port. Reusing the port across app
+    // launches keeps that browser storage reachable after a restart. If the
+    // saved port was occupied, startPersonalProxy chooses a free replacement
+    // and this becomes the stable port for the next launch.
+    const settings = loadSettings();
+    if (rememberPersonalProxyPort(settings, serverUrl, proxy.port)) saveSettings(settings);
+    return proxy;
+  });
   personalProxies.set(serverUrl, pending);
   try {
     return await pending;

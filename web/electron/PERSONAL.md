@@ -30,6 +30,12 @@ in. The personal app serves the checked-out frontend from a private loopback
 origin and proxies only the backend API/auth namespaces to that cloud URL; it
 does not deploy or mutate the cloud service.
 
+The shell remembers a loopback port for each configured server. Keeping that
+origin stable across launches preserves browser-local UI preferences such as
+light/dark mode, color palette, panel sizes, and recent composer choices. If
+another local process temporarily occupies the saved port, Personal chooses
+and remembers a free replacement instead of failing to start.
+
 PR cards use the local `git` and GitHub CLI installations. Authenticate once
 with `gh auth login` if the card above the composer asks for it.
 

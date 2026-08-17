@@ -10,6 +10,38 @@ const httpProxy = require("http-proxy");
 
 const API_PREFIXES = ["/v1", "/api", "/auth", "/health", "/.well-known"];
 const UPSTREAM_COOKIE_PREFIX = "omnigent_personal_upstream_";
+const PERSONAL_PROXY_PORTS_KEY = "personal_proxy_ports";
+
+/**
+ * Accept only unprivileged TCP ports that Electron can safely reuse.
+ * Invalid or missing values become 0, which asks the OS for a free port.
+ */
+function normalizePersonalProxyPort(value) {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : 0;
+}
+
+/** Read the saved loopback port for one server from tolerant app settings. */
+function personalProxyPortFromSettings(settings, serverUrl) {
+  const ports = settings?.[PERSONAL_PROXY_PORTS_KEY];
+  if (!ports || typeof ports !== "object" || Array.isArray(ports)) return 0;
+  return normalizePersonalProxyPort(ports[serverUrl]);
+}
+
+/**
+ * Remember the loopback port for one server. Returns true only when settings
+ * changed so callers can avoid an unnecessary settings-file write.
+ */
+function rememberPersonalProxyPort(settings, serverUrl, value) {
+  const port = normalizePersonalProxyPort(value);
+  if (!settings || typeof settings !== "object" || !port) return false;
+  if (personalProxyPortFromSettings(settings, serverUrl) === port) return false;
+  const existing = settings[PERSONAL_PROXY_PORTS_KEY];
+  const ports =
+    existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {};
+  settings[PERSONAL_PROXY_PORTS_KEY] = { ...ports, [serverUrl]: port };
+  return true;
+}
 
 /**
  * Return a stable cookie namespace for one configured Omnigent server.
@@ -125,7 +157,27 @@ function staticFileFor(staticDir, pathname) {
   return fs.existsSync(index) ? index : null;
 }
 
-async function startPersonalProxy({ staticDir, serverUrl }) {
+function listenOnLoopback(server, port) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      server.removeListener("error", onError);
+      server.removeListener("listening", onListening);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onListening = () => {
+      cleanup();
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  });
+}
+
+async function startPersonalProxy({ staticDir, serverUrl, preferredPort = 0 }) {
   const target = new URL(serverUrl);
   const basePath = target.pathname.replace(/\/$/, "");
   const proxyOptions = {
@@ -231,15 +283,22 @@ async function startPersonalProxy({ staticDir, serverUrl }) {
     proxy.ws(request, socket, head);
   });
 
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
+  const requestedPort = normalizePersonalProxyPort(preferredPort);
+  try {
+    await listenOnLoopback(server, requestedPort);
+  } catch (error) {
+    // A stale saved port may have been claimed by another local process since
+    // the last launch. Stay available by taking any free port; main persists
+    // that replacement so the following launch is stable again.
+    if (!requestedPort || error?.code !== "EADDRINUSE") throw error;
+    await listenOnLoopback(server, 0);
+  }
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("failed to bind personal proxy");
   localOrigin = `http://127.0.0.1:${address.port}`;
   return {
     origin: localOrigin,
+    port: address.port,
     close: () =>
       new Promise((resolve) => {
         proxy.close();
@@ -251,6 +310,9 @@ async function startPersonalProxy({ staticDir, serverUrl }) {
 module.exports = {
   isApiPath,
   mergeCertificateAuthorities,
+  normalizePersonalProxyPort,
+  personalProxyPortFromSettings,
+  rememberPersonalProxyPort,
   sanitizeSetCookies,
   stripProxyCookies,
   startPersonalProxy,
