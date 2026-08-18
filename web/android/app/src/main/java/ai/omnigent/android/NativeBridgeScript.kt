@@ -234,23 +234,6 @@ object NativeBridgeScript {
               });
               return Promise.resolve(true);
             },
-            speak(params) {
-              const text = params && typeof params.text === "string" ? params.text : "";
-              if (!text) return Promise.resolve(false);
-              post({
-                method: "speak",
-                params: {
-                  text,
-                  language:
-                    params && typeof params.language === "string" ? params.language : "en-US",
-                  rate: params && Number.isFinite(params.rate) ? params.rate : 1,
-                },
-              });
-              return Promise.resolve(true);
-            },
-            stopSpeaking() {
-              post({ method: "stopSpeaking" });
-            },
             onNotificationActivated(callback) {
               if (typeof callback !== "function") return () => {};
               notificationCallbacks.add(callback);

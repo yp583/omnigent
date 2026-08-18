@@ -122,6 +122,52 @@ def test_bind_dashboard_and_memory_round_trip(db_uri: str, tmp_path: Path) -> No
     assert conflict.status_code == 409
 
 
+def test_ensure_creates_one_hidden_runner_bound_chat(db_uri: str, tmp_path: Path) -> None:
+    client, conversations = _client(db_uri, tmp_path)
+    anchor = conversations.create_conversation(
+        agent_id=ORDINARY_AGENT_ID,
+        title="Current work",
+        runner_id="runner-local",
+    )
+
+    created = client.post("/v1/conductor/ensure")
+    repeated = client.post("/v1/conductor/ensure")
+
+    assert created.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json()["conversation_id"] == created.json()["conversation_id"]
+    conductor = conversations.get_conversation(created.json()["conversation_id"])
+    assert conductor is not None
+    assert conductor.agent_id == CONDUCTOR_AGENT_ID
+    assert conductor.runner_id == anchor.runner_id
+    assert conductor.labels["omnigent.conductor"] == "true"
+    dashboard_ids = {row["id"] for row in client.get("/v1/conductor").json()["sessions"]}
+    assert dashboard_ids == {anchor.id}
+
+
+def test_ensure_requires_an_owned_runner_anchor(db_uri: str, tmp_path: Path) -> None:
+    client, _conversations = _client(db_uri, tmp_path)
+
+    response = client.post("/v1/conductor/ensure")
+
+    assert response.status_code == 409
+    assert "available runner" in response.json()["error"]["message"]
+
+
+def test_update_rejects_an_unknown_permission_mode(db_uri: str, tmp_path: Path) -> None:
+    client, conversations = _client(db_uri, tmp_path)
+    conductor = conversations.create_conversation(agent_id=CONDUCTOR_AGENT_ID)
+    assert client.put("/v1/conductor", json={"conversation_id": conductor.id}).status_code == 200
+
+    response = client.patch(
+        "/v1/conductor",
+        json={"config": {"permission_mode": "unrestricted-ish"}},
+    )
+
+    assert response.status_code == 400
+    assert "not a supported" in response.json()["error"]["message"]
+
+
 def test_rejects_binding_subagent_as_conductor(db_uri: str, tmp_path: Path) -> None:
     client, conversations = _client(db_uri, tmp_path)
     parent = conversations.create_conversation(agent_id=ORDINARY_AGENT_ID)

@@ -1,76 +1,12 @@
 package ai.omnigent.android
 
 import android.net.Uri
-import android.speech.tts.TextToSpeech
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
 import org.json.JSONObject
-import java.util.Locale
-
-internal interface NativeSpeech {
-    fun speak(
-        text: String,
-        language: String,
-        rate: Float,
-    )
-
-    fun stop()
-
-    fun shutdown()
-}
-
-internal class AndroidNativeSpeech(
-    context: android.content.Context,
-) : NativeSpeech,
-    TextToSpeech.OnInitListener {
-    private val engine = TextToSpeech(context.applicationContext, this)
-    private var ready = false
-    private var pending: Triple<String, String, Float>? = null
-
-    override fun onInit(status: Int) {
-        ready = status == TextToSpeech.SUCCESS
-        if (!ready) {
-            pending = null
-            return
-        }
-        pending?.let { (text, language, rate) -> speak(text, language, rate) }
-        pending = null
-    }
-
-    override fun speak(
-        text: String,
-        language: String,
-        rate: Float,
-    ) {
-        val request = Triple(text.take(MAX_SPEECH_CHARS), language, rate.coerceIn(0.5f, 2f))
-        if (!ready) {
-            pending = request
-            return
-        }
-        engine.stop()
-        engine.language = Locale.forLanguageTag(request.second)
-        engine.setSpeechRate(request.third)
-        engine.speak(request.first, TextToSpeech.QUEUE_FLUSH, null, "omnigent-conductor")
-    }
-
-    override fun stop() {
-        pending = null
-        engine.stop()
-    }
-
-    override fun shutdown() {
-        pending = null
-        engine.stop()
-        engine.shutdown()
-    }
-
-    private companion object {
-        const val MAX_SPEECH_CHARS = 8_000
-    }
-}
 
 /**
  * The single web -> native bridge, installed via
@@ -87,7 +23,6 @@ internal class AndroidNativeSpeech(
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
-    private val speech: NativeSpeech,
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -151,18 +86,6 @@ class OmnigentBridgeListener(
                     navigatePath = params.optString("navigatePath").ifEmpty { null },
                 )
             }
-
-            "speak" -> {
-                val params = json.optJSONObject("params") ?: return
-                val text = params.optString("text").trim().ifEmpty { return }
-                speech.speak(
-                    text = text,
-                    language = params.optString("language", "en-US"),
-                    rate = params.optDouble("rate", 1.0).toFloat(),
-                )
-            }
-
-            "stopSpeaking" -> speech.stop()
 
             "blobBase64" -> {
                 blobSaver.save(

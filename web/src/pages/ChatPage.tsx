@@ -111,6 +111,8 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession, stopSession, updateSession } from "@/lib/sessionsApi";
 import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
   CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
   mergeNativePermissionModeArgs,
@@ -118,7 +120,13 @@ import {
   NATIVE_PERMISSION_CUSTOM_VALUE,
   nativePermissionControlForHarness,
   nativePermissionModeFromSession,
+  type NativePermissionControl,
 } from "@/lib/nativePermissionModes";
+import {
+  getConductorDashboard,
+  updateConductorConfig,
+  type ConductorBinding,
+} from "@/lib/conductorApi";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
@@ -2390,6 +2398,7 @@ function MainAgentSurface({
           />
 
           <Composer
+            isConductorChat={isConductorChat}
             disabled={disabled}
             status={status}
             isWorking={isWorking}
@@ -4259,6 +4268,8 @@ interface ComposerProps {
   wrapperLabel?: string | null;
   /** Top-level session whose local workspace tree contributes PRs. */
   sessionTreeRootId?: string | null;
+  /** This session is the caller's durable owner-wide Conductor chat. */
+  isConductorChat?: boolean;
 }
 
 /**
@@ -4666,6 +4677,7 @@ export function Composer({
   subAgentLabel = null,
   wrapperLabel = null,
   sessionTreeRootId = null,
+  isConductorChat = false,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -5896,6 +5908,7 @@ export function Composer({
                 harnessLabel={harnessLabel}
               />
               <ComposerConfigGear
+                isConductorChat={isConductorChat}
                 harnessLabel={harnessLabel}
                 showModels={showModels}
                 showEffort={showEffort}
@@ -6317,6 +6330,13 @@ function formatEffortLabel(effort: string): string {
 const SUBAGENT_ROUTING_LABEL = "Subagent routing";
 const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
 
+const CONDUCTOR_PERMISSION_CONTROL: NativePermissionControl = {
+  label: "Permissions",
+  description: "What Conductor can change without asking",
+  defaultValue: CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  options: CLAUDE_NATIVE_PERMISSION_MODES,
+};
+
 /**
  * In-session run-config modal opened from the composer's gear icon. The
  * live-committing analogue of the new-session ``HarnessConfigModal``: only the
@@ -6334,6 +6354,8 @@ const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session s
 function SessionConfigModal({
   open,
   onOpenChange,
+  isConductorChat,
+  conductorBinding,
   harnessLabel,
   showModels,
   showEffort,
@@ -6347,6 +6369,8 @@ function SessionConfigModal({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  isConductorChat: boolean;
+  conductorBinding: ConductorBinding | null;
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
@@ -6366,7 +6390,9 @@ function SessionConfigModal({
   const localStatus = useChatStore((s) => s.status);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const { session } = useSession(conversationId);
-  const permissionControl = nativePermissionControlForHarness(sessionHarness);
+  const permissionControl = isConductorChat
+    ? CONDUCTOR_PERMISSION_CONTROL
+    : nativePermissionControlForHarness(sessionHarness);
   const currentPermissionMode = permissionMode ?? permissionControl?.defaultValue;
   const canRestartForPermissionChange =
     isOwnerLevel(session?.permissionLevel ?? null) &&
@@ -6508,27 +6534,34 @@ function SessionConfigModal({
         if (!canRestartForPermissionChange) {
           throw new Error("Permission mode can only change while an owner has the session idle.");
         }
-        const terminalLaunchArgs = mergeNativePermissionModeArgs(
-          sessionHarness,
-          session?.terminalLaunchArgs,
-          draftPermissionMode,
-        );
-        const labels =
-          sessionHarness === "codex-native"
-            ? {
-                [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]:
-                  draftPermissionMode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE ? "1" : "0",
-              }
-            : undefined;
-        await updateSession(conversationId, {
-          terminalLaunchArgs,
-          ...(labels ? { labels } : {}),
-        });
+        if (isConductorChat) {
+          await updateConductorConfig({
+            ...(conductorBinding?.config ?? {}),
+            permission_mode: draftPermissionMode,
+          });
+        } else {
+          const terminalLaunchArgs = mergeNativePermissionModeArgs(
+            sessionHarness,
+            session?.terminalLaunchArgs,
+            draftPermissionMode,
+          );
+          const labels =
+            sessionHarness === "codex-native"
+              ? {
+                  [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]:
+                    draftPermissionMode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE ? "1" : "0",
+                }
+              : undefined;
+          await updateSession(conversationId, {
+            terminalLaunchArgs,
+            ...(labels ? { labels } : {}),
+          });
+        }
         permissionPersisted = true;
         onPermissionModeApplied(draftPermissionMode);
 
-        // These modes are native CLI launch settings. Stop + retry resumes the
-        // same vendor session with the new argv; no transcript input is added.
+        // Permission modes are read at harness launch. Stop + retry resumes the
+        // same transcript with the new setting; no transcript input is added.
         await stopSession(conversationId);
         await retrySession(conversationId);
         const selectedLabel = permissionControl.options.find(
@@ -6738,6 +6771,7 @@ function SessionConfigModal({
  *   trigger is a read-only label). ``0`` / omitted means never requested.
  */
 function ComposerConfigGear({
+  isConductorChat,
   harnessLabel,
   showModels,
   showEffort,
@@ -6749,6 +6783,7 @@ function ComposerConfigGear({
   disabled,
   openNonce = 0,
 }: {
+  isConductorChat: boolean;
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
@@ -6764,16 +6799,44 @@ function ComposerConfigGear({
   const conversationId = useChatStore((s) => s.conversationId);
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   const { session } = useSession(conversationId);
-  const permissionControl = nativePermissionControlForHarness(sessionHarness);
+  const permissionControl = isConductorChat
+    ? CONDUCTOR_PERMISSION_CONTROL
+    : nativePermissionControlForHarness(sessionHarness);
+  const [conductorBinding, setConductorBinding] = useState<ConductorBinding | null>(null);
   const sessionPermissionMode =
-    nativePermissionModeFromSession(sessionHarness, session?.terminalLaunchArgs, session?.labels) ??
-    permissionControl?.defaultValue;
+    (isConductorChat
+      ? typeof conductorBinding?.config.permission_mode === "string"
+        ? conductorBinding.config.permission_mode
+        : CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+      : nativePermissionModeFromSession(
+          sessionHarness,
+          session?.terminalLaunchArgs,
+          session?.labels,
+        )) ?? permissionControl?.defaultValue;
   const [permissionMode, setPermissionMode] = useState<string | null>(
     sessionPermissionMode ?? null,
   );
   useEffect(() => {
     setPermissionMode(sessionPermissionMode ?? null);
   }, [conversationId, sessionPermissionMode]);
+  useEffect(() => {
+    if (!isConductorChat) {
+      setConductorBinding(null);
+      return;
+    }
+    let cancelled = false;
+    void getConductorDashboard()
+      .then((dashboard) => {
+        if (!cancelled) setConductorBinding(dashboard.conductor);
+      })
+      .catch(() => {
+        // The guarded route already reports binding failures. Keep the safe
+        // default until a later open or reload refreshes this setting.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isConductorChat, conversationId]);
   const appliedOpenNonce = useRef(0);
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
@@ -6785,6 +6848,7 @@ function ComposerConfigGear({
     setOpen(true);
   }, [openNonce, disabled]);
   const summary = useSessionConfigSummary({
+    isConductorChat,
     harnessLabel,
     showModels,
     showEffort,
@@ -6854,6 +6918,8 @@ function ComposerConfigGear({
       <SessionConfigModal
         open={open}
         onOpenChange={setOpen}
+        isConductorChat={isConductorChat}
+        conductorBinding={conductorBinding}
         harnessLabel={harnessLabel}
         showModels={showModels}
         showEffort={showEffort}
@@ -6875,6 +6941,7 @@ function ComposerConfigGear({
  * values, including the persisted native permission mode.
  */
 function useSessionConfigSummary({
+  isConductorChat,
   harnessLabel,
   showModels,
   showEffort,
@@ -6883,6 +6950,7 @@ function useSessionConfigSummary({
   costRoutingEligible,
   permissionMode,
 }: {
+  isConductorChat: boolean;
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
@@ -6911,7 +6979,9 @@ function useSessionConfigSummary({
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
-  const permissionControl = nativePermissionControlForHarness(sessionHarness);
+  const permissionControl = isConductorChat
+    ? CONDUCTOR_PERMISSION_CONTROL
+    : nativePermissionControlForHarness(sessionHarness);
   if (permissionControl && permissionMode) {
     rows.push({
       label: permissionControl.label,

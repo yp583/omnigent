@@ -219,7 +219,7 @@ import {
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
 // --harness kimi` use) — the picker offers only the native TUI (`kimi-native-ui`).
-const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
+const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code", "conductor"]);
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -1927,7 +1927,6 @@ export function NewChatLandingScreen() {
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
   const requestedAgentName = searchParams.get("agent")?.trim() ?? "";
-  const conductorSetup = searchParams.get("conductorSetup") === "1";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
@@ -3748,17 +3747,6 @@ export function NewChatLandingScreen() {
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
-      // Dedicated Conductor setup binds the new transcript before ChatPage
-      // auto-sends its first prompt. That ordering guarantees the Conductor's
-      // owner-wide tools are authorized on turn one and prevents an existing
-      // ordinary transcript from ever being repurposed.
-      if (conductorSetup) {
-        await bindConductor(data.id);
-        // Drop setup's cached null/legacy binding so the guarded chat route
-        // fetches the newly active Conductor before it decides whether this
-        // deep link is allowed.
-        queryClient.removeQueries({ queryKey: ["conductor", "dashboard"] });
-      }
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
       landingDraft = null;
@@ -3768,7 +3756,7 @@ export function NewChatLandingScreen() {
       // session is created either way and its first message stays held
       // for whenever they open it.
       if (onScreenRef.current) {
-        navigate(conductorSetup ? `/conductor/${data.id}` : `/c/${data.id}`);
+        navigate(`/c/${data.id}`);
       }
     } catch {
       returnDraftToUser();

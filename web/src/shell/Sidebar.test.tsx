@@ -296,6 +296,21 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("No sessions")).not.toHaveClass("text-sm");
   });
 
+  it("keeps the singleton Conductor out of the ordinary session rows", () => {
+    mockConversations([
+      conv("conv_work", "Claude", { title: "Regular work" }),
+      conv("conv_conductor", "Conductor", {
+        title: "Conductor",
+        labels: { "omnigent.conductor": "true" },
+      }),
+    ]);
+
+    renderSidebar();
+
+    expect(screen.getByText("Regular work")).toBeInTheDocument();
+    expect(screen.getAllByText("Conductor")).toHaveLength(1);
+  });
+
   it("uses the interface text token for session-list errors", () => {
     conversationsRef.current = [];
     useConvMock.mockReturnValue({

@@ -79,9 +79,6 @@ export interface ComposerMicButtonProps {
   /** Fired when Esc ends dictation. The parent should restore the text it
    *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
   onVoiceDiscard?: () => void;
-  /** Reports take lifecycle to richer voice surfaces (for example the
-   *  Conductor push-to-talk panel). Ordinary composers can omit it. */
-  onListeningChange?: (listening: boolean) => void;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -97,7 +94,6 @@ export const ComposerMicButton = ({
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,
-  onListeningChange,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary whenever the browser has the constructor
   // (Chrome/Safari, unchanged behavior); with no constructor at all
@@ -128,8 +124,6 @@ export const ComposerMicButton = ({
   onVoiceStartRef.current = onVoiceStart;
   const onVoiceDiscardRef = useRef(onVoiceDiscard);
   onVoiceDiscardRef.current = onVoiceDiscard;
-  const onListeningChangeRef = useRef(onListeningChange);
-  onListeningChangeRef.current = onListeningChange;
   // Set by the Esc handler so late results after a discard don't repopulate the
   // composer the parent just reverted. Cleared on the next start.
   const discardingRef = useRef(false);
@@ -152,10 +146,6 @@ export const ComposerMicButton = ({
 
   // Written via .style.transform from rAF — avoids 60Hz React re-renders.
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
-
-  useEffect(() => {
-    onListeningChangeRef.current?.(isListening);
-  }, [isListening]);
 
   useEffect(() => {
     if (!Ctor) return;

@@ -5,7 +5,6 @@ import {
   isElectronShell,
   isIOSShell,
   isNativeShell,
-  nativeSpeak,
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
@@ -15,7 +14,6 @@ import {
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   setThemeSource,
-  stopNativeSpeech,
   supportsBrowser,
 } from "./nativeBridge";
 
@@ -35,8 +33,6 @@ const iosOnSidebarDragUnsubscribe = vi.fn();
 const iosOnSidebarDrag = vi.fn().mockReturnValue(iosOnSidebarDragUnsubscribe);
 const iosSetServerSwitcherHidden = vi.fn();
 const iosSetSidebarOpen = vi.fn();
-const iosSpeak = vi.fn().mockResolvedValue(true);
-const iosStopSpeaking = vi.fn();
 
 // The Android WebView bridge mock, installed on window.omnigentNative. The MVP
 // Android shell exposes the shell-agnostic subset (notifications + badge); the
@@ -46,8 +42,6 @@ const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
 const androidSetColorScheme = vi.fn();
-const androidSpeak = vi.fn().mockResolvedValue(true);
-const androidStopSpeaking = vi.fn();
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -86,8 +80,6 @@ function setIOS(on: boolean, withClickRouting = true): void {
       notify: (...args: unknown[]) => iosNotify(...args),
       setServerSwitcherHidden: (...args: unknown[]) => iosSetServerSwitcherHidden(...args),
       setSidebarOpen: (...args: unknown[]) => iosSetSidebarOpen(...args),
-      speak: (...args: unknown[]) => iosSpeak(...args),
-      stopSpeaking: (...args: unknown[]) => iosStopSpeaking(...args),
       onSidebarDrag: (...args: unknown[]) => iosOnSidebarDrag(...args),
       ...(withClickRouting
         ? {
@@ -108,8 +100,6 @@ function setAndroid(on: boolean, withClickRouting = true): void {
       setBadgeCount: (...args: unknown[]) => androidSetBadge(...args),
       setColorScheme: (...args: unknown[]) => androidSetColorScheme(...args),
       notify: (...args: unknown[]) => androidNotify(...args),
-      speak: (...args: unknown[]) => androidSpeak(...args),
-      stopSpeaking: (...args: unknown[]) => androidStopSpeaking(...args),
       ...(withClickRouting
         ? {
             onNotificationActivated: (...args: unknown[]) =>
@@ -127,8 +117,6 @@ beforeEach(() => {
   electronNotify.mockResolvedValue(true);
   iosNotify.mockResolvedValue(true);
   androidNotify.mockResolvedValue(true);
-  iosSpeak.mockResolvedValue(true);
-  androidSpeak.mockResolvedValue(true);
 });
 
 afterEach(() => {
@@ -499,34 +487,6 @@ describe("setBadgeCount", () => {
       throw new Error("ipc down");
     });
     await expect(bridgeSetBadge(2)).resolves.toBeUndefined();
-  });
-});
-
-describe("native speech", () => {
-  it("routes speech and stop through the iOS bridge", async () => {
-    setIOS(true);
-    const params = { text: "Ready for review", language: "en-US", rate: 1.1 };
-
-    await expect(nativeSpeak(params)).resolves.toBe(true);
-    stopNativeSpeech();
-
-    expect(iosSpeak).toHaveBeenCalledWith(params);
-    expect(iosStopSpeaking).toHaveBeenCalledTimes(1);
-  });
-
-  it("routes speech and stop through the Android bridge", async () => {
-    setAndroid(true);
-
-    await expect(nativeSpeak({ text: "Done" })).resolves.toBe(true);
-    stopNativeSpeech();
-
-    expect(androidSpeak).toHaveBeenCalledWith({ text: "Done" });
-    expect(androidStopSpeaking).toHaveBeenCalledTimes(1);
-  });
-
-  it("reports unavailable outside a capable shell", async () => {
-    await expect(nativeSpeak({ text: "Done" })).resolves.toBe(false);
-    expect(() => stopNativeSpeech()).not.toThrow();
   });
 });
 

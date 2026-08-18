@@ -2893,6 +2893,12 @@ def create_runner_app(
                 cwd=await _session_runtime_cwd(session_id),
                 session_id=session_id,
             )
+            await _apply_conductor_permission_mode(
+                spawn_env,
+                spec=spec,
+                session_id=session_id,
+                server_client=server_client,
+            )
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
                     harness_name,
@@ -5793,6 +5799,12 @@ def create_runner_app(
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
+            )
+            await _apply_conductor_permission_mode(
+                spawn_env,
+                spec=cached_spec,
+                session_id=conv,
+                server_client=server_client,
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -9616,6 +9628,52 @@ class _SpawnEnvBuilder(Protocol):
 
 class _ModelCopyValue(Protocol):
     def model_copy(self, *, update: Mapping[str, object]) -> object: ...
+
+
+_CONDUCTOR_PERMISSION_MODES = {
+    "default",
+    "auto",
+    "acceptEdits",
+    "plan",
+    "dontAsk",
+    "bypassPermissions",
+}
+
+
+async def _apply_conductor_permission_mode(
+    spawn_env: dict[str, str] | None,
+    *,
+    spec: AgentSpec,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> None:
+    """Overlay the active user's persisted Conductor approval mode.
+
+    The built-in spec supplies the safe ``default``. A user may change this
+    setting from the ordinary composer gear; it lives on the per-user binding,
+    so the runner resolves it at process launch instead of mutating the shared
+    built-in agent bundle.
+    """
+    if spawn_env is None or spec.name != "conductor" or server_client is None:
+        return
+    try:
+        response = await server_client.get("/v1/conductor", timeout=10.0)
+        if response.status_code != 200:
+            return
+        body = response.json()
+        binding = body.get("conductor") if isinstance(body, dict) else None
+        if not isinstance(binding, dict) or binding.get("conversation_id") != session_id:
+            return
+        config = binding.get("config")
+        mode = config.get("permission_mode") if isinstance(config, dict) else None
+        if mode in _CONDUCTOR_PERMISSION_MODES:
+            spawn_env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = mode
+    except (httpx.HTTPError, RuntimeError, ValueError):
+        _logger.warning(
+            "Could not load Conductor permission mode for %s; using the spec default",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _ensure_session_subagent_router(

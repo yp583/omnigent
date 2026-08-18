@@ -17,8 +17,8 @@ vi.mock("@/shell/AppShell", () => ({
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
-vi.mock("@/pages/ConductorPage", () => ({
-  ConductorPage: () => <div>conductor setup</div>,
+vi.mock("@/pages/ConductorGate", () => ({
+  ConductorGate: () => <div>conductor gate</div>,
 }));
 vi.mock("@/lib/conductorApi", () => ({ getConductorDashboard: vi.fn() }));
 
@@ -80,7 +80,7 @@ describe("Conductor chat route", () => {
     expect(await screen.findByText("chat page")).toBeInTheDocument();
   });
 
-  it("redirects a stale ordinary-transcript deep link to setup", async () => {
+  it("redirects a stale ordinary-transcript deep link to the gate", async () => {
     vi.mocked(getConductorDashboard).mockResolvedValue({
       conductor: null,
       memoryProviders: ["markdown"],
@@ -88,7 +88,7 @@ describe("Conductor chat route", () => {
     });
 
     renderRoute("/conductor/ordinary-session");
-    expect(await screen.findByText("conductor setup")).toBeInTheDocument();
+    expect(await screen.findByText("conductor gate")).toBeInTheDocument();
     expect(screen.queryByText("chat page")).toBeNull();
   });
 });
