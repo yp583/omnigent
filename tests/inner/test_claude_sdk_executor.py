@@ -2154,6 +2154,66 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
+    def test_sigterm_exit_does_not_poison_future_turns(self):
+        """A torn-down CLI may reconnect on the next turn instead of wedging."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        created = []
+
+        class _SigtermProcessError(RuntimeError):
+            exit_code = 143
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+                    self.index = len(created)
+                    created.append(self)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    if self.index == 0:
+                        raise _SigtermProcessError("Command failed with exit code 143")
+
+                async def receive_response(self):
+                    yield _ResultMessage("claude-session-a", "recovered")
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                first_events = [e async for e in executor.run_turn(messages, [], "")]
+                second_events = [e async for e in executor.run_turn(messages, [], "")]
+
+            self.assertIsInstance(first_events[0], ExecutorError)
+            self.assertNotIn("session-a", executor._crashed_sessions)
+            self.assertIsInstance(second_events[-1], TurnComplete)
+            self.assertEqual(second_events[-1].response, "recovered")
+            self.assertEqual(len(created), 2)
+
+        _run(_t())
+
     def test_cancelled_turn_evicts_wedged_client(self):
         """A cancelled turn evicts the cached client so resume can recover (#2109).
 

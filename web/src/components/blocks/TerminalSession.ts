@@ -14,6 +14,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { copyText } from "@/lib/clipboard";
 import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 
 // Card background colors derived from the app's CSS palette.
@@ -301,6 +302,38 @@ export function applyTerminalCopy(
   if (!selection) return false;
   event.clipboardData?.setData("text/plain", selection);
   event.preventDefault();
+  return true;
+}
+
+/**
+ * Whether a browser key event is an explicit terminal copy shortcut.
+ *
+ * Command+C is safe to claim on macOS only when xterm has a selection.
+ * Ctrl+Shift+C is the corresponding Linux/Windows terminal gesture. Plain
+ * Ctrl+C is deliberately excluded because it must remain SIGINT.
+ */
+export function isTerminalCopyShortcut(
+  event: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey">,
+): boolean {
+  if (event.key.toLowerCase() !== "c" || event.altKey) return false;
+  return (
+    (event.metaKey && !event.ctrlKey && !event.shiftKey) ||
+    (event.ctrlKey && event.shiftKey && !event.metaKey)
+  );
+}
+
+/** Copy an xterm selection directly from a keyboard user gesture. */
+export function copyTerminalSelection(
+  event: Pick<KeyboardEvent, "preventDefault">,
+  selection: string,
+  write: (text: string) => Promise<void> = copyText,
+): boolean {
+  if (!selection) return false;
+  event.preventDefault();
+  void write(selection).catch(() => {
+    // Clipboard rejection leaves the selection intact so menu/right-click
+    // copy remains available; it must never break terminal input.
+  });
   return true;
 }
 
@@ -618,6 +651,16 @@ export class TerminalSession {
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
+      if (isTerminalCopyShortcut(e)) {
+        const selection = this.term.getSelection();
+        if (selection) {
+          // xterm invokes this callback for keydown, keypress, and keyup.
+          // Write once on keydown, but suppress every phase so the shortcut
+          // never leaks a literal key or control byte into the PTY.
+          if (e.type === "keydown") copyTerminalSelection(e, selection);
+          return false;
+        }
+      }
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.

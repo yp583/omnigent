@@ -8,13 +8,14 @@ by the pty-driver tests in this directory).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from collections.abc import Iterable
 
 import pytest
 from omnigent_client import child_summary_busy
-from omnigent_ui_sdk.terminal._formatter import StreamingText
+from omnigent_ui_sdk.terminal._formatter import StreamingText, StreamLive, StreamReplace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 from prompt_toolkit.output import DummyOutput
 from rich.text import Text
@@ -405,6 +406,21 @@ class _TitleRecordingOutput(DummyOutput):
         self.flush_count += 1
 
 
+class _ClipboardRecordingOutput(DummyOutput):
+    """Prompt-toolkit output stub that records raw OSC sequences."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raw_writes: list[str] = []
+        self.flush_count = 0
+
+    def write_raw(self, data: str) -> None:
+        self.raw_writes.append(data)
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+
 def _patch_create_output(monkeypatch: pytest.MonkeyPatch, output: object) -> None:
     """
     Replace the SDK's ``create_output`` factory so the next
@@ -427,6 +443,40 @@ def _patch_create_output(monkeypatch: pytest.MonkeyPatch, output: object) -> Non
         "omnigent_ui_sdk.terminal._host.create_output",
         lambda: output,
     )
+
+
+def test_copy_to_clipboard_writes_osc52(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A local terminal receives a base64 OSC 52 clipboard payload."""
+    monkeypatch.delenv("TMUX", raising=False)
+    output = _ClipboardRecordingOutput()
+    _patch_create_output(monkeypatch, output)
+    host = TerminalHost(model_name="test")
+    flushes_before_copy = output.flush_count
+
+    assert host.copy_to_clipboard("hello ✓") is True
+    assert output.raw_writes == ["\x1b]52;c;aGVsbG8g4pyT\x07"]
+    assert output.flush_count == flushes_before_copy + 1
+
+
+def test_copy_to_clipboard_wraps_osc52_for_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remote tmux sessions receive the passthrough DCS envelope."""
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    output = _ClipboardRecordingOutput()
+    _patch_create_output(monkeypatch, output)
+    host = TerminalHost(model_name="test")
+
+    assert host.copy_to_clipboard("hi") is True
+    assert output.raw_writes == ["\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\"]
+
+
+def test_copy_to_clipboard_rejects_empty_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty response does not overwrite the user's clipboard."""
+    output = _ClipboardRecordingOutput()
+    _patch_create_output(monkeypatch, output)
+    host = TerminalHost(model_name="test")
+
+    assert host.copy_to_clipboard("") is False
+    assert output.raw_writes == []
 
 
 @pytest.mark.asyncio
@@ -632,6 +682,47 @@ def test_output_dispatches_stream_replace_to_replace_live_region(
     assert host._streamed_line_count == 0, (
         f"Expected _streamed_line_count == 0 after StreamReplace, got {host._streamed_line_count}."
     )
+
+
+@pytest.mark.asyncio
+async def test_stream_live_repaints_are_coalesced_to_latest_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rapid live tails repaint once per frame and retain the newest tail."""
+    host = TerminalHost(model_name="test")
+    renders: list[tuple[str, bool]] = []
+
+    def _record(renderable: Text, *, commit: bool) -> None:
+        renders.append((renderable.plain, commit))
+
+    monkeypatch.setattr(host, "_replace_live_region", _record)
+    host.output(StreamLive(Text("one")))
+    host.output(StreamLive(Text("two")))
+    host.output(StreamLive(Text("three")))
+
+    assert renders == [("one", False)]
+    await asyncio.sleep(0.06)
+    assert renders == [("one", False), ("three", False)]
+
+
+@pytest.mark.asyncio
+async def test_stream_replace_supersedes_pending_live_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final commit cancels a queued stale live-tail repaint."""
+    host = TerminalHost(model_name="test")
+    renders: list[tuple[str, bool]] = []
+
+    def _record(renderable: Text, *, commit: bool) -> None:
+        renders.append((renderable.plain, commit))
+
+    monkeypatch.setattr(host, "_replace_live_region", _record)
+    host.output(StreamLive(Text("one")))
+    host.output(StreamLive(Text("stale")))
+    host.output(StreamReplace(Text("final")))
+    await asyncio.sleep(0.06)
+
+    assert renders == [("one", False), ("final", True)]
 
 
 def test_output_wraps_urls_in_osc_8_hyperlink(

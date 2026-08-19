@@ -15,7 +15,9 @@ import {
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
+  copyTerminalSelection,
   isUnexpectedTerminalClose,
+  isTerminalCopyShortcut,
   loadWebglRenderer,
   openTerminalLink,
   sgrWheelReports,
@@ -122,6 +124,44 @@ describe("applyTerminalCopy", () => {
     expect(applyTerminalCopy(event, "")).toBe(false);
     expect(setData).not.toHaveBeenCalled();
     expect(preventDefault).not.toHaveBeenCalled();
+  });
+});
+
+describe("terminal copy shortcut", () => {
+  function keyEvent(overrides: Partial<KeyboardEvent> = {}) {
+    return {
+      key: "c",
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      ...overrides,
+    };
+  }
+
+  it("recognizes Command+C and Ctrl+Shift+C without claiming Ctrl+C", () => {
+    expect(isTerminalCopyShortcut(keyEvent({ metaKey: true }))).toBe(true);
+    expect(isTerminalCopyShortcut(keyEvent({ ctrlKey: true, shiftKey: true }))).toBe(true);
+    expect(isTerminalCopyShortcut(keyEvent({ ctrlKey: true }))).toBe(false);
+    expect(isTerminalCopyShortcut(keyEvent({ metaKey: true, altKey: true }))).toBe(false);
+  });
+
+  it("writes the exact xterm selection and consumes the browser gesture", () => {
+    const preventDefault = vi.fn();
+    const write = vi.fn().mockResolvedValue(undefined);
+
+    expect(copyTerminalSelection({ preventDefault }, "selected terminal text", write)).toBe(true);
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledWith("selected terminal text");
+  });
+
+  it("does not consume copy when xterm has no selection", () => {
+    const preventDefault = vi.fn();
+    const write = vi.fn().mockResolvedValue(undefined);
+
+    expect(copyTerminalSelection({ preventDefault }, "", write)).toBe(false);
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
   });
 });
 
@@ -504,6 +544,39 @@ describe("TerminalSession", () => {
     );
     expect(resizeFrame).toBeDefined();
     session.dispose();
+  });
+
+  it("copies an xterm selection on Command+C without sending it to the PTY", async () => {
+    const priorClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const { session, socket } = makeSession();
+    try {
+      const { term } = session as unknown as { term: Terminal };
+      await new Promise<void>((resolve) => {
+        term.write("selected text", resolve);
+      });
+      term.select(0, 0, "selected text".length);
+
+      const event = new KeyboardEvent("keydown", {
+        key: "c",
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      term.textarea?.dispatchEvent(event);
+
+      await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith("selected text"));
+      expect(socket.sent).toHaveLength(0);
+      expect(event.defaultPrevented).toBe(true);
+    } finally {
+      session.dispose();
+      if (priorClipboard) Object.defineProperty(navigator, "clipboard", priorClipboard);
+      else Reflect.deleteProperty(navigator, "clipboard");
+    }
   });
 
   it("does not re-send a resize when the fitted size is unchanged", () => {

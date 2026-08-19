@@ -91,6 +91,7 @@ logger = logging.getLogger(__name__)
 # producer (Databricks AI gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+_SIGTERM_EXIT_CODES = frozenset({143, -15})
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks AI gateway only serves Claude requests
@@ -98,6 +99,28 @@ _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
+
+
+def _is_sigterm_exit(exc: BaseException) -> bool:
+    """Return whether an exception tree reports a subprocess SIGTERM exit."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending and len(seen) < 32:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(current, "exit_code", None) in _SIGTERM_EXIT_CODES:
+            return True
+        grouped = getattr(current, "exceptions", ())
+        if isinstance(grouped, Sequence):
+            pending.extend(child for child in grouped if isinstance(child, BaseException))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
+
 
 # ---------------------------------------------------------------------------
 # TypeAliases for Omnigent JSON-shaped boundary values. The SDK exchanges
@@ -2866,8 +2889,11 @@ class ClaudeSDKExecutor(Executor):
             # instead of reusing it and re-tripping the watchdog (#2109).
             self._evict_client_on_cancel(session_key)
             raise
-        except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
-            self._crashed_sessions[session_key] = str(exc)
+        except Exception as exc:  # noqa: BLE001 — top-level boundary; records non-teardown crashes and surfaces errors
+            # Teardown can surface as SIGTERM here. Preserve this turn's error,
+            # but let a later turn rebuild the subprocess-backed client.
+            if not _is_sigterm_exit(exc):
+                self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
             stderr_text = "\n".join(stderr_lines) if stderr_lines else "(no stderr captured)"
             diagnostics_text = (
@@ -2962,7 +2988,7 @@ class ClaudeSDKExecutor(Executor):
                         "summary instead of the harness's real compacted state.",
                         claude_session_id,
                     )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # WARNING, not DEBUG: a swallowed read here silently degrades
                 # EVERY later resume of this conversation. The runner persists a
                 # compaction item with no ``compacted_messages``, so resume

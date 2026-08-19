@@ -94,10 +94,9 @@ class StreamLive:
     "replaceable" live region.
 
     Used for the unstable tail of streaming text — the portion
-    after the last stable markdown boundary. Re-rendered on every
-    ``TextChunk`` via ``Markdown()`` so the user sees formatted
-    output from the first token, with unclosed fences / inline
-    styles rendered as Rich handles them (CommonMark-compliant).
+    after the last stable markdown boundary. Emitted on every
+    ``TextChunk``; the host coalesces rapid markers into terminal
+    frames before parsing Markdown and repainting.
 
     :param renderable: The Rich renderable to display in the live
         region, e.g. ``Padding(Markdown(tail_text), (0, 1, 0, 3))``.
@@ -170,21 +169,39 @@ class _DiamondMarkdown:
     word without losing Markdown formatting in the paragraph body.
     """
 
-    __slots__ = ("_diamond_seg", "_md")
+    __slots__ = ("_code_theme", "_diamond_seg", "_text")
 
     def __init__(self, text: str, diamond_style: str, code_theme: str) -> None:
-        self._md = Markdown(text, code_theme=code_theme)
+        self._text = text
+        self._code_theme = code_theme
         self._diamond_seg = Segment("◆ ", Style.parse(diamond_style))
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         inserted = False
-        for segment in console.render(self._md, options):
+        markdown = Markdown(self._text, code_theme=self._code_theme)
+        for segment in console.render(markdown, options):
             if not inserted and segment.text and not segment.control and segment.text.strip():
                 yield self._diamond_seg
                 inserted = True
             yield segment
         if not inserted:
             yield self._diamond_seg
+
+
+class _LazyMarkdown:
+    """Defer Markdown parsing until a coalesced terminal frame is rendered."""
+
+    __slots__ = ("_code_theme", "_text")
+
+    def __init__(self, text: str, code_theme: str) -> None:
+        self._text = text
+        self._code_theme = code_theme
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        yield from console.render(
+            Markdown(self._text, code_theme=self._code_theme),
+            options,
+        )
 
 
 def _find_stable_markdown_boundary(text: str) -> int:
@@ -349,6 +366,10 @@ class RichBlockFormatter:
         # or an error mid-paragraph).
         self._paragraph_buffer: str = ""
         self._committed_offset: int = 0
+        self._markdown_scan_offset: int = 0
+        self._markdown_in_fence: bool = False
+        self._last_safe_boundary: int = 0
+        self._pending_boundary: int = 0
         self._needs_diamond: bool = False
 
         # Tool-call dedup state. The sessions API emits a
@@ -430,9 +451,46 @@ class RichBlockFormatter:
         # first rendered paragraph.
         self._paragraph_buffer = ""
         self._committed_offset = 0
+        self._reset_markdown_scanner()
         self._seen_tool_call_ids = set()
         self._needs_diamond = True
         return [Text("")]
+
+    def _reset_markdown_scanner(self) -> None:
+        """Reset the incremental stable-Markdown boundary scanner."""
+        self._markdown_scan_offset = 0
+        self._markdown_in_fence = False
+        self._last_safe_boundary = 0
+        self._pending_boundary = 0
+
+    def _advance_markdown_scanner(self) -> int:
+        """Scan only complete lines appended since the previous text chunk."""
+        text = self._paragraph_buffer
+        n = len(text)
+
+        # A blank line at the exact end of the prior chunk was not safe to
+        # commit until more content arrived after it.
+        if self._pending_boundary and self._pending_boundary < n:
+            self._last_safe_boundary = self._pending_boundary
+            self._pending_boundary = 0
+
+        while self._markdown_scan_offset < n:
+            nl = text.find("\n", self._markdown_scan_offset)
+            if nl == -1:
+                break
+            stripped = text[self._markdown_scan_offset : nl].strip()
+            if stripped.startswith("```"):
+                self._markdown_in_fence = not self._markdown_in_fence
+            if not stripped and not self._markdown_in_fence:
+                candidate = nl + 1
+                if candidate < n:
+                    self._last_safe_boundary = candidate
+                    self._pending_boundary = 0
+                else:
+                    self._pending_boundary = candidate
+            self._markdown_scan_offset = nl + 1
+
+        return self._last_safe_boundary
 
     def format_text_chunk(self, block: TextChunk) -> list[FormattedItem]:
         """
@@ -443,7 +501,7 @@ class RichBlockFormatter:
         boundary returned by :func:`_find_stable_markdown_boundary`)
         and a live region (the unstable tail). Newly stable content is
         emitted as ``StreamReplace``; the tail is emitted as
-        ``StreamLive`` so the host re-renders it on the next token.
+        ``StreamLive`` so the host can repaint it on the next frame.
 
         No ``StreamingText`` is emitted for text content — all text is
         rendered through ``Markdown()`` from the first token. Raw
@@ -457,7 +515,7 @@ class RichBlockFormatter:
         """
         self._paragraph_buffer += block.text
         items: list[FormattedItem] = []
-        boundary = _find_stable_markdown_boundary(self._paragraph_buffer)
+        boundary = self._advance_markdown_scanner()
         if boundary > self._committed_offset:
             stable = self._paragraph_buffer[self._committed_offset : boundary]
             if stable.strip():
@@ -508,6 +566,7 @@ class RichBlockFormatter:
         leftover = self._paragraph_buffer[self._committed_offset :]
         self._paragraph_buffer = ""
         self._committed_offset = 0
+        self._reset_markdown_scanner()
         if leftover.strip():
             return [self._markdown_replace(leftover)]
         return []
@@ -543,6 +602,7 @@ class RichBlockFormatter:
         leftover = self._paragraph_buffer[self._committed_offset :]
         self._paragraph_buffer = ""
         self._committed_offset = 0
+        self._reset_markdown_scanner()
         items: list[FormattedItem] = []
         if leftover.strip():
             items.append(self._markdown_replace(leftover))
@@ -608,7 +668,7 @@ class RichBlockFormatter:
         top = 1 if self._committed_offset > 0 else 0
         return StreamLive(
             renderable=Padding(
-                Markdown(tail_text, code_theme=self.code_theme),
+                _LazyMarkdown(tail_text, self.code_theme),
                 (top, 1, 0, 3),
             )
         )

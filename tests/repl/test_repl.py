@@ -1819,6 +1819,43 @@ def test_build_startup_header_subscription_credential(tmp_path, monkeypatch) -> 
     assert header.description == "A test agent"
 
 
+def test_build_startup_header_skips_detection_when_defaults_are_explicit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Configured surfaces do not launch slow ambient credential probes."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  claude-subscription:\n"
+        "    kind: subscription\n"
+        "    cli: claude\n"
+        "    default: anthropic\n"
+        "  codex-subscription:\n"
+        "    kind: subscription\n"
+        "    cli: codex\n"
+        "    default: openai\n"
+    )
+
+    def _unexpected_detection():
+        raise AssertionError("ambient provider detection should be skipped")
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers",
+        _unexpected_detection,
+    )
+    header = _build_startup_header(
+        "claude-sdk",
+        "Configured agent.",
+        ["anthropic", "openai"],
+    )
+
+    assert header.credential == "Subscription"
+    assert header.creds_line is not None
+
+
 def test_build_startup_header_creds_line_hints_first_available(tmp_path, monkeypatch) -> None:
     """
     A surface with no default names the credential the launch will fall back to.

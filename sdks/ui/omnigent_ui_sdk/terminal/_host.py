@@ -14,6 +14,7 @@ keep the prompt visible during streaming.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import io
 import logging
@@ -688,6 +689,10 @@ def _prompt_input_max_rows() -> int:
 # instead of partial-clearing into the duplicate-render bug.
 _BOTTOM_RESERVED_ROWS: int = 5
 
+# Rich Markdown parsing and terminal repainting are CPU-bound. Coalesce token
+# deltas to 20 fps so input handling keeps a responsive share of the event loop.
+_STREAM_LIVE_FRAME_SECONDS: float = 0.05
+
 
 # Idempotency guard for the CSI-u escape-sequence registrations
 # below. The map mutates a prompt-toolkit module-level dict; doing
@@ -953,6 +958,9 @@ class TerminalHost:
         self._text_buffer: str = ""
         self._streamed_line_count: int = 0  # Lines printed from streaming text.
         self._live_line_count: int = 0  # Lines in the live (unstable tail) region.
+        self._pending_stream_live: _RichRenderable | None = None
+        self._stream_live_flush_handle: asyncio.TimerHandle | None = None
+        self._last_stream_live_render_at: float = 0.0
         self.text_indent: str = "   "  # Indent for streaming text lines.
         self.on_help: Callable[[], None] | None = None  # Ctrl+H callback.
         # Ctrl+T toggle: callback invoked when the user presses Ctrl+T.
@@ -1527,6 +1535,31 @@ class TerminalHost:
         with contextlib.suppress(Exception):
             self._output.clear_title()
             self._output.flush()
+
+    def copy_to_clipboard(self, text: str) -> bool:
+        """Copy *text* through the terminal's OSC 52 clipboard channel.
+
+        OSC 52 is handled by the terminal emulator on the user's machine, so
+        it also works when Omni runs on a remote host over SSH. tmux requires
+        the control sequence to be wrapped in its passthrough envelope.
+
+        :param text: Plain text to place on the user's clipboard.
+        :returns: ``True`` when a non-empty payload was written, otherwise
+            ``False``. Terminal policy may still decline clipboard access.
+        """
+        if not text:
+            return False
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        sequence = f"\x1b]52;c;{encoded}\x07"
+        if os.environ.get("TMUX"):
+            sequence = f"\x1bPtmux;\x1b{sequence}\x1b\\"
+        try:
+            self._output.write_raw(sequence)
+            self._output.flush()
+        except Exception:
+            _log.exception("Failed to write OSC 52 clipboard sequence")
+            return False
+        return True
 
     async def __aenter__(self) -> TerminalHost:
         self._try_set_window_title()
@@ -2805,6 +2838,7 @@ class TerminalHost:
         """Display a formatted item above the pinned prompt.
 
         - ``StreamingText``: printed with ``end=""`` for live streaming.
+        - ``StreamLive``: coalesced to the latest tail at 20 frames/second.
         - ``StreamReplace``: atomic clear-streamed-region + render
           (delegated to :meth:`replace_streamed_text`). Used by the
           formatter for per-paragraph Markdown re-rendering — the
@@ -2817,11 +2851,13 @@ class TerminalHost:
         if item is None:
             return
         if isinstance(item, StreamLive):
-            self._replace_live_region(item.renderable, commit=False)
+            self._queue_stream_live(item.renderable)
             return
         if isinstance(item, StreamReplace):
+            self._discard_pending_stream_live()
             self._replace_live_region(item.renderable, commit=True)
             return
+        self._flush_pending_stream_live()
         if isinstance(item, StreamingText):
             self._text_buffer += item.text
             # Flush complete lines (LLM-produced newlines).
@@ -2875,6 +2911,56 @@ class TerminalHost:
         )
         temp.print(item)
         print(linkify_ansi(buf.getvalue()), end="", flush=True)
+
+    def _queue_stream_live(self, renderable: _RichRenderable) -> None:
+        """Render the newest live tail at most once per terminal frame."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Synchronous SDK consumers do not have a loop that can service a
+            # timer, so retain the immediate-output contract for them.
+            self._render_stream_live(renderable)
+            return
+
+        now = loop.time()
+        elapsed = now - self._last_stream_live_render_at
+        if self._stream_live_flush_handle is None and elapsed >= _STREAM_LIVE_FRAME_SECONDS:
+            self._render_stream_live(renderable)
+            return
+
+        self._pending_stream_live = renderable
+        if self._stream_live_flush_handle is None:
+            delay = max(0.0, _STREAM_LIVE_FRAME_SECONDS - elapsed)
+            self._stream_live_flush_handle = loop.call_later(
+                delay,
+                self._flush_pending_stream_live,
+            )
+
+    def _render_stream_live(self, renderable: _RichRenderable) -> None:
+        self._replace_live_region(renderable, commit=False)
+        try:
+            self._last_stream_live_render_at = asyncio.get_running_loop().time()
+        except RuntimeError:
+            self._last_stream_live_render_at = self._monotonic()
+
+    def _flush_pending_stream_live(self) -> None:
+        """Render and clear the newest coalesced live tail, if any."""
+        handle = self._stream_live_flush_handle
+        self._stream_live_flush_handle = None
+        if handle is not None:
+            handle.cancel()
+        renderable = self._pending_stream_live
+        self._pending_stream_live = None
+        if renderable is not None:
+            self._render_stream_live(renderable)
+
+    def _discard_pending_stream_live(self) -> None:
+        """Cancel a superseded live-tail repaint."""
+        handle = self._stream_live_flush_handle
+        self._stream_live_flush_handle = None
+        if handle is not None:
+            handle.cancel()
+        self._pending_stream_live = None
 
     def _print_text_line(self, text: str) -> None:
         """Print a line of streaming text, wrapped and indented.
@@ -2963,6 +3049,7 @@ class TerminalHost:
         kept for callers that need to clear without an immediate
         replacement (e.g. cancel paths).
         """
+        self._discard_pending_stream_live()
         total = self._streamed_line_count + self._live_line_count
         if total > 0:
             # Move cursor up and clear each line.
@@ -2986,6 +3073,7 @@ class TerminalHost:
             the cleared lines, e.g.
             ``Padding(Markdown(text), (0, 1, 0, 3))``.
         """
+        self._discard_pending_stream_live()
         self._replace_live_region(renderable, commit=True)
 
     def _replace_live_region(
@@ -3573,6 +3661,7 @@ class TerminalHost:
     def cancel(self) -> None:
         """Cancel all running handler tasks."""
         self.stop_timer()
+        self._discard_pending_stream_live()
         for task in self._tasks:
             if not task.done():
                 task.cancel()

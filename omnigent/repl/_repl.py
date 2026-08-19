@@ -388,13 +388,24 @@ def _build_startup_header(
     )
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
+        PI_SURFACE,
         describe_active_credential,
         first_available_provider,
         load_config,
+        provider_family_for_harness,
         surface_default_provider,
     )
 
-    config = effective_config_with_detected(load_config())
+    config = load_config()
+    surfaces = set(used_families or [])
+    if harness is not None:
+        family = provider_family_for_harness(harness)
+        if family is not None:
+            surfaces.add(family)
+        elif harness in {"pi", "pi-native"}:
+            surfaces.add(PI_SURFACE)
+    if any(surface_default_provider(config, surface) is None for surface in surfaces):
+        config = effective_config_with_detected(config)
 
     model_label: str | None = None
     credential: str | None = None
@@ -1394,6 +1405,9 @@ class _SessionsChatReplAdapter:
         self._harness: str | None = harness
         self._context_window: int | None = None
         self._last_total_tokens: int | None = None
+        # Plain prose from the current turn, accumulated from text deltas.
+        # ``/copy`` sends this through the terminal's OSC 52 channel.
+        self._last_assistant_text: str = ""
         self._pending_local_tasks: dict[str, asyncio.Task[None]] = {}
         self._turn_done: asyncio.Event
         # FIFO counter: local sends are already echoed by ``on_input``,
@@ -3409,6 +3423,7 @@ async def run_repl(
                 from omnigent_client import BlockContext, ResponseStartBlock
 
                 _saw_text_deltas = False
+                session._last_assistant_text = ""
                 # New turn: drop the prior turn's streamed-segment
                 # bookkeeping so its prose can't suppress a later,
                 # legitimately identical assistant message.
@@ -3571,6 +3586,7 @@ async def run_repl(
             from omnigent_client import TextChunk
 
             _saw_text_deltas = True
+            session._last_assistant_text += sdk_ev.delta
             _prose_tracker.on_delta(sdk_ev.delta)
             items_out = list(fmt.format_text_chunk(TextChunk(text=sdk_ev.delta)))
             if tape_entry is not None:
@@ -3722,6 +3738,11 @@ async def run_repl(
                     _saw_text_deltas or _streamed_match,
                 )
                 should_render = plan.render_item
+                if item_type == "message" and item.get("role") == "assistant" and should_render:
+                    message_text = _extract_message_text(item).strip()
+                    if message_text:
+                        separator = "\n\n" if session._last_assistant_text else ""
+                        session._last_assistant_text += separator + message_text
                 # When ``True``, the message-boundary flush below already
                 # recorded the tape entry; the trailing ``elif`` must
                 # not overwrite it with an empty marker.
@@ -4505,25 +4526,13 @@ async def run_repl(
                 _header = _build_startup_header(harness, agent_description, used_families)
             except Exception:  # noqa: BLE001 — startup-UI boundary: a config read must never block REPL boot
                 _log.exception("Failed to build startup header; falling back to plain banner")
-        # Installed server version for the header's "server <ver>" row.
-        # Probed via the connected (authenticated) client so a short, bounded
-        # GET /v1/info never stalls boot and answers even on auth-gated hosted
-        # servers; None on any failure simply omits the row. Skipped when:
-        #   - there's no header (minimal banner ignores the version), or
-        #   - the server is a Databricks workspace mount — a workspace build
-        #     reports no meaningful version string (its /api/version returns a
-        #     placeholder like "source"), so showing it is noise.
-        from omnigent.cli_auth import is_workspace_hosted_url
-
-        _show_version = _header is not None and not (
-            server_url is not None and is_workspace_hosted_url(server_url)
-        )
-        server_version = await _fetch_server_version(client) if _show_version else None
+        # Server version is decorative; probing it before first paint made a
+        # slow or remote server add up to a second to every TUI launch.
         _sys.stdout.write(
             _render_startup_banner_ansi(
                 ui_name,
                 server_url=server_url,
-                server_version=server_version,
+                server_version=None,
                 header=_header,
             )
         )
@@ -4726,7 +4735,7 @@ async def _cmd_help(
     # wall. Commands not listed in a group still render (under "Other"), so a
     # newly registered command is never silently hidden from /help.
     groups: list[tuple[str, list[str]]] = [
-        ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
+        ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/copy", "/cancel"]),
         ("Context", ["/compact", "/context", "/model", "/effort"]),
         ("Display", ["/theme"]),
         ("Diagnostics", ["/logs", "/report"]),
@@ -4756,6 +4765,25 @@ async def _cmd_help(
 
 
 COMMANDS["/?"] = COMMANDS["/help"]
+
+
+@_cmd("/copy", "Copy the latest assistant response")
+async def _cmd_copy(
+    arg: str,  # noqa: ARG001 — dispatch-contract params
+    session: _ReplSession,
+    client: OmnigentClient,  # noqa: ARG001
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+) -> None:
+    """Copy the latest assistant prose to the user's terminal clipboard."""
+    text = getattr(session, "_last_assistant_text", "").strip()
+    if not text:
+        host.output(Text("  Nothing to copy yet.", style=fmt.muted))
+        return
+    if host.copy_to_clipboard(text):
+        host.output(Text(f"  Copied latest response ({len(text)} characters).", style=fmt.muted))
+    else:
+        host.output(Text("  Clipboard copy failed in this terminal.", style=fmt.warning))
 
 
 _THEME_CLEAR_ALIASES = {"default", "auto", "reset"}
@@ -5341,6 +5369,7 @@ async def _start_new_conversation(
             return False
     else:
         session.reset()
+    session._last_assistant_text = ""  # type: ignore[attr-defined]
     # Drop the prior conversation's sub-agent tree so its agents don't linger
     # in the badge / ↓ menu under the fresh session.
     host.clear_subagents()
