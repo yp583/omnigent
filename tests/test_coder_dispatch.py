@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -53,8 +54,12 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
             "load_1m": 6.0,
             "logical_cpu_count": 4.0,
             "containers": 26.0,
-            "workspace_path": "/workspace/omnigent",
-            "repository_remote": "github.com/yp583/omnigent",
+            "repositories": [
+                {
+                    "workspace_path": "/workspace/omnigent",
+                    "repository_remote": "github.com/yp583/omnigent",
+                }
+            ],
         },
         "ypbox2": {
             "memory_used_bytes": 2 * _GIB,
@@ -62,8 +67,12 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
             "load_1m": 1.0,
             "logical_cpu_count": 2.0,
             "containers": 4.0,
-            "workspace_path": "/workspace/omnigent",
-            "repository_remote": "github.com/yp583/omnigent",
+            "repositories": [
+                {
+                    "workspace_path": "/workspace/omnigent",
+                    "repository_remote": "github.com/yp583/omnigent",
+                }
+            ],
         },
     }
 
@@ -72,6 +81,7 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
         return probes[workspace]
 
     monkeypatch.setattr(coder_dispatch, "_ssh_probe", _probe)
+    workspace_queries: list[str] = []
 
     async def _omni_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/hosts"
@@ -84,7 +94,6 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
                         "name": "ypbox1",
                         "status": "online",
                         "sandbox_provider": None,
-                        "coder_workspace_id": "workspace-1",
                     },
                     {
                         "host_id": "host_2",
@@ -101,6 +110,20 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
         if request.url.path == "/api/v2/workspaces":
             assert request.headers["Coder-Session-Token"] == "secret-token"
             assert "owner:me" in request.url.params["q"]
+            workspace_queries.append(request.url.params["q"])
+            if "include_agent_metadata" in request.url.params["q"]:
+                return httpx.Response(
+                    400,
+                    json={
+                        "message": "Invalid workspace search query.",
+                        "validations": [
+                            {
+                                "field": "include_agent_metadata",
+                                "detail": "unsupported",
+                            }
+                        ],
+                    },
+                )
             return httpx.Response(
                 200,
                 json={
@@ -137,8 +160,13 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
     assert all(item["eligible"] is True for item in candidates)
     assert candidates[0]["normalized_load"] == 0.5
     assert candidates[1]["logical_cpu_count"] == 4.0
+    assert candidates[0]["identity_match"] == "coder_workspace_id"
+    assert candidates[1]["identity_match"] == "unique_workspace_name"
     assert result["needs_confirmation"] is False
     assert "never cap" in str(result["ranking_note"])
+    assert len(workspace_queries) == 2
+    assert "include_agent_metadata" in workspace_queries[0]
+    assert "include_agent_metadata" not in workspace_queries[1]
     assert result["excluded"] == [
         {
             "workspace_id": "workspace-3",
@@ -179,7 +207,71 @@ def test_git_remote_normalization_removes_credentials() -> None:
         coder_dispatch._normalize_git_remote("https://token-value@github.com/yp583/omnigent.git")
         == "github.com/yp583/omnigent"
     )
+
+
+def test_ssh_probe_output_parses_memory_and_strips_repository_credentials() -> None:
+    """The stdin probe shape yields capacity and credential-free checkouts."""
+    result = coder_dispatch._parse_ssh_probe_output(
+        b"stats\t22660272\t8060296\t4096\t0.56\t8\t26\n"
+        b"repo\t/home/ubuntu/silico\t"
+        b"https://secret-token@github.com/Altrix-Technologies/silico-prod.git\n"
+    )
+
+    assert result is not None
+    assert result["memory_total_bytes"] == 8060296 * 4096
+    assert result["memory_used_bytes"] == 8060296 * 4096 - 22660272 * 1024
+    assert result["load_1m"] == 0.56
+    assert result["logical_cpu_count"] == 8.0
+    assert result["containers"] == 26.0
+    assert result["repositories"] == [
+        {
+            "workspace_path": "/home/ubuntu/silico",
+            "repository_remote": "github.com/Altrix-Technologies/silico-prod",
+        }
+    ]
+    assert "secret-token" not in str(result)
     assert (
         coder_dispatch._normalize_git_remote("git@github.com:yp583/omnigent.git")
         == "github.com/yp583/omnigent"
+    )
+
+
+def test_coder_url_falls_back_to_cli_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Discovery works from an ordinary logged-in CLI without CODER_URL."""
+    monkeypatch.delenv("CODER_URL", raising=False)
+    monkeypatch.setenv("CODER_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "url").write_text("https://coder.example.test/\n", encoding="utf-8")
+
+    assert coder_dispatch._coder_url() == "https://coder.example.test"
+
+
+def test_legacy_name_match_rejects_ambiguous_online_hosts() -> None:
+    """Old-server name fallback never guesses between duplicate host names."""
+    hosts = [
+        {
+            "host_id": "host_1",
+            "name": "ypbox1",
+            "status": "online",
+            "sandbox_provider": None,
+        },
+        {
+            "host_id": "host_2",
+            "name": "YPBOX1",
+            "status": "online",
+            "sandbox_provider": None,
+        },
+    ]
+    by_workspace, by_host_id, by_name = coder_dispatch._available_omni_hosts(hosts)
+
+    assert (
+        coder_dispatch._match_omni_host(
+            workspace_id="workspace-1",
+            workspace_name="ypbox1",
+            by_coder_workspace_id=by_workspace,
+            by_host_id=by_host_id,
+            by_legacy_name=by_name,
+        )
+        is None
     )

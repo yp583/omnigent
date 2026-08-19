@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
 
@@ -47,14 +48,9 @@ _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 # never evaluates remote output. CPU count is descriptive only; load normalized
 # by it participates in ranking but it never limits the number of sessions.
 _SSH_PROBE = r"""
-mem_total=$(awk '/^MemTotal:/{print $2 * 1024}' /proc/meminfo 2>/dev/null)
-mem_available=$(awk '/^MemAvailable:/{print $2 * 1024}' /proc/meminfo 2>/dev/null)
-if [ -n "$mem_total" ] && [ -n "$mem_available" ]; then
-  mem_used=$(awk -v total="$mem_total" -v available="$mem_available" \
-    'BEGIN { print total - available }')
-else
-  mem_used=""
-fi
+mem_available_kib=$(grep '^MemAvailable:' /proc/meminfo 2>/dev/null | tr -s ' ' | cut -d ' ' -f 2)
+physical_pages=$(getconf _PHYS_PAGES 2>/dev/null || true)
+page_size=$(getconf PAGESIZE 2>/dev/null || true)
 load_1m=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
 cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
 containers=""
@@ -63,11 +59,17 @@ if command -v docker >/dev/null 2>&1; then
 elif command -v podman >/dev/null 2>&1; then
   containers=$(podman ps -q 2>/dev/null | wc -l | tr -d ' ')
 fi
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-repo_remote=$(git remote get-url origin 2>/dev/null || true)
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-  "$mem_used" "$mem_total" "$load_1m" "$cpu_count" \
-  "$containers" "$repo_root" "$repo_remote"
+printf 'stats\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$mem_available_kib" "$physical_pages" "$page_size" \
+  "$load_1m" "$cpu_count" "$containers"
+find "$HOME" -maxdepth 3 -type d -name .git -print 2>/dev/null |
+while IFS= read -r git_dir; do
+  repo_root=${git_dir%/.git}
+  repo_remote=$(git -C "$repo_root" remote get-url origin 2>/dev/null || true)
+  if [ -n "$repo_remote" ]; then
+    printf 'repo\t%s\t%s\n' "$repo_root" "$repo_remote"
+  fi
+done
 """.strip()
 
 
@@ -251,6 +253,85 @@ def _coder_token() -> str | None:
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
+def _coder_url() -> str | None:
+    """Resolve the Coder server URL from the environment or CLI config."""
+    configured = (os.environ.get("CODER_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+
+    config_paths: list[Path] = []
+    explicit_config_dir = (os.environ.get("CODER_CONFIG_DIR") or "").strip()
+    if explicit_config_dir:
+        config_paths.append(Path(explicit_config_dir).expanduser() / "url")
+    xdg_config_home = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg_config_home:
+        config_paths.append(Path(xdg_config_home).expanduser() / "coderv2" / "url")
+    home = Path.home()
+    config_paths.extend(
+        (
+            home / ".config" / "coderv2" / "url",
+            home / "Library" / "Application Support" / "coderv2" / "url",
+        )
+    )
+    for path in dict.fromkeys(config_paths):
+        try:
+            value = path.read_text(encoding="utf-8").strip().rstrip("/")
+        except OSError:
+            continue
+        if value.startswith(("https://", "http://")):
+            return value
+    return None
+
+
+def _available_omni_hosts(
+    hosts: Sequence[JsonObject],
+) -> tuple[dict[str, JsonObject], dict[str, JsonObject], dict[str, list[JsonObject]]]:
+    """Index online, user-managed Omni hosts by stable and legacy identities."""
+    by_coder_workspace_id: dict[str, JsonObject] = {}
+    by_host_id: dict[str, JsonObject] = {}
+    by_legacy_name: dict[str, list[JsonObject]] = {}
+    for host in hosts:
+        host_id = host.get("host_id")
+        if (
+            not isinstance(host_id, str)
+            or not host_id
+            or host.get("status") != "online"
+            or host.get("sandbox_provider") is not None
+        ):
+            continue
+        coder_workspace_id = host.get("coder_workspace_id")
+        if isinstance(coder_workspace_id, str) and coder_workspace_id:
+            by_coder_workspace_id[coder_workspace_id.lower()] = host
+            continue
+        by_host_id[host_id.lower()] = host
+        name = host.get("name")
+        if isinstance(name, str) and (normalized_name := name.strip().casefold()):
+            by_legacy_name.setdefault(normalized_name, []).append(host)
+    return by_coder_workspace_id, by_host_id, by_legacy_name
+
+
+def _match_omni_host(
+    *,
+    workspace_id: str,
+    workspace_name: str,
+    by_coder_workspace_id: Mapping[str, JsonObject],
+    by_host_id: Mapping[str, JsonObject],
+    by_legacy_name: Mapping[str, Sequence[JsonObject]],
+) -> tuple[JsonObject, str] | None:
+    """Match a Coder workspace to an online Omni host without ambiguity."""
+    normalized_id = workspace_id.lower()
+    host = by_coder_workspace_id.get(normalized_id)
+    if host is not None:
+        return host, "coder_workspace_id"
+    host = by_host_id.get(normalized_id)
+    if host is not None:
+        return host, "host_id"
+    name_matches = by_legacy_name.get(workspace_name.strip().casefold(), ())
+    if len(name_matches) == 1:
+        return name_matches[0], "unique_workspace_name"
+    return None
+
+
 def _workspace_agents(workspace: JsonObject) -> list[JsonObject]:
     """Flatten agents from a workspace's latest-build resources."""
     latest_build = _json_object(workspace.get("latest_build")) or {}
@@ -286,8 +367,8 @@ async def _ssh_probe(owner: str, workspace: str) -> JsonObject | None:
             target,
             "--",
             "sh",
-            "-lc",
-            _SSH_PROBE,
+            "-s",
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -295,7 +376,7 @@ async def _ssh_probe(owner: str, workspace: str) -> JsonObject | None:
         return None
     try:
         stdout, _stderr = await asyncio.wait_for(
-            process.communicate(), timeout=_SSH_TIMEOUT_SECONDS
+            process.communicate(_SSH_PROBE.encode()), timeout=_SSH_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError:
         process.kill()
@@ -303,11 +384,14 @@ async def _ssh_probe(owner: str, workspace: str) -> JsonObject | None:
         return None
     if process.returncode != 0:
         return None
+    return _parse_ssh_probe_output(stdout)
+
+
+def _parse_ssh_probe_output(stdout: bytes) -> JsonObject | None:
+    """Parse the fixed SSH probe output without exposing raw repository URLs."""
     lines = stdout.decode(errors="replace").splitlines()
-    if not lines:
-        return None
-    fields = lines[-1].split("\t", 6)
-    if len(fields) != 7:
+    stats = next((line.split("\t", 6) for line in lines if line.startswith("stats\t")), None)
+    if stats is None or len(stats) != 7:
         return None
 
     def _float(text: str) -> float | None:
@@ -316,15 +400,71 @@ async def _ssh_probe(owner: str, workspace: str) -> JsonObject | None:
         except ValueError:
             return None
 
+    memory_available_kib = _float(stats[1])
+    physical_pages = _float(stats[2])
+    page_size = _float(stats[3])
+    memory_total_bytes = (
+        physical_pages * page_size
+        if physical_pages is not None and page_size is not None
+        else None
+    )
+    memory_used_bytes = None
+    if memory_available_kib is not None and memory_total_bytes is not None:
+        memory_used_bytes = max(0.0, memory_total_bytes - memory_available_kib * 1024)
+    repositories: list[JsonObject] = []
+    for line in lines:
+        fields = line.split("\t", 2)
+        if len(fields) != 3 or fields[0] != "repo" or not fields[1].startswith("/"):
+            continue
+        remote = _normalize_git_remote(fields[2])
+        if remote is not None:
+            repositories.append({"workspace_path": fields[1], "repository_remote": remote})
     return {
-        "memory_used_bytes": _float(fields[0]),
-        "memory_total_bytes": _float(fields[1]),
-        "load_1m": _float(fields[2]),
-        "logical_cpu_count": _float(fields[3]),
-        "containers": _float(fields[4]),
-        "workspace_path": fields[5] or None,
-        "repository_remote": _normalize_git_remote(fields[6]),
+        "memory_used_bytes": memory_used_bytes,
+        "memory_total_bytes": memory_total_bytes,
+        "load_1m": _float(stats[4]),
+        "logical_cpu_count": _float(stats[5]),
+        "containers": _float(stats[6]),
+        "repositories": repositories,
     }
+
+
+def _select_probe_repository(
+    probe: JsonObject,
+    *,
+    expected_repository: str | None,
+    reported_directory: object,
+) -> JsonObject | None:
+    """Select a verified source checkout from one SSH probe result."""
+    repositories = _objects(probe.get("repositories"))
+    if expected_repository is not None:
+        repositories = [
+            repository
+            for repository in repositories
+            if repository.get("repository_remote") == expected_repository
+        ]
+    elif isinstance(reported_directory, str):
+        reported_match = [
+            repository
+            for repository in repositories
+            if repository.get("workspace_path") == reported_directory
+        ]
+        if reported_match:
+            repositories = reported_match
+        elif len(repositories) != 1:
+            return None
+    elif len(repositories) != 1:
+        return None
+    if not repositories:
+        return None
+    return min(
+        repositories,
+        key=lambda repository: (
+            "/.worktrees/" in str(repository.get("workspace_path")),
+            len(str(repository.get("workspace_path"))),
+            str(repository.get("workspace_path")),
+        ),
+    )
 
 
 async def _container_count(client: httpx.AsyncClient, agent_id: str) -> int | None:
@@ -362,12 +502,12 @@ async def discover_coder_hosts(
     limit. When every host is over the memory target or unmeasured, callers must
     request explicit human confirmation before overriding the recommendation.
     """
-    coder_url = (os.environ.get("CODER_URL") or "").strip().rstrip("/")
+    coder_url = _coder_url()
     expected_repository = _normalize_git_remote(repository_remote)
     if not coder_url:
         return {
             "error": "coder_not_configured",
-            "detail": "CODER_URL is not set in the Omni runner environment",
+            "detail": "set CODER_URL or log in with the coder CLI",
         }
     token = await asyncio.to_thread(_coder_token)
     if token is None:
@@ -383,18 +523,16 @@ async def discover_coder_hosts(
     except (httpx.HTTPError, ValueError) as exc:
         return {"error": "omni_hosts_unavailable", "detail": str(exc)}
     omni_hosts = _objects(hosts_payload.get("hosts") if isinstance(hosts_payload, dict) else None)
-    by_workspace: dict[str, JsonObject] = {}
-    for host in omni_hosts:
-        workspace_id = host.get("coder_workspace_id")
-        if (
-            isinstance(workspace_id, str)
-            and workspace_id
-            and isinstance(host.get("host_id"), str)
-            and bool(host.get("host_id"))
-            and host.get("status") == "online"
-            and host.get("sandbox_provider") is None
-        ):
-            by_workspace[workspace_id.lower()] = host
+    by_workspace, by_host_id, by_legacy_name = _available_omni_hosts(omni_hosts)
+
+    def _host_match(workspace_id: str, workspace_name: str) -> tuple[JsonObject, str] | None:
+        return _match_omni_host(
+            workspace_id=workspace_id,
+            workspace_name=workspace_name,
+            by_coder_workspace_id=by_workspace,
+            by_host_id=by_host_id,
+            by_legacy_name=by_legacy_name,
+        )
 
     requested_keys = tuple(
         dict.fromkeys(
@@ -410,8 +548,11 @@ async def discover_coder_hosts(
             )
         )
     )
-    query = "owner:me status:running healthy:true " + " ".join(
-        f'include_agent_metadata:"{key}"' for key in requested_keys if key
+    base_query = "owner:me status:running healthy:true"
+    query = (
+        base_query
+        + " "
+        + " ".join(f'include_agent_metadata:"{key}"' for key in requested_keys if key)
     )
     headers = {"Coder-Session-Token": token}
     async with httpx.AsyncClient(base_url=coder_url, headers=headers) as coder_client:
@@ -421,6 +562,15 @@ async def discover_coder_hosts(
                 params={"q": query},
                 timeout=_API_TIMEOUT_SECONDS,
             )
+            if response.status_code == 400:
+                # Coder releases before metadata search expansion reject the
+                # include_agent_metadata term. The fixed SSH probe supplies the
+                # same placement facts, so retry the portable workspace query.
+                response = await coder_client.get(
+                    "/api/v2/workspaces",
+                    params={"q": base_query},
+                    timeout=_API_TIMEOUT_SECONDS,
+                )
             response.raise_for_status()
             payload: Any = response.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -441,7 +591,7 @@ async def discover_coder_hosts(
                 if (
                     not isinstance(workspace_id, str)
                     or not isinstance(workspace_name, str)
-                    or workspace_id.lower() not in by_workspace
+                    or _host_match(workspace_id, workspace_name) is None
                     or not _workspace_is_running(workspace)
                     or not any(_agent_is_ready(agent) for agent in _workspace_agents(workspace))
                 ):
@@ -461,8 +611,8 @@ async def discover_coder_hosts(
             owner = owner_value if isinstance(owner_value, str) else ""
             if not isinstance(workspace_id, str) or not isinstance(workspace_name, str):
                 continue
-            host = by_workspace.get(workspace_id.lower())
-            if host is None:
+            host_match = _host_match(workspace_id, workspace_name)
+            if host_match is None:
                 excluded.append(
                     {
                         "workspace_id": workspace_id,
@@ -471,6 +621,7 @@ async def discover_coder_hosts(
                     }
                 )
                 continue
+            host, identity_match = host_match
             if not _workspace_is_running(workspace):
                 excluded.append(
                     {
@@ -528,8 +679,14 @@ async def discover_coder_hosts(
                         load_1m = cast(float | None, probe.get("load_1m"))
                     if containers is None and probe.get("containers") is not None:
                         containers = int(cast(float, probe["containers"]))
-                    workspace_path = probe.get("workspace_path")
-                    candidate_repository = probe.get("repository_remote")
+                    selected_repository = _select_probe_repository(
+                        probe,
+                        expected_repository=expected_repository,
+                        reported_directory=reported_workspace_path,
+                    )
+                    if selected_repository is not None:
+                        workspace_path = selected_repository.get("workspace_path")
+                        candidate_repository = selected_repository.get("repository_remote")
                     logical_cpu_count = probe.get("logical_cpu_count")
                     source = "coder_metadata+ssh"
                 else:
@@ -575,6 +732,7 @@ async def discover_coder_hosts(
                 {
                     "host_id": host.get("host_id"),
                     "host_name": host.get("name"),
+                    "identity_match": identity_match,
                     "workspace_id": workspace_id,
                     "workspace_name": workspace_name,
                     "owner_name": owner,
