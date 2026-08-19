@@ -1266,9 +1266,10 @@ class SessionCreateRequest(BaseModel):
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the session.
     :param parent_session_id: Parent session for sub-agent spawns.
-        When set, the server inherits the parent's ``runner_id``
-        affinity and sets ``parent_conversation_id`` on the child
-        conversation. ``None`` for top-level sessions.
+        When set, the server sets ``parent_conversation_id`` on the child.
+        It also inherits the parent's ``runner_id`` affinity unless an
+        explicit ``host_id`` targets a different registered host. ``None``
+        for top-level sessions.
     :param sub_agent_name: For sub-agent sessions, the sub-agent
         type name within the parent's spec tree, e.g.
         ``"summarizer"``. The runner uses this to load the correct

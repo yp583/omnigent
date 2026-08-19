@@ -74,6 +74,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelTaskTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.coder_dispatch import SysCoderHostsTool
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
@@ -278,6 +279,11 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
+# Priority 5f.0b: Coder-backed placement discovery. Registered alongside
+# sys_session_create only for specs with ``spawn: true`` and executed on the
+# runner, where Coder credentials and the authenticated Omni client live.
+_CODER_DISPATCH_TOOLS = frozenset({SysCoderHostsTool.name()})
+
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
 # state via the Omnigent server's existing REST endpoints (GET /items, GET
@@ -456,6 +462,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _CODER_DISPATCH_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
@@ -619,6 +626,7 @@ _ALL_LOCAL_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _CODER_DISPATCH_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
@@ -2278,6 +2286,11 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    *,
+    host_id: str | None = None,
+    workspace: str | None = None,
+    branch_name: str | None = None,
+    base_branch: str | None = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2286,7 +2299,8 @@ def _build_session_create_body(
     what makes the write child-only (an orchestrator cannot create a
     top-level or sibling session). A non-empty ``title``, ``message``, and
     ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    first queued user turn via ``initial_items``. Explicit host placement is
+    forwarded with optional git worktree creation.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2296,6 +2310,10 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param host_id: Optional registered external host id.
+    :param workspace: Absolute source-repository path on ``host_id``.
+    :param branch_name: Optional branch for a new isolated worktree.
+    :param base_branch: Optional starting revision for ``branch_name``.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2306,6 +2324,14 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if host_id is not None and workspace is not None:
+        body["host_id"] = host_id
+        body["workspace"] = workspace
+    if branch_name is not None:
+        git: _JsonObject = {"branch_name": branch_name}
+        if base_branch is not None:
+            git["base_branch"] = base_branch
+        body["git"] = git
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2340,7 +2366,7 @@ def _finalize_created_session(
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
     :returns: JSON handle ``{conversation_id, kind, agent_id,
-        agent_name, title, status}``.
+        agent_name, title, status, host_id, workspace, git_branch}``.
     """
     from omnigent.runner import app as _runner_app
     from omnigent.server.schemas import SessionCreatedEvent
@@ -2375,8 +2401,111 @@ def _finalize_created_session(
             "agent_name": data.get("agent_name"),
             "title": title if isinstance(title, str) else None,
             "status": data.get("status") or "created",
+            "host_id": data.get("host_id"),
+            "workspace": data.get("workspace"),
+            "git_branch": data.get("git_branch"),
         }
     )
+
+
+async def _execute_coder_hosts(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Discover and rank connected Coder-backed Omni hosts."""
+    if server_client is None:
+        return json.dumps({"error": "sys_coder_hosts requires server access"})
+
+    from omnigent.coder_dispatch import (
+        DEFAULT_CONTAINERS_KEY,
+        DEFAULT_CPU_KEY,
+        DEFAULT_LOAD_KEY,
+        DEFAULT_MAX_AGE_SECONDS,
+        DEFAULT_MEMORY_KEY,
+        DEFAULT_MEMORY_RESERVE_GIB,
+        DEFAULT_REQUESTED_MEMORY_GIB,
+        discover_coder_hosts,
+    )
+
+    def _key(name: str, default: str) -> str | None:
+        value = args.get(name, default)
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", normalized) is None:
+            return None
+        return normalized
+
+    def _number(name: str, default: float, *, minimum: float, maximum: float) -> float | None:
+        value = args.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        numeric = float(value)
+        return numeric if minimum <= numeric <= maximum else None
+
+    memory_key = _key("memory_key", DEFAULT_MEMORY_KEY)
+    cpu_key = _key("cpu_key", DEFAULT_CPU_KEY)
+    load_key = _key("load_key", DEFAULT_LOAD_KEY)
+    containers_key = _key("containers_key", DEFAULT_CONTAINERS_KEY)
+    max_age = _number(
+        "max_age_seconds", float(DEFAULT_MAX_AGE_SECONDS), minimum=1.0, maximum=3600.0
+    )
+    requested_memory = _number(
+        "requested_memory_gib",
+        DEFAULT_REQUESTED_MEMORY_GIB,
+        minimum=0.001,
+        maximum=1024.0,
+    )
+    reserve_memory = _number(
+        "memory_reserve_gib",
+        DEFAULT_MEMORY_RESERVE_GIB,
+        minimum=0.0,
+        maximum=1024.0,
+    )
+    ssh_fallback = args.get("ssh_fallback", True)
+    repository_remote = args.get("repository_remote")
+    if (
+        None
+        in (
+            memory_key,
+            cpu_key,
+            load_key,
+            containers_key,
+            max_age,
+            requested_memory,
+            reserve_memory,
+        )
+        or not isinstance(ssh_fallback, bool)
+        or (
+            repository_remote is not None
+            and (not isinstance(repository_remote, str) or not repository_remote.strip())
+        )
+    ):
+        return json.dumps({"error": "invalid sys_coder_hosts arguments"})
+    assert memory_key is not None
+    assert cpu_key is not None
+    assert load_key is not None
+    assert containers_key is not None
+    assert max_age is not None
+    assert requested_memory is not None
+    assert reserve_memory is not None
+
+    result = await discover_coder_hosts(
+        server_client=server_client,
+        memory_key=memory_key,
+        cpu_key=cpu_key,
+        load_key=load_key,
+        containers_key=containers_key,
+        max_age_seconds=int(max_age),
+        requested_memory_gib=requested_memory,
+        memory_reserve_gib=reserve_memory,
+        ssh_fallback=ssh_fallback,
+        repository_remote=(
+            repository_remote.strip() if isinstance(repository_remote, str) else None
+        ),
+    )
+    return json.dumps(result)
 
 
 async def _execute_session_create(
@@ -2401,8 +2530,9 @@ async def _execute_session_create(
       ``POST /v1/sessions`` create.
 
     Both modes force ``parent_session_id`` to the caller (child-only).
-    The child inherits the caller's runner (server-side affinity), so a
-    queued initial message starts a turn immediately. Returns a handle
+    By default the child inherits the caller's runner. Existing-agent mode
+    may explicitly target a registered host and optionally create an isolated
+    git worktree there. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
     ``conversation_id``) — unlike named-mode send, it does NOT block on
@@ -2444,6 +2574,29 @@ async def _execute_session_create(
                 )
             }
         )
+    placement_names = ("host_id", "workspace", "branch_name", "base_branch")
+    if has_config_path and any(name in args for name in placement_names):
+        return json.dumps(
+            {"error": "host placement is supported only with existing-agent agent_id mode"}
+        )
+    placement: dict[str, str | None] = {}
+    for name in placement_names:
+        value = args.get(name)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            return json.dumps({"error": f"'{name}' must be a non-empty string"})
+        placement[name] = value.strip() if isinstance(value, str) else None
+    host_id = placement["host_id"]
+    workspace = placement["workspace"]
+    branch_name = placement["branch_name"]
+    base_branch = placement["base_branch"]
+    if (host_id is None) != (workspace is None):
+        return json.dumps({"error": "'host_id' and 'workspace' must be provided together"})
+    if workspace is not None and not workspace.startswith("/"):
+        return json.dumps({"error": "'workspace' must be an absolute path on the target host"})
+    if branch_name is not None and host_id is None:
+        return json.dumps({"error": "'branch_name' requires 'host_id' and 'workspace'"})
+    if base_branch is not None and branch_name is None:
+        return json.dumps({"error": "'base_branch' requires 'branch_name'"})
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -2454,12 +2607,18 @@ async def _execute_session_create(
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
         )
+    targeted = host_id is not None
+    message = args.get("message")
     body = _build_session_create_body(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        args.get("message"),
+        None if targeted else message,
         model=args.get("model"),
+        host_id=host_id,
+        workspace=workspace,
+        branch_name=branch_name,
+        base_branch=base_branch,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2470,19 +2629,28 @@ async def _execute_session_create(
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "agent_id": agent_id})
     if resp.status_code >= 400:
-        return json.dumps(
-            {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
-        )
+        if targeted and resp.status_code == 409:
+            error = "placement_conflict"
+        elif targeted and resp.status_code in (502, 503, 504):
+            error = "placement_unavailable"
+        else:
+            error = f"sys_session_create returned {resp.status_code}"
+        return json.dumps({"error": error, "detail": resp.text[:200]})
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
-    return _finalize_created_session(
+    handle = _finalize_created_session(
         data,
         conversation_id=conversation_id,
         agent_id=str(agent_id),
         title=args.get("title"),
         publish_event=publish_event,
     )
+    if targeted and isinstance(message, str) and message:
+        message_error = await _post_child_first_message(data["id"], message, server_client)
+        if message_error is not None:
+            return message_error
+    return handle
 
 
 def _bundle_local_agent_source(source: Path) -> bytes:
@@ -5175,6 +5343,8 @@ async def execute_tool(
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
+        elif tool_name in _CODER_DISPATCH_TOOLS:
+            output = await _execute_coder_hosts(args, server_client=server_client)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,
@@ -7115,7 +7285,7 @@ def _inject_orchestrator_skills(
     agent_spec: AgentSpec | None,
 ) -> list[SkillSpec]:
     """
-    Auto-inject built-in platform skills for every omnigent agent.
+    Auto-inject built-in platform skills for Omnigent agents.
 
     The ``build-omnigent`` skill teaches the LLM how to author valid
     agent configs. Every agent on the platform should have access to it
@@ -7123,17 +7293,22 @@ def _inject_orchestrator_skills(
     ``omnigent claude`` user can author and launch new agents. The
     skill is injected from the canonical source at
     ``omnigent/onboarding/agent/skills/build-omnigent/`` when not
-    already present in the bundled set.
+    already present in the bundled set. Agents with ``spawn: true`` also
+    receive ``coder-dispatch``, which pairs their placement-discovery and
+    arbitrary child-create grants.
 
     :param skills: The agent's current skill list (bundled +
         potentially others); mutated in-place and returned.
-    :param agent_spec: The session's AgentSpec (unused after the gate
-        removal; retained for call-site compatibility).
+    :param agent_spec: The session's AgentSpec, used to gate dispatch skill
+        injection on ``spawn: true``.
     :returns: The (possibly augmented) skill list.
     """
-    del agent_spec  # no longer gated; inject unconditionally
     existing_names = {getattr(s, "name", None) for s in skills}
-    if "build-omnigent" in existing_names:
+    wanted = {"build-omnigent"}
+    if agent_spec is not None and agent_spec.spawn:
+        wanted.add("coder-dispatch")
+    missing = wanted - existing_names
+    if not missing:
         return skills
     from omnigent.spec.parser import _discover_skills
 
@@ -7143,9 +7318,11 @@ def _inject_orchestrator_skills(
     if not onboarding_skills_dir.is_dir():
         return skills
     for spec in _discover_skills(onboarding_skills_dir, skipped=[]):
-        if spec.name == "build-omnigent":
+        if spec.name in missing:
             skills.append(spec)
-            break
+            missing.remove(spec.name)
+            if not missing:
+                break
     return skills
 
 

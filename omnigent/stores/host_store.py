@@ -75,6 +75,8 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param coder_workspace_id: Immutable Coder workspace UUID for a host
+        running inside Coder, or ``None`` for any other host.
     """
 
     host_id: str
@@ -86,6 +88,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    coder_workspace_id: str | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -154,6 +157,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        coder_workspace_id=row.coder_workspace_id,
     )
 
 
@@ -202,6 +206,7 @@ class HostStore:
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
+        coder_workspace_id: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -241,6 +246,8 @@ class HostStore:
             Written on every connect — including ``None`` from an older
             host that doesn't report it, which correctly resets any
             stale value back to "unknown".
+        :param coder_workspace_id: Immutable Coder workspace UUID when the
+            connecting host runs inside Coder; ``None`` otherwise.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
@@ -267,13 +274,13 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.coder_workspace_id = coder_workspace_id
                 return _row_to_host(row)
 
-            # host_id is new — check whether (workspace_id, user_id, name)
-            # already exists. If it does, the same machine regenerated its
-            # identity file: this is a host_id rotation. If allow_host_id_reown
-            # is set, also check if any row holds this host_id under a different
-            # user_id and re-own it instead of inserting.
+            # host_id is new. A Coder workspace UUID is the strongest stable
+            # identity available: workspace rebuilds may regenerate Omni's
+            # local host id or change the display name. Rotate that durable row
+            # before falling back to the legacy same-name heuristic.
             if allow_host_id_reown:
                 reowned = self._reown_host_id(
                     session,
@@ -281,10 +288,32 @@ class HostStore:
                     name=name,
                     user_id=user_id,
                     configured_harnesses_json=harnesses_json,
+                    coder_workspace_id=coder_workspace_id,
                 )
                 if reowned is not None:
                     return reowned
 
+            if coder_workspace_id is not None:
+                existing_by_coder = session.execute(
+                    select(SqlHost).where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.user_id == user_id,
+                        SqlHost.coder_workspace_id == coder_workspace_id,
+                    )
+                ).scalar_one_or_none()
+                if existing_by_coder is not None:
+                    existing_by_coder.name = name
+                    row = self._rotate_host_id(
+                        session,
+                        existing_by_coder,
+                        host_id,
+                        now,
+                        harnesses_json,
+                        coder_workspace_id,
+                    )
+                    return _row_to_host(row)
+
+            # Legacy/non-Coder identity rotation: same owner and display name.
             existing_by_name = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -303,6 +332,7 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    coder_workspace_id,
                 )
                 return _row_to_host(row)
 
@@ -315,6 +345,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                coder_workspace_id=coder_workspace_id,
             )
             session.add(row)
             return _row_to_host(row)
@@ -326,6 +357,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        coder_workspace_id: str | None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -346,6 +378,7 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param coder_workspace_id: Immutable Coder workspace UUID, or None.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -399,6 +432,7 @@ class HostStore:
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
             configured_harnesses=harnesses_json,
+            coder_workspace_id=coder_workspace_id,
         )
         session.add(new_row)
         session.flush()
@@ -424,6 +458,7 @@ class HostStore:
         name: str,
         user_id: str,
         configured_harnesses_json: str | None = None,
+        coder_workspace_id: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -448,6 +483,7 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param coder_workspace_id: Immutable Coder workspace UUID, or None.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -472,6 +508,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                coder_workspace_id=coder_workspace_id,
             )
         )
         return Host(
@@ -484,6 +521,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            coder_workspace_id=coder_workspace_id,
         )
 
     def set_offline(self, host_id: str) -> None:

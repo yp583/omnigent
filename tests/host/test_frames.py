@@ -149,6 +149,7 @@ def test_hello_frame_round_trip() -> None:
         frame_protocol_version=1,
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
+        coder_workspace_id="3C835F4A-0916-4E1E-922D-8A9F30C9CB58",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -156,6 +157,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
+    assert decoded.coder_workspace_id == "3c835f4a-0916-4e1e-922d-8a9f30c9cb58"
 
 
 def test_hello_frame_empty_runners() -> None:

@@ -800,8 +800,11 @@ class SysSessionCreateTool(Tool):
     A **child-only write**: the new session's ``parent_session_id`` is
     forced to the caller's own session, so an orchestrator can only spawn
     sessions inside its own subtree — never a top-level or sibling
-    session. The child inherits the caller's runner (co-location), so it
-    starts executing as soon as a message is queued.
+    session. By default the child inherits the caller's runner
+    (co-location), so it starts executing as soon as a message is queued.
+    Existing-agent mode may instead target a connected external host with
+    ``host_id`` plus an absolute ``workspace``. Supplying ``branch_name``
+    creates an isolated git worktree on that host before the child starts.
 
     Two addressing modes — exactly one of ``agent_id`` or
     ``config_path`` must be given:
@@ -818,6 +821,11 @@ class SysSessionCreateTool(Tool):
       with ``sys_os_write``). The runner bundles the source and
       proxies the multipart ``POST /v1/sessions`` create, registering
       a fresh session-scoped agent.
+
+    Cross-host placement is supported only in existing-agent mode. Pass
+    ``host_id`` and absolute ``workspace`` together; pass ``branch_name``
+    to create a new worktree and optionally ``base_branch`` to select its
+    starting revision.
 
     An optional ``message`` is queued as the child's first user turn;
     an optional ``title`` labels the session.
@@ -859,7 +867,13 @@ class SysSessionCreateTool(Tool):
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
             "session (you cannot create top-level or sibling sessions). "
-            "Returns {conversation_id, agent_id, title, status}; the "
+            "Existing-agent mode can target another online registered "
+            "host by passing host_id with its absolute workspace path; "
+            "branch_name creates an isolated git worktree there and "
+            "base_branch selects its starting revision. Placement fields "
+            "are not supported with config_path. Returns "
+            "{conversation_id, agent_id, title, status, host_id, workspace, "
+            "git_branch}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send."
@@ -931,6 +945,40 @@ class SysSessionCreateTool(Tool):
                                 "or 'provider-local-model-id'. Sets the harness "
                                 "model at session creation; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "host_id": {
+                            "type": "string",
+                            "description": (
+                                "Existing-agent mode only: online registered "
+                                "Omnigent host to launch on, e.g. "
+                                "'host_a1b2c3'. Must be paired with workspace. "
+                                "Omit both to inherit the caller's runner."
+                            ),
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Existing-agent mode only: absolute source-repository "
+                                "path on host_id, e.g. '/workspace/project'. Must be "
+                                "paired with host_id. When branch_name is present, "
+                                "Omnigent creates the child worktree from this repo."
+                            ),
+                        },
+                        "branch_name": {
+                            "type": "string",
+                            "description": (
+                                "Existing-agent mode only: unique git branch for an "
+                                "isolated host-side worktree, e.g. "
+                                "'omni/auth-fix-a1b2'. Requires host_id and workspace."
+                            ),
+                        },
+                        "base_branch": {
+                            "type": "string",
+                            "description": (
+                                "Optional starting revision for branch_name, e.g. "
+                                "'origin/main'. Requires branch_name. Never guess it "
+                                "when the user has not supplied or confirmed a base."
                             ),
                         },
                     },

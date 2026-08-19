@@ -1267,6 +1267,8 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param coder_workspace_id: Immutable Coder workspace UUID reported by an
+        external host. ``NULL`` for non-Coder and server-managed hosts.
     """
 
     __tablename__ = "hosts"
@@ -1296,6 +1298,7 @@ class SqlHost(OmnigentBase):
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    coder_workspace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -1307,6 +1310,12 @@ class SqlHost(OmnigentBase):
         # rotation) stays consistent.
         UniqueConstraint(
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "user_id",
+            "coder_workspace_id",
+            name="uq_hosts_workspace_user_coder_workspace",
         ),
     )
 

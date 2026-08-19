@@ -24,12 +24,16 @@ from fastapi import FastAPI
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostLaunchRunnerFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_agent
 
@@ -60,6 +64,7 @@ class _HostCapture:
     """
 
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
+    launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
 
 
@@ -91,6 +96,8 @@ async def register_worktree_host(
         the create- and remove-worktree frames the host received.
     """
     conns: list[HostConnection] = []
+    previous_host_store = app.state.host_store
+    app.state.host_store = HostStore(db_uri)
 
     def _register(*, create_status: str = "ok", create_error: str | None = None) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
@@ -144,6 +151,17 @@ async def register_worktree_host(
                                     "error": create_error,
                                 }
                             )
+                elif isinstance(frame, HostLaunchRunnerFrame):
+                    cap.launch.append(frame)
+                    fut = conn.pending_launches.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(
+                            {
+                                "status": "launched",
+                                "runner_id": "runner_on_selected_host",
+                                "error": None,
+                            }
+                        )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
@@ -164,6 +182,7 @@ async def register_worktree_host(
             await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
         if not task.done():
             task.cancel()
+    app.state.host_store = previous_host_store
 
 
 async def _create_git_session(
@@ -244,6 +263,43 @@ async def test_create_without_base_branch_sends_none(
     assert len(cap.create) == 1
     assert cap.create[0].branch_name == "wip"
     assert cap.create[0].base_branch is None
+
+
+async def test_explicit_host_overrides_parent_runner_affinity(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An explicit host dispatches a child away from its parent's runner."""
+    cap = register_worktree_host()
+    agent = await create_test_agent(client, name="wt-cross-host-agent")
+    parent_resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert parent_resp.status_code == 201, parent_resp.text
+    parent_id = parent_resp.json()["id"]
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    assert conv_store.set_runner_id(parent_id, "runner_on_parent_host") is True
+
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "omni/cross-host", "base_branch": "main"},
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+
+    child = child_resp.json()
+    assert child["parent_session_id"] == parent_id
+    assert child["host_id"] == _HOST_ID
+    assert child["runner_id"] != "runner_on_parent_host"
+    assert child["workspace"] == f"{_SOURCE_REPO}-worktrees/omni-cross-host"
+    assert len(cap.create) == 1
+    assert len(cap.launch) == 1
+    assert cap.launch[0].session_id == child["id"]
 
 
 async def test_create_with_invalid_base_branch_fails_400(

@@ -28,6 +28,7 @@ from omnigent.tools.builtins import (
     SysAgentListTool,
     SysCallAsyncTool,
     SysCancelAsyncTool,
+    SysCoderHostsTool,
     SysListModelsTool,
     SysReadInboxTool,
     SysScheduledTaskCreateTool,
@@ -442,9 +443,10 @@ class ToolManager:
           ``sys_session_close``, and ``sys_list_models`` (per-worker
           model availability for picking a valid ``args.model``) — the
           agent may spawn THE SPECIFIED LIST of sub-agents, nothing else.
-        - ``spawn: true`` additionally registers ``sys_session_create``
-          — launching arbitrary children from an existing agent_id or a
-          custom locally-authored bundle (``config_path``). It also
+        - ``spawn: true`` additionally registers ``sys_coder_hosts`` for
+          Coder-backed placement and ``sys_session_create`` — launching
+          arbitrary children from an existing agent_id or a custom
+          locally-authored bundle (``config_path``). It also
           registers send/close (an agent must be able to drive and
           tombstone the children it creates); without declared
           sub-agents, send's schema omits the named-mode parameters.
@@ -499,6 +501,7 @@ class ToolManager:
         # explicit ``spawn: true`` grant — declaring tools.agents
         # alone only permits the specified sub-agent types.
         if self._spec.spawn:
+            self._tools[SysCoderHostsTool.name()] = SysCoderHostsTool()
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
 
     def _register_session_tools(self) -> None:

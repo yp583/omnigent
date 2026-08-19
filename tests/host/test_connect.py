@@ -23,6 +23,7 @@ from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     _build_runner_env,
+    _coder_workspace_id_from_env,
     _RunnerHandle,
     run_host_process,
 )
@@ -68,6 +69,28 @@ from omnigent.runner.identity import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_coder_workspace_id_prefers_omnigent_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Templates may explicitly override Coder's ambient workspace UUID."""
+    monkeypatch.setenv("CODER_WORKSPACE_ID", "ambient-id")
+    monkeypatch.setenv("OMNIGENT_CODER_WORKSPACE_ID", " OVERRIDE-ID ")
+
+    assert _coder_workspace_id_from_env() == "override-id"
+
+
+async def test_coder_workspace_id_rejects_unbounded_or_spaced_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid ambient identities never reach the host frame or database."""
+    monkeypatch.delenv("OMNIGENT_CODER_WORKSPACE_ID", raising=False)
+    monkeypatch.setenv("CODER_WORKSPACE_ID", "not a workspace id")
+    assert _coder_workspace_id_from_env() is None
+
+    monkeypatch.setenv("CODER_WORKSPACE_ID", "x" * 65)
+    assert _coder_workspace_id_from_env() is None
 
 
 @pytest.fixture(autouse=True)

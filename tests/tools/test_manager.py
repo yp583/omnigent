@@ -447,6 +447,7 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_send" in names
     assert "sys_session_close" in names
     assert "sys_session_create" in names
+    assert "sys_coder_hosts" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
     # Intelligent routing advisor stays hidden when routing is disabled.

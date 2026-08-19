@@ -601,6 +601,11 @@ This preserves the existing sessions API contract for clients that
 already uploaded or registered an agent. The response is the full
 `SessionResponse` shape with `id` set to the new conversation id.
 
+When `parent_session_id` and `host_id` are both set, the explicit host wins:
+the child does not inherit the parent's runner. This is the cross-host dispatch
+path used by Coder-backed placement. Without `host_id`, parent-runner affinity
+is unchanged.
+
   host_type (string, "external" | "managed", default "external")
     How the session's host is obtained. `"external"` (the default,
     and the pre-existing behavior): the session runs on

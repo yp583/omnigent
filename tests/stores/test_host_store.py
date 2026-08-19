@@ -103,6 +103,33 @@ def test_upsert_updates_existing_host_on_reconnect(
     assert updated.status == "online"
 
 
+def test_coder_workspace_identity_survives_host_id_and_name_rotation(
+    host_store: HostStore,
+) -> None:
+    """A rebuilt Coder workspace keeps one host row and its stable mapping."""
+    coder_workspace_id = "3c835f4a-0916-4e1e-922d-8a9f30c9cb58"
+    original = host_store.upsert_on_connect(
+        host_id="2e034aec380566e36f1b9e4f9287bc8d",
+        name="old-name",
+        user_id="alice@example.com",
+        coder_workspace_id=coder_workspace_id,
+    )
+
+    rotated = host_store.upsert_on_connect(
+        host_id="66addf80b8b4957660bdb86b622ec794",
+        name="ypbox1",
+        user_id="alice@example.com",
+        coder_workspace_id=coder_workspace_id,
+    )
+
+    assert rotated.host_id == "66addf80b8b4957660bdb86b622ec794"
+    assert rotated.name == "ypbox1"
+    assert rotated.coder_workspace_id == coder_workspace_id
+    assert rotated.created_at == original.created_at
+    assert host_store.get_host(original.host_id) is None
+    assert host_store.list_hosts("alice@example.com") == [rotated]
+
+
 def test_upsert_persists_configured_harnesses(host_store: HostStore) -> None:
     """
     Verify configured_harnesses is written on insert and read back

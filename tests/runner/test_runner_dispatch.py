@@ -5808,6 +5808,13 @@ def test_session_create_is_runner_local() -> None:
     assert should_dispatch_locally("sys_session_create") is True
 
 
+def test_coder_host_discovery_is_runner_local() -> None:
+    """Native harnesses must relay Coder placement discovery to the runner."""
+    from omnigent.runner.tool_dispatch import should_dispatch_locally
+
+    assert should_dispatch_locally("sys_coder_hosts") is True
+
+
 @pytest.mark.asyncio
 async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     """
@@ -6269,6 +6276,105 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     assert handle["conversation_id"] == "conv_child"
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_targets_host_then_posts_first_message() -> None:
+    """Cross-host creates launch the worktree before delivering the task."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append((request.method, request.url.path, body))
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_remote",
+                    "agent_id": "ag_x",
+                    "agent_name": "coder",
+                    "status": "idle",
+                    "host_id": "host_ypbox1",
+                    "workspace": "/workspace/.worktrees/remote",
+                    "git_branch": "omni/remote-a1b2",
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_remote/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "title": "remote task",
+                    "message": "implement it",
+                    "host_id": "host_ypbox1",
+                    "workspace": "/workspace/omnigent",
+                    "branch_name": "omni/remote-a1b2",
+                    "base_branch": "origin/main",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent",
+        )
+
+    assert [entry[1] for entry in requests] == [
+        "/v1/sessions",
+        "/v1/sessions/conv_remote/events",
+    ]
+    create_body = requests[0][2]
+    assert create_body["parent_session_id"] == "conv_parent"
+    assert create_body["host_id"] == "host_ypbox1"
+    assert create_body["workspace"] == "/workspace/omnigent"
+    assert create_body["git"] == {
+        "branch_name": "omni/remote-a1b2",
+        "base_branch": "origin/main",
+    }
+    assert "initial_items" not in create_body
+    assert requests[1][2]["data"]["content"][0]["text"] == "implement it"
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_remote"
+    assert handle["host_id"] == "host_ypbox1"
+    assert handle["workspace"] == "/workspace/.worktrees/remote"
+    assert handle["git_branch"] == "omni/remote-a1b2"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_rejects_placement_for_config_upload() -> None:
+    """Bundle mode cannot silently discard explicit remote placement."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "config_path": "helper.yaml",
+                    "host_id": "host_ypbox1",
+                    "workspace": "/workspace/omnigent",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent",
+        )
+
+    assert json.loads(output)["error"] == (
+        "host placement is supported only with existing-agent agent_id mode"
+    )
 
 
 @pytest.mark.asyncio

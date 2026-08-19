@@ -35,6 +35,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.coder_dispatch import SysCoderHostsTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
@@ -86,6 +87,7 @@ __all__ = [
     "SysAgentListTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
+    "SysCoderHostsTool",
     "SysListModelsTool",
     "SysReadInboxTool",
     "SysScheduledTaskCreateTool",
@@ -277,6 +279,10 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
+    # ``sys_coder_hosts`` is auto-registered only for ``spawn: true`` agents.
+    # Execution is runner-dispatched because it needs the runner's Coder
+    # credentials and authenticated Omnigent server client.
+    "sys_coder_hosts": None,
     # ``browser_*`` embedded-browser tools are framework-owned: always
     # auto-registered by ``ToolManager._register_browser_tools`` (the
     # single source of truth for registration), so any agent can drive

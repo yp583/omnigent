@@ -20,8 +20,10 @@ from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skil
 from omnigent.runner.native.orchestration import (
     _ensure_orchestrator_skills_in_bundle,
 )
+from omnigent.spec.types import AgentSpec
 
 SKILL_NAME = "build-omnigent"
+CODER_SKILL_NAME = "coder-dispatch"
 
 
 def test_skill_source_lives_in_the_installed_package() -> None:
@@ -60,3 +62,25 @@ def test_codex_resolves_the_injected_skill(tmp_path: Path) -> None:
     sources = codex_skill_sources(tmp_path, tmp_path / "fake-home")
     assert sources == [tmp_path / "skills"]
     assert SKILL_NAME in select_codex_skill_dirs("all", sources)
+
+
+def test_spawn_agent_receives_coder_dispatch_skill(tmp_path: Path) -> None:
+    """Only an agent with the arbitrary-child spawn grant gets dispatch."""
+    _ensure_orchestrator_skills_in_bundle(
+        tmp_path,
+        AgentSpec(spec_version=1, spawn=True),
+    )
+
+    target = tmp_path / "skills" / CODER_SKILL_NAME
+    assert target.is_dir()
+    assert (target / "SKILL.md").is_file()
+
+
+def test_non_spawn_agent_does_not_receive_coder_dispatch_skill(tmp_path: Path) -> None:
+    """The skill is hidden when its required placement tools are absent."""
+    _ensure_orchestrator_skills_in_bundle(
+        tmp_path,
+        AgentSpec(spec_version=1, spawn=False),
+    )
+
+    assert not (tmp_path / "skills" / CODER_SKILL_NAME).exists()

@@ -7796,10 +7796,11 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
-    # Inherit runner affinity from the parent session so the child
-    # is assigned to the same runner (sub-agent co-location).
+    # Inherit runner affinity for ordinary child sessions. An explicit host
+    # is a deliberate cross-host placement and must remain unbound so the
+    # route-level host launch can bind its new runner.
     inherited_runner_id: str | None = None
-    if body.parent_session_id is not None:
+    if body.parent_session_id is not None and body.host_id is None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id

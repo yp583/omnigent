@@ -587,8 +587,9 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+            ``coder_workspace_id``, ``configured_harnesses``, and
+            ``gateway_inference`` (``None`` when no connected host has
+            reported it to this replica).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -625,6 +626,7 @@ def create_hosts_router(
                     # targets the server creates on demand, not
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
+                    "coder_workspace_id": host.coder_workspace_id,
                     "configured_harnesses": host.configured_harnesses,
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
@@ -669,6 +671,7 @@ def create_hosts_router(
             # Same semantics as list_hosts: non-None marks a
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
+            "coder_workspace_id": host.coder_workspace_id,
             "configured_harnesses": host.configured_harnesses,
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".

@@ -104,6 +104,9 @@ class HostHelloFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host that doesn't report
         it) — never treat it as "nothing is gateway-backed".
+    :param coder_workspace_id: Immutable Coder workspace UUID when this host
+        runs inside Coder. ``None`` for non-Coder hosts. Resource load is not
+        carried on the host tunnel; dispatch reads it from Coder directly.
     """
 
     version: str
@@ -112,6 +115,7 @@ class HostHelloFrame:
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     gateway_inference: dict[str, bool] | None = None
+    coder_workspace_id: str | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
 
@@ -930,6 +934,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
+                "coder_workspace_id": frame.coder_workspace_id,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
             }
@@ -1371,6 +1376,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        coder_workspace_id=_optional_coder_workspace_id(msg),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
@@ -1991,3 +1997,14 @@ def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
     if not isinstance(val, str):
         raise ValueError(f"frame field must be a string or null: {key!r}")
     return val
+
+
+def _optional_coder_workspace_id(msg: _JsonObject) -> str | None:
+    """Decode and normalize the bounded Coder workspace identity."""
+    value = _optional_nullable_str(msg, "coder_workspace_id")
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized or len(normalized) > 64 or any(ch.isspace() for ch in normalized):
+        raise ValueError("invalid coder_workspace_id")
+    return normalized

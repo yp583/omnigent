@@ -148,6 +148,24 @@ HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
 
 
+def _coder_workspace_id_from_env() -> str | None:
+    """Return the immutable Coder workspace id advertised by this host.
+
+    Coder supplies ``CODER_WORKSPACE_ID`` inside workspace agents. The
+    Omnigent-prefixed override supports templates that deliberately scrub or
+    remap Coder's ambient environment. The value is static placement identity,
+    not resource telemetry.
+    """
+    value = os.environ.get("OMNIGENT_CODER_WORKSPACE_ID") or os.environ.get("CODER_WORKSPACE_ID")
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized or len(normalized) > 64 or any(ch.isspace() for ch in normalized):
+        _logger.warning("Ignoring invalid Coder workspace id from the host environment")
+        return None
+    return normalized
+
+
 def _unavailable_harness_became_ready(
     previous: Mapping[str, HarnessAvailability],
 ) -> bool:
@@ -2893,6 +2911,7 @@ class HostProcess:
             # The loop below refreshes changes; launch remains authoritative.
             configured_harnesses=configured_harnesses,
             gateway_inference=gateway_inference,
+            coder_workspace_id=_coder_workspace_id_from_env(),
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
         )
