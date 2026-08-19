@@ -4447,3 +4447,43 @@ class UpdateProjectRequest(BaseModel):
         if len(trimmed) > 100:
             raise ValueError("name must be at most 100 characters")
         return trimmed
+
+
+# ── Conductor ────────────────────────────────────────────────────
+
+
+class BindConductorRequest(BaseModel):
+    """Bind an already-created, owner-controlled session as the Conductor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str
+    memory_provider: str = Field(default="markdown", min_length=1, max_length=64)
+
+
+class UpdateConductorRequest(BaseModel):
+    """Update the active memory provider or provider-neutral settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory_provider: str | None = Field(default=None, min_length=1, max_length=64)
+    config: dict[str, Any] | None = None
+
+
+class WriteConductorMemoryRequest(BaseModel):
+    """Create or replace one Markdown memory document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=1024)
+    content: str
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class DeleteConductorMemoryRequest(BaseModel):
+    """Soft-delete one Markdown memory document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=1024)
+    expected_revision: int | None = Field(default=None, ge=1)

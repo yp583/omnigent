@@ -63,6 +63,10 @@ interface NativeShellApi {
   setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
+  /** Speak a short assistant reply with the platform text-to-speech engine. */
+  speak?: (params: NativeSpeechParams) => Promise<boolean>;
+  /** Stop speech started through {@link speak}. */
+  stopSpeaking?: () => void;
   // Optional: a shell older than this SPA may lack notification-click routing,
   // in which case clicking a native toast only focuses the app (the prior
   // behavior) instead of also navigating.
@@ -492,6 +496,38 @@ export interface NativeNotifyParams {
    * `onNativeNotificationActivated`. Omitted -> click only focuses the window.
    */
   navigatePath?: string;
+}
+
+export interface NativeSpeechParams {
+  text: string;
+  language?: string;
+  rate?: number;
+}
+
+/**
+ * Ask a native shell to speak text. Returns false in a browser or an older
+ * shell so the caller can fall back to the Web Speech API.
+ */
+export async function nativeSpeak(params: NativeSpeechParams): Promise<boolean> {
+  const native = nativeApi();
+  if (!native?.speak) return false;
+  try {
+    return await native.speak(params);
+  } catch (err) {
+    console.warn("[nativeBridge] native speech failed:", err);
+    return false;
+  }
+}
+
+/** Stop native speech if the installed shell exposes that capability. */
+export function stopNativeSpeech(): void {
+  const native = nativeApi();
+  if (!native?.stopSpeaking) return;
+  try {
+    native.stopSpeaking();
+  } catch (err) {
+    console.warn("[nativeBridge] stopping native speech failed:", err);
+  }
 }
 
 /**

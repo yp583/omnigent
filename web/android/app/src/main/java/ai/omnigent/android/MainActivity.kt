@@ -49,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
+    private lateinit var speech: AndroidNativeSpeech
     private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
 
@@ -124,6 +125,7 @@ class MainActivity : AppCompatActivity() {
         // reference chain can't pin this Activity.
         notifications = NativeNotificationManager(applicationContext)
         blobSaver = BlobSaver(applicationContext)
+        speech = AndroidNativeSpeech(applicationContext)
 
         // Capture (don't replay yet) a notification tap that cold-started us.
         pendingNavigatePath = navigatePathOf(intent)
@@ -308,6 +310,7 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    speech = speech,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -474,6 +477,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (::speech.isInitialized) speech.shutdown()
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null

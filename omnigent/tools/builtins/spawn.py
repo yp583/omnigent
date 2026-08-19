@@ -69,10 +69,9 @@ class SysSessionSendTool(Tool):
       sub-agent sees its full prior history plus the new ``args``).
     - **By session id** — pass ``session_id`` to post to an
       **existing** child session (e.g. one returned by
-      ``sys_session_create``). This is a child-only write: the
-      target must be a direct child of the caller
-      (``parent_session_id == caller``), so an orchestrator can
-      only drive sessions inside its own subtree.
+      ``sys_session_create``). This is normally a child-only write. The
+      built-in Conductor may also steer another session whose root is owned by
+      the same user, after a server-side owner check.
 
     Exactly one of ``(agent + title)`` or ``session_id`` must be
     given, always with ``args``.
@@ -138,7 +137,12 @@ class SysSessionSendTool(Tool):
             "named session."
         )
 
-    def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
+    def __init__(
+        self,
+        sub_specs: dict[str, AgentSpec],
+        *,
+        allow_conductor_sessions: bool = False,
+    ) -> None:
         """
         Initialize with the agent's available sub-agent specs.
 
@@ -146,6 +150,7 @@ class SysSessionSendTool(Tool):
             ``{"researcher": AgentSpec(...)}``.
         """
         self._sub_specs = sub_specs
+        self._allow_conductor_sessions = allow_conductor_sessions
 
     def get_schema(self) -> dict[str, Any]:
         """
@@ -158,7 +163,10 @@ class SysSessionSendTool(Tool):
         :returns: Dict with ``"type": "function"`` and a
             ``"function"`` sub-dict.
         """
-        return _build_sys_session_send_schema(self._sub_specs)
+        return _build_sys_session_send_schema(
+            self._sub_specs,
+            allow_conductor_sessions=self._allow_conductor_sessions,
+        )
 
 
 def _spec_opts_into_harness_override(spec: Any) -> bool:
@@ -191,6 +199,8 @@ def _spec_opts_into_harness_override(spec: Any) -> bool:
 
 def _build_sys_session_send_schema(
     sub_specs: dict[str, AgentSpec],
+    *,
+    allow_conductor_sessions: bool = False,
 ) -> dict[str, Any]:
     """
     Build the OpenAI function schema for ``sys_session_send``.
@@ -237,6 +247,13 @@ def _build_sys_session_send_schema(
                 ),
             },
         }
+    conductor_scope = (
+        " The active Conductor may also target any session whose root is owned "
+        "by the same user; those sends are queued for monitoring with "
+        "sys_session_get_info or sys_session_get_history."
+        if allow_conductor_sessions
+        else ""
+    )
     description = (
         SysSessionSendTool.description()
         if sub_specs
@@ -250,9 +267,11 @@ def _build_sys_session_send_schema(
             "Confined to your direct children. Returns the child's "
             "output when its turn completes. To run multiple sessions "
             "in parallel, emit multiple sys_session_send tool_calls in "
-            "the same response — they dispatch concurrently."
+            "the same response — they dispatch concurrently." + conductor_scope
         )
     )
+    if sub_specs and conductor_scope:
+        description += conductor_scope
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
     # at least one declared sub-agent opts in via
     # ``executor.config.allowed_harnesses``. Specs without the opt-in keep the
@@ -315,8 +334,13 @@ def _build_sys_session_send_schema(
                             "By-session-id mode: post to an existing "
                             "child session (e.g. one returned by "
                             "sys_session_create), e.g. 'conv_abc123'. "
-                            "Must be a direct child of the calling "
-                            "session. Use instead of agent + title."
+                            + (
+                                "For the active Conductor, the target may instead be any "
+                                "session owned by the same user. "
+                                if allow_conductor_sessions
+                                else "Must be a direct child of the calling session. "
+                            )
+                            + "Use instead of agent + title."
                         ),
                     },
                     "args": {

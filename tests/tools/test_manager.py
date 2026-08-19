@@ -504,6 +504,27 @@ def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
     assert named_params["properties"]["agent"]["enum"] == ["researcher"]
 
 
+def test_conductor_gets_private_memory_tools_and_owned_session_copy() -> None:
+    conductor = ToolManager(AgentSpec(spec_version=1, name="conductor", spawn=True))
+    schemas = {
+        schema["function"]["name"]: schema["function"] for schema in conductor.get_tool_schemas()
+    }
+    assert {
+        "sys_conductor_memory_list",
+        "sys_conductor_memory_read",
+        "sys_conductor_memory_write",
+    } <= schemas.keys()
+    assert "owned by the same user" in schemas["sys_session_send"]["description"]
+
+    ordinary_names = {
+        schema["function"]["name"]
+        for schema in ToolManager(
+            AgentSpec(spec_version=1, name="ordinary", spawn=True)
+        ).get_tool_schemas()
+    }
+    assert "sys_conductor_memory_read" not in ordinary_names
+
+
 def test_declared_agents_grant_send_close_but_not_create() -> None:
     """
     Declaring ``tools.agents`` permits spawning ONLY the specified

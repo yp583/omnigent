@@ -31,7 +31,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -302,6 +302,16 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# Owner-private durable memory exposed only to the built-in Conductor. The
+# runner verifies both the agent identity and the server-side active binding.
+_CONDUCTOR_MEMORY_TOOLS = frozenset(
+    {
+        "sys_conductor_memory_list",
+        "sys_conductor_memory_read",
+        "sys_conductor_memory_write",
+    }
+)
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -457,6 +467,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _CONDUCTOR_MEMORY_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -1722,6 +1733,7 @@ async def _execute_subagent_tool(
             conversation_id=conversation_id,
             publish_event=publish_event,
             created_by=dispatch_created_by,
+            conductor_mode=_is_conductor_agent(agent_spec),
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -2151,15 +2163,17 @@ async def _send_to_existing_session(
     conversation_id: str,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     created_by: str | None = None,
+    conductor_mode: bool = False,
 ) -> str:
     """
-    Post a message to an existing direct-child session, return a handle.
+    Post a message to an existing authorized session and return a handle.
 
     The by-session-id mode of ``sys_session_send``. **Child-only**: the
-    target must be a direct child of the caller (its
+    target must normally be a direct child of the caller (its
     ``parent_session_id`` equals ``conversation_id``), so a caller can
-    only drive sessions inside its own subtree — never a sibling or an
-    unrelated session it merely has access to. Looks the target up to
+    only drive sessions inside its own subtree. The active built-in Conductor
+    may instead steer a session whose root is exactly owned by the same user;
+    the server verifies that binding and ownership. Looks the target up to
     verify parentage (404 → ``session_not_found``; wrong parent or
     denied read → ``session_out_of_tree``), registers the child→parent
     fan-out and work mappings, posts the message, and returns a
@@ -2187,17 +2201,29 @@ async def _send_to_existing_session(
     if snap.status_code != 200:
         return f"Error: sys_session_send lookup returned {snap.status_code}"
     snap_data = snap.json()
+    conductor_steer = False
     if snap_data.get("parent_session_id") != conversation_id:
-        return json.dumps(
-            {
-                "error": "session_out_of_tree",
-                "conversation_id": target_session_id,
-                "message": (
-                    "target is not a direct child of the calling session; "
-                    "sys_session_send by session_id is child-only."
-                ),
-            }
-        )
+        if conductor_mode:
+            denied = await _authorize_conductor_target(
+                target_session_id,
+                conversation_id=conversation_id,
+                server_client=server_client,
+                action="steer",
+            )
+            if denied is not None:
+                return denied
+            conductor_steer = True
+        else:
+            return json.dumps(
+                {
+                    "error": "session_out_of_tree",
+                    "conversation_id": target_session_id,
+                    "message": (
+                        "target is not a direct child of the calling session; "
+                        "sys_session_send by session_id is child-only."
+                    ),
+                }
+            )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
             {
@@ -2218,6 +2244,31 @@ async def _send_to_existing_session(
         return (
             f"Error: session {target_session_id!r} is already running; "
             "wait for completion before sending again"
+        )
+    if conductor_steer:
+        try:
+            msg_resp = await _post_child_message_event(
+                server_client,
+                target_session_id,
+                content=[{"type": "input_text", "text": message}],
+                created_by=created_by,
+            )
+        except httpx.HTTPError as exc:
+            return f"Error: failed to steer session: {type(exc).__name__}: {exc}"
+        if msg_resp.status_code >= 400:
+            return f"Error: failed to steer session: {msg_resp.status_code} {msg_resp.text[:200]}"
+        return json.dumps(
+            {
+                "conversation_id": target_session_id,
+                "kind": "session_steer",
+                "title": snap_data.get("title"),
+                "status": "queued",
+                "message": (
+                    "Message queued. This independently managed session does not "
+                    "deliver into the Conductor inbox; monitor it with "
+                    "sys_session_get_info or sys_session_get_history."
+                ),
+            }
         )
     _runner_app.register_child_session(
         target_session_id,
@@ -3856,6 +3907,195 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
     return {"type": itype}
 
 
+def _is_conductor_agent(agent_spec: AgentSpec | None) -> bool:
+    """Return whether the running spec is the narrow built-in Conductor."""
+    return agent_spec is not None and getattr(agent_spec, "name", None) == "conductor"
+
+
+async def _authorize_conductor_target(
+    target_session_id: str,
+    *,
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+    action: Literal["read", "steer"],
+) -> str | None:
+    """Ask the server to prove the active Conductor can read or steer a target.
+
+    ``None`` means authorized. A JSON error string is returned for every
+    failure so callers fail closed without leaking a foreign session's
+    existence.
+    """
+    try:
+        response = await server_client.get(
+            f"/v1/conductor/sessions/{target_session_id}/authorization",
+            params={"caller_session_id": conversation_id, "action": action},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"conductor authorization failed: {exc}"})
+    if response.status_code == 200:
+        authorization = response.json()
+        if authorization.get("allowed") is True:
+            return None
+        if action == "steer" and authorization.get("can_read") is True:
+            return json.dumps(
+                {
+                    "error": "session_read_only",
+                    "session_id": target_session_id,
+                    "message": (
+                        "This session was shared read-only. Its owner must grant edit "
+                        "access before Conductor can steer it."
+                    ),
+                }
+            )
+        return json.dumps({"error": "session_not_accessible", "session_id": target_session_id})
+    if response.status_code == 404:
+        return json.dumps({"error": "session_not_accessible", "session_id": target_session_id})
+    if response.status_code in (401, 403):
+        return json.dumps({"error": "active_conductor_required"})
+    return json.dumps(
+        {
+            "error": f"conductor authorization returned {response.status_code}",
+            "session_id": target_session_id,
+        }
+    )
+
+
+async def _conductor_session_list_via_rest(
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+    agent_name: object = None,
+) -> str:
+    """Return children plus the active Conductor's permission-aware ledger."""
+    try:
+        response = await server_client.get("/v1/conductor", timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_list failed: {exc}"})
+    if response.status_code != 200:
+        return json.dumps({"error": f"sys_session_list returned {response.status_code}"})
+    body = _string_object_dict(response.json())
+    if body is None:
+        return json.dumps({"error": "sys_session_list returned malformed data"})
+    conductor = _string_object_dict(body.get("conductor"))
+    if conductor is None or conductor.get("conversation_id") != conversation_id:
+        return json.dumps({"error": "active_conductor_required"})
+    rows = _json_object_list(body.get("sessions"))
+    sessions = [
+        {
+            "session_id": row.get("id"),
+            "agent_name": row.get("agent_name"),
+            "title": row.get("title"),
+            "status": row.get("status"),
+            "runner_id": None,
+            "runner_online": None,
+            "parent_session_id": None,
+            "workspace": row.get("workspace"),
+            "git_branch": row.get("git_branch"),
+            "pending_approval_count": row.get("pending_approval_count"),
+            "task_summary": row.get("task_summary"),
+            "access_scope": row.get("access_scope"),
+            "owner_user_id": row.get("owner_user_id"),
+            "permission_level": row.get("permission_level"),
+            "can_steer": row.get("can_steer"),
+        }
+        for row in rows
+        if not (isinstance(agent_name, str) and agent_name) or row.get("agent_name") == agent_name
+    ]
+    sub_agents = await _collect_sub_agents(conversation_id, server_client)
+    return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
+
+
+async def _execute_conductor_memory_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+    agent_spec: AgentSpec | None,
+) -> str:
+    """Dispatch Conductor memory tools after validating the active binding."""
+    if not _is_conductor_agent(agent_spec):
+        return json.dumps({"error": "active_conductor_required"})
+    if server_client is None or conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires server access and a session id"})
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    # GET /conductor is the server-side binding proof and is deliberately
+    # repeated here; merely naming a custom spec "conductor" grants nothing.
+    try:
+        dashboard = await server_client.get("/v1/conductor", timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} authorization failed: {exc}"})
+    if dashboard.status_code != 200:
+        return json.dumps({"error": "active_conductor_required"})
+    dashboard_body = _string_object_dict(dashboard.json())
+    conductor = (
+        _string_object_dict(dashboard_body.get("conductor"))
+        if dashboard_body is not None
+        else None
+    )
+    if conductor is None or conductor.get("conversation_id") != conversation_id:
+        return json.dumps({"error": "active_conductor_required"})
+
+    if tool_name == "sys_conductor_memory_list":
+        prefix = args.get("prefix")
+        params = {"prefix": prefix} if isinstance(prefix, str) and prefix else None
+        method = "GET"
+        path = "/v1/conductor/memory"
+        request_kwargs: dict[str, Any] = {"params": params}
+    elif tool_name == "sys_conductor_memory_read":
+        path_value = args.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            return json.dumps({"error": f"{tool_name} requires a non-empty 'path'"})
+        method = "GET"
+        path = "/v1/conductor/memory/document"
+        request_kwargs = {"params": {"path": path_value}}
+    else:
+        path_value = args.get("path")
+        content = args.get("content")
+        expected_revision = args.get("expected_revision")
+        if (
+            not isinstance(path_value, str)
+            or not path_value
+            or not isinstance(content, str)
+            or not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            return json.dumps(
+                {
+                    "error": (
+                        f"{tool_name} requires path/content strings and a non-negative "
+                        "expected_revision integer"
+                    )
+                }
+            )
+        method = "PUT"
+        path = "/v1/conductor/memory/document"
+        request_kwargs = {
+            "json": {
+                "path": path_value,
+                "content": content,
+                "expected_revision": expected_revision,
+            }
+        }
+    try:
+        response = await server_client.request(method, path, timeout=30.0, **request_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"{tool_name} returned {response.status_code}",
+                "detail": response.text[:500],
+            }
+        )
+    return json.dumps(response.json())
+
+
 async def _execute_session_query_tool(
     tool_name: str,
     arguments: str,
@@ -3914,8 +4154,25 @@ async def _execute_session_query_tool(
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
+    conductor_mode = _is_conductor_agent(agent_spec)
+    if tool_name == "sys_session_list" and conductor_mode:
+        return await _conductor_session_list_via_rest(
+            conversation_id, server_client, args.get("agent_name")
+        )
     if tool_name == "sys_session_list":
         return await _session_list_via_rest(conversation_id, server_client, args.get("agent_name"))
+    if conductor_mode and tool_name in {"sys_session_get_history", "sys_session_get_info"}:
+        target_key = "conversation_id" if tool_name == "sys_session_get_history" else "session_id"
+        target = args.get(target_key) or conversation_id
+        if isinstance(target, str) and target != conversation_id:
+            denied = await _authorize_conductor_target(
+                target,
+                conversation_id=conversation_id,
+                server_client=server_client,
+                action="read",
+            )
+            if denied is not None:
+                return denied
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
@@ -5368,6 +5625,14 @@ async def execute_tool(
                 args,
                 conversation_id,
                 server_client,
+            )
+        elif tool_name in _CONDUCTOR_MEMORY_TOOLS:
+            output = await _execute_conductor_memory_tool(
+                tool_name,
+                arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+                agent_spec=agent_spec,
             )
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(

@@ -7289,6 +7289,201 @@ async def test_sys_session_send_session_id_rejects_non_child() -> None:
     assert event_posts == []
 
 
+@pytest.mark.asyncio
+async def test_conductor_can_steer_an_owned_non_child_without_registering_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The active Conductor uses owner authorization, not fake child linkage."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    registered: list[str] = []
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **_kwargs: registered.append(child_id),
+    )
+    event_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_owned":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_owned",
+                    "parent_session_id": None,
+                    "title": "Fix checkout",
+                    "busy": False,
+                },
+            )
+        if request.url.path == "/v1/conductor/sessions/conv_owned/authorization":
+            assert request.url.params["caller_session_id"] == "conv_conductor"
+            assert request.url.params["action"] == "steer"
+            return httpx.Response(200, json={"allowed": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_owned/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": "conv_owned", "args": "Please open a PR"}),
+            server_client=server_client,
+            conversation_id="conv_conductor",
+            agent_spec=SimpleNamespace(name="conductor", sub_agents=[]),
+            session_inbox=asyncio.Queue(),
+        )
+
+    assert event_posts[0]["data"]["content"][0]["text"] == "Please open a PR"
+    assert registered == []
+    handle = json.loads(output)
+    assert handle["kind"] == "session_steer"
+    assert handle["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_conductor_refuses_to_steer_a_read_only_shared_session() -> None:
+    """A shared READ grant supports inspection but not cross-session sends."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_shared":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_shared",
+                    "parent_session_id": None,
+                    "title": "Team review",
+                    "busy": False,
+                },
+            )
+        if request.url.path == "/v1/conductor/sessions/conv_shared/authorization":
+            assert request.url.params["caller_session_id"] == "conv_conductor"
+            assert request.url.params["action"] == "steer"
+            return httpx.Response(
+                200,
+                json={"allowed": False, "can_read": True, "can_steer": False},
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_shared/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": "conv_shared", "args": "Please merge this"}),
+            server_client=server_client,
+            conversation_id="conv_conductor",
+            agent_spec=SimpleNamespace(name="conductor", sub_agents=[]),
+            session_inbox=asyncio.Queue(),
+        )
+
+    result = json.loads(output)
+    assert result["error"] == "session_read_only"
+    assert "grant edit access" in result["message"]
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_conductor_session_list_preserves_shared_session_provenance() -> None:
+    """The Conductor model sees ownership and control capability on shared rows."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/conductor":
+            return httpx.Response(
+                200,
+                json={
+                    "conductor": {"conversation_id": "conv_conductor"},
+                    "sessions": [
+                        {
+                            "id": "conv_shared",
+                            "agent_name": "claude-native-ui",
+                            "title": "Team review",
+                            "status": "idle",
+                            "pending_approval_count": 0,
+                            "workspace": "/team/repo",
+                            "git_branch": "feature/team-review",
+                            "task_summary": "Review launch plan",
+                            "access_scope": "shared",
+                            "owner_user_id": "owner@example.com",
+                            "permission_level": 1,
+                            "can_steer": False,
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_list",
+            arguments=json.dumps({"agent_name": "claude-native-ui"}),
+            server_client=server_client,
+            conversation_id="conv_conductor",
+            agent_spec=SimpleNamespace(name="conductor", sub_agents=[]),
+        )
+
+    result = json.loads(output)
+    assert result["sessions"] == [
+        {
+            "session_id": "conv_shared",
+            "agent_name": "claude-native-ui",
+            "title": "Team review",
+            "status": "idle",
+            "runner_id": None,
+            "runner_online": None,
+            "parent_session_id": None,
+            "workspace": "/team/repo",
+            "git_branch": "feature/team-review",
+            "pending_approval_count": 0,
+            "task_summary": "Review launch plan",
+            "access_scope": "shared",
+            "owner_user_id": "owner@example.com",
+            "permission_level": 1,
+            "can_steer": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_conductor_memory_dispatch_requires_active_binding() -> None:
+    """A spec name alone cannot access Conductor memory."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/conductor"
+        return httpx.Response(
+            200,
+            json={
+                "conductor": {"conversation_id": "conv_someone_else"},
+                "sessions": [],
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_conductor_memory_list",
+            arguments="{}",
+            server_client=server_client,
+            conversation_id="conv_impostor",
+            agent_spec=SimpleNamespace(name="conductor"),
+        )
+    assert json.loads(output)["error"] == "active_conductor_required"
+
+
 @pytest.mark.parametrize("empty_output", ["", "   ", "\n\t "])
 def test_format_async_task_item_empty_subagent_completion_reads_as_no_output(
     empty_output: str,

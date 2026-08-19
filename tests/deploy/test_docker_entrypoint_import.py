@@ -155,6 +155,19 @@ def test_select_artifact_store(
     assert isinstance(_select_artifact_store(resolved), expected_type)
 
 
+def test_build_conductor_wires_markdown_provider(tmp_path: Path) -> None:
+    from deploy.docker.entrypoint import _build_conductor
+    from omnigent.stores.conductor_store.sqlalchemy_store import SqlAlchemyConductorStore
+
+    conductor_store, memory_providers = _build_conductor(
+        f"sqlite:///{tmp_path / 'conductor.db'}",
+        LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+
+    assert isinstance(conductor_store, SqlAlchemyConductorStore)
+    assert memory_providers.names() == ["markdown"]
+
+
 # ── routing wiring ────────────────────────────────────────────────────────
 # A Docker deploy must honour its own `routing:` block rather than running on
 # all-default knobs, so the settings that reach RuntimeCaps are the parsed ones.

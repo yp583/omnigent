@@ -29,6 +29,9 @@ from omnigent.tools.builtins import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
     SysCoderHostsTool,
+    SysConductorMemoryListTool,
+    SysConductorMemoryReadTool,
+    SysConductorMemoryWriteTool,
     SysListModelsTool,
     SysReadInboxTool,
     SysScheduledTaskCreateTool,
@@ -158,6 +161,7 @@ class ToolManager:
         self._register_skill_tools()
         self._register_builtin_tools()
         self._register_sub_agent_tools()
+        self._register_conductor_tools()
         self._register_session_tools()
         self._register_agent_mgmt_tools()
         self._register_os_env_tools()
@@ -197,6 +201,23 @@ class ToolManager:
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
         self._register_browser_tools()
+
+    def _register_conductor_tools(self) -> None:
+        """Register durable-memory tools only on the built-in Conductor.
+
+        The runner and server independently verify that the calling session is
+        the user's active Conductor binding. The name check keeps this narrow
+        tool surface out of ordinary agents while that runtime authorization
+        provides the actual security boundary.
+        """
+        if self._spec.name != "conductor":
+            return
+        for tool in (
+            SysConductorMemoryListTool(),
+            SysConductorMemoryReadTool(),
+            SysConductorMemoryWriteTool(),
+        ):
+            self._tools[tool.name()] = tool
 
     def _register_policy_tools(self) -> None:
         """
@@ -483,6 +504,7 @@ class ToolManager:
         sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
         self._tools[SysSessionSendTool.name()] = SysSessionSendTool(
             sub_specs=sub_specs,
+            allow_conductor_sessions=self._spec.name == "conductor",
         )
         self._tools[SysSessionCloseTool.name()] = SysSessionCloseTool()
         # Model awareness pairs with the dispatch grant: the per-worker

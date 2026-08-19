@@ -36,6 +36,11 @@ from omnigent.tools.builtins.async_inbox import (
     SysReadInboxTool,
 )
 from omnigent.tools.builtins.coder_dispatch import SysCoderHostsTool
+from omnigent.tools.builtins.conductor import (
+    SysConductorMemoryListTool,
+    SysConductorMemoryReadTool,
+    SysConductorMemoryWriteTool,
+)
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
@@ -88,6 +93,9 @@ __all__ = [
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
     "SysCoderHostsTool",
+    "SysConductorMemoryListTool",
+    "SysConductorMemoryReadTool",
+    "SysConductorMemoryWriteTool",
     "SysListModelsTool",
     "SysReadInboxTool",
     "SysScheduledTaskCreateTool",

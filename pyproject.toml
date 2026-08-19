@@ -441,7 +441,7 @@ exclude = ["*.__pycache__", "*.__pycache__.*"]
     "agent/skills/_orchestration/*/SKILL.md",
     "agent/tools/python/*.py",
 ]
-"omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
+"omnigent.resources.examples" = ["*.yaml", "*.sh", "conductor/**/*", "debby/**/*", "polly/**/*"]
 "omnigent.resources.pi_native" = ["*.js"]
 "omnigent.resources.scripts" = ["*.sh"]
 # include UI assets in build, plus the static API-only landing page served
