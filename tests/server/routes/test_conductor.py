@@ -122,6 +122,23 @@ def test_bind_dashboard_and_memory_round_trip(db_uri: str, tmp_path: Path) -> No
     assert conflict.status_code == 409
 
 
+def test_dashboard_can_include_archived_sessions(db_uri: str, tmp_path: Path) -> None:
+    client, conversations = _client(db_uri, tmp_path)
+    active = conversations.create_conversation(agent_id=ORDINARY_AGENT_ID, title="Active")
+    archived = conversations.create_conversation(agent_id=ORDINARY_AGENT_ID, title="Archived")
+    conversations.update_conversation(archived.id, archived=True)
+
+    default_rows = client.get("/v1/conductor").json()["sessions"]
+    default_ids = {row["id"] for row in default_rows}
+    assert active.id in default_ids
+    assert archived.id not in default_ids
+
+    rows = client.get("/v1/conductor", params={"include_archived": "true"}).json()["sessions"]
+    by_id = {row["id"]: row for row in rows}
+    assert by_id[active.id]["archived"] is False
+    assert by_id[archived.id]["archived"] is True
+
+
 def test_ensure_creates_one_hidden_runner_bound_chat(db_uri: str, tmp_path: Path) -> None:
     client, conversations = _client(db_uri, tmp_path)
     anchor = conversations.create_conversation(

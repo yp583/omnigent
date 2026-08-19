@@ -5810,10 +5810,10 @@ def test_session_create_is_runner_local() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+async def test_session_list_global_sessions_filter_archives_and_connectivity() -> None:
     """
     The global ``sessions`` view fetches GET /v1/sessions (forwarding the
-    ``agent_name`` filter), projects each row, and annotates
+    ``agent_name`` and ``include_archived`` filters), projects each row, and annotates
     ``runner_online`` by checking each UNIQUE runner once. Proves: the
     agent_name filter reaches the server; sessions are projected with
     status + parentage; and connectivity is folded in without a
@@ -5843,6 +5843,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
                             "agent_name": "researcher",
                             "title": "auth",
                             "status": "running",
+                            "archived": False,
                             "runner_id": "r1",
                             "parent_session_id": None,
                         },
@@ -5851,6 +5852,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
                             "agent_name": "researcher",
                             "title": "payments",
                             "status": "idle",
+                            "archived": True,
                             "runner_id": "r1",
                             "parent_session_id": None,
                         },
@@ -5866,7 +5868,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
         out = json.loads(
             await _execute_session_query_tool(
                 "sys_session_list",
-                json.dumps({"agent_name": "researcher"}),
+                json.dumps({"agent_name": "researcher", "include_archived": True}),
                 conversation_id="conv_x",
                 server_client=client,
             )
@@ -5874,6 +5876,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
+    assert sessions_params.get("include_archived") == "true"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -5882,6 +5885,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "agent_name": "researcher",
             "title": "auth",
             "status": "running",
+            "archived": False,
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
@@ -5891,6 +5895,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "agent_name": "researcher",
             "title": "payments",
             "status": "idle",
+            "archived": True,
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
@@ -6925,6 +6930,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_id": "ag_xyz",
                     "agent_name": "researcher",
                     "status": "running",
+                    "archived": True,
                     "created_at": 1,
                     "updated_at": 84,
                     "title": "auth flow",
@@ -6958,6 +6964,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["archived"] is True
     assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
@@ -7253,8 +7260,11 @@ async def test_conductor_session_list_preserves_shared_session_provenance() -> N
     """The Conductor model sees ownership and control capability on shared rows."""
     from omnigent.runner.tool_dispatch import execute_tool
 
+    conductor_params: dict[str, str] = {}
+
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/conductor":
+            conductor_params.update(dict(request.url.params))
             return httpx.Response(
                 200,
                 json={
@@ -7265,6 +7275,7 @@ async def test_conductor_session_list_preserves_shared_session_provenance() -> N
                             "agent_name": "claude-native-ui",
                             "title": "Team review",
                             "status": "idle",
+                            "archived": True,
                             "pending_approval_count": 0,
                             "workspace": "/team/repo",
                             "git_branch": "feature/team-review",
@@ -7284,19 +7295,21 @@ async def test_conductor_session_list_preserves_shared_session_provenance() -> N
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_list",
-            arguments=json.dumps({"agent_name": "claude-native-ui"}),
+            arguments=json.dumps({"agent_name": "claude-native-ui", "include_archived": True}),
             server_client=server_client,
             conversation_id="conv_conductor",
             agent_spec=SimpleNamespace(name="conductor", sub_agents=[]),
         )
 
     result = json.loads(output)
+    assert conductor_params.get("include_archived") == "true"
     assert result["sessions"] == [
         {
             "session_id": "conv_shared",
             "agent_name": "claude-native-ui",
             "title": "Team review",
             "status": "idle",
+            "archived": True,
             "runner_id": None,
             "runner_online": None,
             "parent_session_id": None,

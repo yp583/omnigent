@@ -125,7 +125,9 @@ def create_conductor_router(
         return conductor
 
     def _accessible_sessions(
-        user_id: str | None, conductor_id: str | None
+        user_id: str | None,
+        conductor_id: str | None,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         scope_user = _scope_user(user_id)
         page = conversation_store.list_conversations(
@@ -133,7 +135,7 @@ def create_conductor_router(
             kind="default",
             has_agent_id=True,
             accessible_by=scope_user if permission_store is not None else None,
-            include_archived=False,
+            include_archived=include_archived,
             order="desc",
             sort_by="updated_at",
         )
@@ -173,6 +175,7 @@ def create_conductor_router(
                     "id": session.id,
                     "title": session.title,
                     "status": session.live_status or "idle",
+                    "archived": session.archived,
                     "pending_approval_count": session.pending_elicitation_count or 0,
                     "updated_at": session.updated_at,
                     "created_at": session.created_at,
@@ -303,7 +306,10 @@ def create_conductor_router(
         return conductor
 
     @router.get("/conductor")
-    async def get_conductor(request: Request) -> dict[str, Any]:
+    async def get_conductor(
+        request: Request,
+        include_archived: bool = Query(default=False),
+    ) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
         scope_user = _scope_user(user_id)
         conductor = await asyncio.to_thread(conductor_store.get, scope_user)
@@ -316,6 +322,7 @@ def create_conductor_router(
             _accessible_sessions,
             user_id,
             conductor.conversation_id if conductor is not None else None,
+            include_archived,
         )
         return {
             "object": "conductor.dashboard",

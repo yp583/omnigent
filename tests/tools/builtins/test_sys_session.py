@@ -307,6 +307,16 @@ def test_peek_schema_required_fields_and_no_extra_props() -> None:
     assert set(params["properties"].keys()) == {"conversation_id", "tail_items"}
 
 
+def test_session_list_schema_exposes_archived_inventory_opt_in() -> None:
+    """Cloud inventory can explicitly include archived sessions."""
+    params = SysSessionListTool().get_schema()["function"]["parameters"]
+
+    assert params["required"] == []
+    assert params["additionalProperties"] is False
+    assert set(params["properties"]) == {"agent_name", "include_archived"}
+    assert params["properties"]["include_archived"]["type"] == "boolean"
+
+
 def test_peek_schema_tail_items_bounds() -> None:
     """
     ``tail_items`` is integer with ``minimum=1`` and ``maximum=50``.

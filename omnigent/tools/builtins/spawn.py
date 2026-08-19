@@ -492,10 +492,11 @@ class SysSessionListTool(Tool):
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /
       ``sys_session_get_info`` / ``sys_session_close``.
-    - ``sessions`` — a **global** view of every session the caller can
-      access (bounded by the server's per-user permission model), each
-      with its status and runner connectivity. An optional
-      ``agent_name`` filter narrows this list. This powers
+    - ``sessions`` — a **global** view of sessions the caller can access
+      (bounded by the server's per-user permission model), each with its
+      archive state, status, and runner connectivity. Archived sessions
+      are excluded by default; pass ``include_archived=true`` to include
+      them. An optional ``agent_name`` filter narrows this list. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
       (``sys_session_send`` by ``session_id``).
@@ -518,8 +519,9 @@ class SysSessionListTool(Tool):
             "(agent, title) children under this conversation (and your "
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
-            "every session "
-            "you can access, each with status + runner connectivity, "
+            "sessions you can access, each with archive state, status + "
+            "runner connectivity. Archived sessions are excluded by "
+            "default; pass include_archived=true to include them. "
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
@@ -531,7 +533,8 @@ class SysSessionListTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict; an optional ``agent_name`` filter.
+            ``"function"`` sub-dict; optional ``agent_name`` and
+            ``include_archived`` filters.
         """
         return {
             "type": "function",
@@ -548,6 +551,14 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": (
+                                "When true, include archived sessions in the "
+                                "global 'sessions' list. Defaults to false. "
+                                "Does not affect the 'sub_agents' view."
                             ),
                         },
                     },
@@ -620,8 +631,8 @@ class SysSessionGetInfoTool(Tool):
 
     A **global read**: resolves against any session the caller is
     permitted to access (bounded by the server's per-user permission
-    model), not just the caller's spawn subtree. Reports lifecycle
-    status, title, agent binding (id + name), runner binding and live
+    model), not just the caller's spawn subtree. Reports archive state,
+    lifecycle status, title, agent binding (id + name), runner binding and live
     connectivity, host, reasoning effort, effective model, parent
     linkage, workspace / git branch, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
@@ -649,7 +660,7 @@ class SysSessionGetInfoTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Return a session's metadata: lifecycle status, title, "
+            "Return a session's metadata: archive state, lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host, reasoning effort, model, parent session, workspace, "
             "persisted last-activity time, and outstanding approval "

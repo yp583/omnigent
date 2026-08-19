@@ -3800,10 +3800,15 @@ async def _conductor_session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
+    include_archived: bool = False,
 ) -> str:
     """Return children plus the active Conductor's permission-aware ledger."""
     try:
-        response = await server_client.get("/v1/conductor", timeout=30.0)
+        response = await server_client.get(
+            "/v1/conductor",
+            params={"include_archived": "true"} if include_archived else None,
+            timeout=30.0,
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_list failed: {exc}"})
     if response.status_code != 200:
@@ -3821,6 +3826,7 @@ async def _conductor_session_list_via_rest(
             "agent_name": row.get("agent_name"),
             "title": row.get("title"),
             "status": row.get("status"),
+            "archived": bool(row.get("archived", False)),
             "runner_id": None,
             "runner_online": None,
             "parent_session_id": None,
@@ -4159,10 +4165,18 @@ async def _execute_session_query_tool(
     conductor_mode = _is_conductor_agent(agent_spec)
     if tool_name == "sys_session_list" and conductor_mode:
         return await _conductor_session_list_via_rest(
-            conversation_id, server_client, args.get("agent_name")
+            conversation_id,
+            server_client,
+            args.get("agent_name"),
+            args.get("include_archived") is True,
         )
     if tool_name == "sys_session_list":
-        return await _session_list_via_rest(conversation_id, server_client, args.get("agent_name"))
+        return await _session_list_via_rest(
+            conversation_id,
+            server_client,
+            args.get("agent_name"),
+            args.get("include_archived") is True,
+        )
     if conductor_mode and tool_name in {"sys_session_get_history", "sys_session_get_info"}:
         target_key = "conversation_id" if tool_name == "sys_session_get_history" else "session_id"
         target = args.get(target_key) or conversation_id
@@ -4270,6 +4284,7 @@ async def _session_get_info_via_rest(
         {
             "session_id": snap.get("id"),
             "status": snap.get("status"),
+            "archived": bool(snap.get("archived", False)),
             # Persisted conversation activity is distinct from lifecycle
             # status: repeated polls with an unchanged value let an
             # orchestrator detect a running session that is not advancing.
@@ -4947,6 +4962,7 @@ async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
+    include_archived: bool = False,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4955,8 +4971,9 @@ async def _session_list_via_rest(
     parent/siblings when the caller is itself a child) — see
     :func:`_collect_sub_agents`. ``sessions`` is the **global**,
     permission-bounded list of every session the caller can access, each
-    annotated with status + runner connectivity, optionally filtered by
-    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
+    annotated with archive state, status + runner connectivity, optionally
+    filtered by ``agent_name``. Archived sessions are included only when
+    ``include_archived`` is true — see :func:`_collect_global_sessions`. Both are
     best-effort: a failure in either view yields an empty list for it
     rather than failing the whole call.
 
@@ -4964,10 +4981,12 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
+    :param include_archived: Include archived rows in the global
+        ``sessions`` view. Defaults to ``False``.
     :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
-    sessions = await _collect_global_sessions(server_client, agent_name)
+    sessions = await _collect_global_sessions(server_client, agent_name, include_archived)
     return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
 
 
@@ -5104,6 +5123,7 @@ async def _resolve_runner_online_map(
 async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
+    include_archived: bool = False,
 ) -> list[_JsonObject]:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
@@ -5112,18 +5132,22 @@ async def _collect_global_sessions(
     status, runner_id, runner_online, parent_session_id}``.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
-    filters the list server-side. Permission-bounded by the server (the
+    filters the list server-side. ``include_archived`` opts into archived
+    rows, which the server omits by default. Permission-bounded by the server (the
     runner's request carries the owning user's identity). Best-effort:
     returns ``[]`` on a fetch failure.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
+    :param include_archived: Whether to request archived rows too.
     :returns: The projected global session entries.
     """
     params: dict[str, str | int] = {"limit": _AGENT_LIST_PAGE_LIMIT, "order": "desc"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if include_archived:
+        params["include_archived"] = "true"
     try:
         resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
@@ -5145,6 +5169,7 @@ async def _collect_global_sessions(
             "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
             "title": r.get("title"),
             "status": r.get("status"),
+            "archived": bool(r.get("archived", False)),
             "runner_id": r.get("runner_id"),
             "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
             "parent_session_id": r.get("parent_session_id"),
