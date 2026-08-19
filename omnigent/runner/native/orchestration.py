@@ -5797,9 +5797,10 @@ def _ensure_orchestrator_skills_in_bundle(
     ``CODEX_HOME/skills/`` (codex) picks up the skill. Injects
     unconditionally for every agent — every ``omnigent claude`` /
     ``omnigent codex`` user should be able to author new agents. The
-    Agents with ``spawn: true`` also receive ``coder-dispatch``. Existing
-    targets are left unchanged. Best-effort: a failure to link is logged but
-    does not abort the terminal launch.
+    Agents with ``spawn: true`` also receive canonical ``cloud-dispatch`` and
+    the deprecated ``coder-dispatch`` compatibility alias (scheduled for
+    removal in v0.12.0). Existing targets are left unchanged. Best-effort: a
+    failure to link is logged but does not abort the terminal launch.
 
     :param bundle_dir: Materialized agent-bundle root, e.g.
         ``/tmp/omnigent-ap-chat-xyz/bundle``.
@@ -5808,13 +5809,16 @@ def _ensure_orchestrator_skills_in_bundle(
     """
     skill_names = ["build-omnigent"]
     if bool(getattr(agent_spec, "spawn", False)):
-        skill_names.append("coder-dispatch")
+        skill_names.extend(("cloud-dispatch", "coder-dispatch"))
     for skill_name in skill_names:
         target_dir = bundle_dir / "skills" / skill_name
         if target_dir.exists():
             continue
         # Anchored on the package root, not a ``.parent`` count off this file.
-        source = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills" / skill_name
+        source_root = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills"
+        if skill_name in {"cloud-dispatch", "coder-dispatch"}:
+            source_root = source_root / "_orchestration"
+        source = source_root / skill_name
         if not source.is_dir():
             _logger.debug(
                 "Orchestrator skill source %s is not a directory; skipping injection",

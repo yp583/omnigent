@@ -447,22 +447,19 @@ def ui_installable_harnesses() -> frozenset[str]:
     return frozenset(resolvable)
 
 
-# The families whose credential the UI can WRITE (Claude/Codex/Pi). A strict
-# subset of the installable families: opencode/qwen are installable but env-auth
-# (omnigent stores no key for them), so they are NOT credential-configurable.
-# ``pi`` consumes anthropic/openai and is handled by the host store-secret
-# handler, so it's included via its own key.
+# The families whose credential the UI can WRITE (Claude/Codex/Pi). Most are a
+# subset of the installable families; Claude SDK is the exception because its
+# Python package bundles the executable but still consumes Anthropic auth.
+# OpenCode/Qwen are installable but env-auth, so they are not configurable.
 _UI_CREDENTIAL_FAMILIES: frozenset[str] = frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_KEY})
 
 
 def ui_credential_configurable_harnesses() -> frozenset[str]:
     """Return every harness identifier the web UI may write a credential for.
 
-    A strict subset of :func:`ui_installable_harnesses`: only harnesses whose
-    provider credential omnigent owns (Claude / Codex / Pi families). The
-    env-auth harnesses (opencode, qwen) are installable but excluded — the host
-    store-secret handler can't configure them — so the credential route can
-    reject them with a clean 400 rather than forwarding a frame the host fails.
+    Includes only harnesses whose provider credential Omnigent owns (Claude /
+    Codex / Pi families). Claude SDK is credential-configurable despite not
+    being CLI-installable; env-auth harnesses (OpenCode/Qwen) are excluded.
 
     :returns: The set of harness identifiers accepted by the credential route,
         e.g. ``{"claude", "claude-native", "codex", "codex-native", "pi", ...}``.
@@ -473,7 +470,34 @@ def ui_credential_configurable_harnesses() -> frozenset[str]:
     for name, mapped in _all_harness_name_to_key().items():
         if mapped in _UI_CREDENTIAL_FAMILIES:
             resolvable.add(name)
+    # Claude SDK is not CLI-installable (the Python SDK bundles Claude Code),
+    # but it consumes the same provider/login credential as native Claude. Its
+    # canonical and executor-type spellings must therefore be accepted by the
+    # credential route when readiness reports ``needs-auth``.
+    resolvable.update({"claude-sdk", "claude_sdk"})
     return frozenset(resolvable)
+
+
+def ui_credential_family(harness: str) -> str | None:
+    """Return the provider family writable from the UI for *harness*.
+
+    This is intentionally separate from :func:`ui_install_key`: Claude SDK is
+    credential-configurable but not CLI-installable because its Python package
+    supplies the executable it launches.
+
+    :param harness: Harness spelling from a session or picker.
+    :returns: ``"anthropic"`` / ``"openai"`` when the UI may store a
+        credential, otherwise ``None``. Pi prefers the Anthropic family for a
+        newly entered key; credential adoption retains the detected family.
+    """
+    if harness in {"claude-sdk", "claude_sdk"}:
+        return ANTHROPIC_FAMILY
+    install_key = ui_install_key(harness)
+    return {
+        ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
+        OPENAI_FAMILY: OPENAI_FAMILY,
+        PI_KEY: ANTHROPIC_FAMILY,
+    }.get(install_key or "")
 
 
 # The auth step per UI-installable family, for the setup checklist. These are
@@ -481,7 +505,6 @@ def ui_credential_configurable_harnesses() -> frozenset[str]:
 # host, never executed server-side), so the commands are literal here rather
 # than derived from ``HarnessInstallSpec.login_args`` — keep them in sync with
 # that spec by hand if a harness's login command changes.
-# ``command`` steps run on the host and are status-tracked; ``setup`` steps
 # ``command`` steps run on the host and are status-tracked; ``auth`` steps
 # (pi) open the UI credential form and are status-tracked; ``setup`` steps
 # (qwen: env-auth, not UI-authable) point at ``omni setup`` and don't track.
@@ -577,6 +600,11 @@ def ui_setup_steps(harness: str) -> list[SetupStep]:
     """
     key = ui_install_key(harness)
     if key is None:
+        credential_family = ui_credential_family(harness)
+        if credential_family is not None:
+            auth = _UI_AUTH_STEP_BY_KEY.get(credential_family)
+            if auth is not None:
+                return [auth]
         # Not UI-installable (curl/OAuth/SDK harness): one generic step.
         return [
             SetupStep(

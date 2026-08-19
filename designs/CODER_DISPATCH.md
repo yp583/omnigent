@@ -19,10 +19,15 @@ An orchestrator with `spawn: true` receives two framework-owned capabilities:
   healthy, running, connected workspaces. It reads fresh configured agent
   metadata, queries Coder's agent-container endpoint when needed, and uses a
   bounded fixed Coder SSH probe to verify the git root and fill missing facts.
-- The `coder-dispatch` skill chooses an eligible host and calls the existing
+- The `cloud-dispatch` skill resolves a Codex or Claude agent, chooses an
+  eligible host (or honors an explicit box selection), and calls the existing
   `sys_session_create` tool with that host, the verified source repository,
   and a unique branch. Omni's existing worktree protocol creates an isolated
   checkout and starts the child runner in it.
+
+`coder-dispatch` is a compatibility alias for `cloud-dispatch` and is expected
+to be removed in v0.12.0. This workflow does not use Claude's hosted
+`claude --remote` service.
 
 Explicit host placement intentionally bypasses normal parent-runner affinity.
 An untargeted child still inherits its parent's runner exactly as before.
@@ -41,6 +46,8 @@ Each Coder workspace needs:
 - an authenticated Omnigent CLI state for the target server;
 - a long-running `omnigent host --background --non-interactive --server
   <omnigent-url>` startup task.
+- the selected Codex or Claude harness installed and authenticated under the
+  same user and `HOME` as the host service.
 
 Coder normally provides `CODER_WORKSPACE_ID`. A template that removes ambient
 Coder variables can set `OMNIGENT_CODER_WORKSPACE_ID` to the workspace UUID
@@ -61,15 +68,30 @@ a candidate require human override. The fixed SSH probe also verifies that the
 working directory is a git root; when the caller supplies its origin remote,
 the normalized remote must match.
 
+When `required_harness` is supplied, discovery also checks the host's reported
+`configured_harnesses` map. A known missing, outdated, or unauthenticated
+harness is a hard failure. Readiness from an older host that did not report the
+map is unknown and can be used only after human confirmation.
+
+This readiness is host-global: it can see the host's configured defaults and
+CLI login, but not a selected agent's per-spec `executor.auth`. Until placement
+becomes agent-aware, a spec-only credential can therefore be conservatively
+reported unavailable; configure the provider or login at host scope for cloud
+dispatch rather than overriding a known authentication failure.
+
 CPU percentage, one-minute load, logical CPU count, and running containers are
 ranking signals only. A host can run more coding-agent sessions than logical
 CPUs, so no CPU-derived session cap exists. Coder observations are snapshots,
 not reservations or runtime guarantees.
 
-The skill automatically uses the highest-ranked eligible host. It asks for a
-human decision only when all connected candidates are unmeasured,
-over-capacity, or point at the wrong repository. A placement conflict or host
-disconnect can be retried on the next eligible candidate.
+Without an explicit box, the skill uses the highest-ranked eligible host and
+asks for a human decision only when the remaining failure is unknown readiness
+or advisory capacity. Repository/path mismatches are never overridable. An
+automatic placement conflict or disconnect can be retried once on the next
+eligible candidate.
+
+An explicit box is matched by exact host/workspace ID or case-insensitive exact
+name. A pinned dispatch never silently falls back to another box.
 
 ## Safety boundaries
 
@@ -79,5 +101,8 @@ disconnect can be retried on the next eligible candidate.
   into the command.
 - Remote sessions are child-only and still pass the existing agent, host,
   workspace, and worktree authorization checks.
+- The Codex/Claude-only rule is workflow policy in `cloud-dispatch`; the
+  underlying discovery and child-create tools remain generic orchestration
+  primitives and do not enforce a provider allowlist themselves.
 - Dispatch does not authorize commits, pushes, pull requests, merges, or
   deployments. Those remain explicit human actions.

@@ -390,6 +390,14 @@ def test_claude_sdk_falls_back_to_first_available_anthropic_credential(
     """
     monkeypatch.setenv("HOME", str(config_home))
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # Keep this config-fallback test independent of asynchronous ambient
+    # provider prewarming performed elsewhere in the process.
+    from omnigent.onboarding.detected import effective_config_with_detected
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.effective_config_with_detected",
+        lambda config: effective_config_with_detected(config, detected=[]),
+    )
     config = {
         "providers": {
             "vendor-anthropic": {  # configured, but NOT marked default

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 
 from omnigent import coder_dispatch
+from omnigent.harness_availability import HarnessAvailability
 
 _GIB = 1024.0**3
 
@@ -94,6 +95,7 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
                         "name": "ypbox1",
                         "status": "online",
                         "sandbox_provider": None,
+                        "configured_harnesses": {"native-codex": True},
                     },
                     {
                         "host_id": "host_2",
@@ -101,6 +103,7 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
                         "status": "online",
                         "sandbox_provider": None,
                         "coder_workspace_id": "workspace-2",
+                        "configured_harnesses": {"codex-native": True},
                     },
                 ]
             },
@@ -152,6 +155,7 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
         result = await coder_dispatch.discover_coder_hosts(
             server_client=server_client,
             repository_remote="git@github.com:yp583/omnigent.git",
+            required_harness="native-codex",
         )
 
     candidates = result["candidates"]
@@ -162,6 +166,16 @@ async def test_discovery_intersects_hosts_verifies_repo_and_ranks_memory(
     assert candidates[1]["logical_cpu_count"] == 4.0
     assert candidates[0]["identity_match"] == "coder_workspace_id"
     assert candidates[1]["identity_match"] == "unique_workspace_name"
+    assert candidates[0]["coder_workspace_id"] == "workspace-2"
+    assert candidates[0]["reported_coder_workspace_id"] == "workspace-2"
+    assert candidates[1]["reported_coder_workspace_id"] is None
+    assert candidates[0]["configured_harnesses"] == {"codex-native": True}
+    assert candidates[1]["configured_harnesses"] == {"codex-native": True}
+    assert candidates[0]["required_harness"] == "codex-native"
+    assert candidates[0]["required_harness_readiness"] is True
+    assert candidates[0]["ineligibility_reasons"] == []
+    assert candidates[0]["override_allowed"] is False
+    assert result["required_harness"] == "codex-native"
     assert result["needs_confirmation"] is False
     assert "never cap" in str(result["ranking_note"])
     assert len(workspace_queries) == 2
@@ -275,3 +289,69 @@ def test_legacy_name_match_rejects_ambiguous_online_hosts() -> None:
         )
         is None
     )
+
+
+def test_harness_readiness_aliases_canonicalize_conservatively() -> None:
+    """Aliases collapse without a ready alias hiding an unavailable state."""
+    assert coder_dispatch._configured_harnesses(
+        {
+            "configured_harnesses": {
+                "native-codex": True,
+                "codex-native": "needs-auth",
+                "claude": True,
+            }
+        }
+    ) == {
+        "codex-native": "needs-auth",
+        "claude-sdk": True,
+    }
+    assert coder_dispatch._configured_harnesses({"configured_harnesses": None}) is None
+
+
+def test_older_host_harness_readiness_is_confirmable() -> None:
+    """An old host may be selected only after confirming unknown readiness."""
+    reasons = coder_dispatch._placement_ineligibility_reasons(
+        workspace_path="/workspace/omnigent",
+        expected_repository="github.com/yp583/omnigent",
+        candidate_repository="github.com/yp583/omnigent",
+        required_harness="codex-native",
+        configured_harnesses=None,
+        required_harness_readiness=None,
+        available_gib=12.0,
+        required_gib=5.0,
+    )
+    assert reasons == ["required_harness_readiness_unknown"]
+    assert coder_dispatch._override_allowed(reasons) is True
+
+
+@pytest.mark.parametrize("readiness", [False, "binary-missing", "needs-auth", "version-too-low"])
+def test_unavailable_required_harness_is_a_hard_failure(readiness: object) -> None:
+    """Every explicit unavailable state blocks dispatch without an override."""
+    reasons = coder_dispatch._placement_ineligibility_reasons(
+        workspace_path="/workspace/omnigent",
+        expected_repository="github.com/yp583/omnigent",
+        candidate_repository="github.com/yp583/omnigent",
+        required_harness="codex-native",
+        configured_harnesses={"codex-native": cast(HarnessAvailability, readiness)},
+        required_harness_readiness=cast(HarnessAvailability, readiness),
+        available_gib=12.0,
+        required_gib=5.0,
+    )
+    assert reasons == ["required_harness_unavailable"]
+    assert coder_dispatch._override_allowed(reasons) is False
+
+
+def test_repository_failure_remains_hard_when_memory_is_unknown() -> None:
+    """Capacity confirmation cannot override repository identity failures."""
+    reasons = coder_dispatch._placement_ineligibility_reasons(
+        workspace_path=None,
+        expected_repository="github.com/yp583/omnigent",
+        candidate_repository=None,
+        required_harness=None,
+        configured_harnesses=None,
+        required_harness_readiness=None,
+        available_gib=None,
+        required_gib=5.0,
+    )
+    assert reasons == ["repository_path_unverified", "memory_unknown"]
+    assert coder_dispatch._override_allowed(reasons) is False

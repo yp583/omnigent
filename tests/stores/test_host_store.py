@@ -105,29 +105,117 @@ def test_upsert_updates_existing_host_on_reconnect(
 
 def test_coder_workspace_identity_survives_host_id_and_name_rotation(
     host_store: HostStore,
+    db_uri: str,
 ) -> None:
-    """A rebuilt Coder workspace keeps one host row and its stable mapping."""
+    """A rebuilt Coder workspace keeps its host, session, and task bindings."""
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
     coder_workspace_id = "3c835f4a-0916-4e1e-922d-8a9f30c9cb58"
+    old_host_id = "2e034aec380566e36f1b9e4f9287bc8d"
+    new_host_id = "66addf80b8b4957660bdb86b622ec794"
     original = host_store.upsert_on_connect(
-        host_id="2e034aec380566e36f1b9e4f9287bc8d",
+        host_id=old_host_id,
         name="old-name",
         user_id="alice@example.com",
         coder_workspace_id=coder_workspace_id,
     )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversation = conversations.create_conversation(
+        host_id=old_host_id,
+        workspace="/home/alice/project",
+    )
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    owned_task = tasks.create(
+        scheduled_task_id="11111111111111111111111111111111",
+        name="owned task",
+        prompt="continue the work",
+        rrule="FREQ=DAILY",
+        user_id="alice@example.com",
+        agent_id="22222222222222222222222222222222",
+        timezone="UTC",
+        host_id=old_host_id,
+    )
+    foreign_task = tasks.create(
+        scheduled_task_id="33333333333333333333333333333333",
+        name="foreign task",
+        prompt="must not follow Alice's host",
+        rrule="FREQ=DAILY",
+        user_id="mallory@example.com",
+        agent_id="44444444444444444444444444444444",
+        timezone="UTC",
+        host_id=old_host_id,
+    )
 
     rotated = host_store.upsert_on_connect(
-        host_id="66addf80b8b4957660bdb86b622ec794",
+        host_id=new_host_id,
         name="ypbox1",
         user_id="alice@example.com",
         coder_workspace_id=coder_workspace_id,
     )
 
-    assert rotated.host_id == "66addf80b8b4957660bdb86b622ec794"
+    assert rotated.host_id == new_host_id
     assert rotated.name == "ypbox1"
     assert rotated.coder_workspace_id == coder_workspace_id
     assert rotated.created_at == original.created_at
     assert host_store.get_host(original.host_id) is None
     assert host_store.list_hosts("alice@example.com") == [rotated]
+    rebound = conversations.get_conversation(conversation.id)
+    assert rebound is not None
+    assert rebound.host_id == new_host_id
+    rebound_owned_task = tasks.get(owned_task.id)
+    assert rebound_owned_task is not None
+    assert rebound_owned_task.host_id == new_host_id
+    assert rebound_owned_task.updated_at is not None
+    unchanged_foreign_task = tasks.get(foreign_task.id)
+    assert unchanged_foreign_task is not None
+    assert unchanged_foreign_task.host_id == old_host_id
+    assert unchanged_foreign_task.updated_at is None
+
+
+def test_local_host_rotation_repoints_null_owner_scheduled_task(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    """Auth-disabled tasks follow the equivalent reserved-local host owner."""
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    old_host_id = "55555555555555555555555555555555"
+    new_host_id = "66666666666666666666666666666666"
+    host_store.upsert_on_connect(
+        host_id=old_host_id,
+        name="local-coder",
+        user_id="local",
+        coder_workspace_id="77777777-7777-4777-8777-777777777777",
+    )
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    task = tasks.create(
+        scheduled_task_id="88888888888888888888888888888888",
+        name="local task",
+        prompt="continue locally",
+        rrule="FREQ=DAILY",
+        user_id=None,
+        agent_id="99999999999999999999999999999999",
+        timezone="UTC",
+        host_id=old_host_id,
+    )
+
+    host_store.upsert_on_connect(
+        host_id=new_host_id,
+        name="local-coder-renamed",
+        user_id="local",
+        coder_workspace_id="77777777-7777-4777-8777-777777777777",
+    )
+
+    rebound = tasks.get(task.id)
+    assert rebound is not None
+    assert rebound.host_id == new_host_id
 
 
 def test_upsert_persists_configured_harnesses(host_store: HostStore) -> None:

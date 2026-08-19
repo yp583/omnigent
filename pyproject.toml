@@ -429,10 +429,18 @@ where = ["."]
 # Discovers the `omnigent` package (including `omnigent.inner.*` and
 # all omnigent subpackages absorbed during unification).
 include = ["omnigent*"]
+exclude = ["*.__pycache__", "*.__pycache__.*"]
 
 [tool.setuptools.package-data]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
+"omnigent.onboarding" = [
+    "agent/AGENTS.md",
+    "agent/config.yaml",
+    "agent/skills/*/SKILL.md",
+    "agent/skills/_orchestration/*/SKILL.md",
+    "agent/tools/python/*.py",
+]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
 "omnigent.resources.pi_native" = ["*.js"]
 "omnigent.resources.scripts" = ["*.sh"]

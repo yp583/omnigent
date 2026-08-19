@@ -163,10 +163,22 @@ def skill_no_resources() -> SkillSpec:
 
 
 @pytest.fixture(autouse=True)
-def _clean_mcp_cache() -> None:
+def _isolate_process_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    Clear the MCP discovery cache before each test.
+    Isolate process-global discovery and clear the MCP cache for each test.
+
+    ``ToolManager`` intentionally discovers project- and user-scoped skills
+    from cwd and HOME when no workdir is supplied. Unit tests that assert an
+    exact schema must not change based on the repository running pytest or a
+    developer's installed skills.
     """
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.chdir(tmp_path)
     clear_discovery_cache()
 
 

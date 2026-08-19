@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.json_types import JsonObject
 
 DEFAULT_MEMORY_KEY = "mem"
@@ -35,6 +37,13 @@ _MEMORY_ALIASES = ("memory", "ram", "memory_usage")
 _CPU_ALIASES = ("cpu_usage", "processor")
 _LOAD_ALIASES = ("load_average", "load_1m")
 _CONTAINER_ALIASES = ("containers", "container_count", "docker_containers")
+_CONFIRMABLE_REASONS = frozenset(
+    {
+        "required_harness_readiness_unknown",
+        "memory_unknown",
+        "insufficient_advisory_memory",
+    }
+)
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*$", re.IGNORECASE)
 _MEMORY_RE = re.compile(
     r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?i?b)?\s*/\s*"
@@ -92,6 +101,83 @@ def _normalized_key(value: object) -> str:
     if not isinstance(value, str):
         return ""
     return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _canonical_harness(value: str | None) -> str | None:
+    """Normalize a caller-provided harness spelling for host readiness lookup."""
+    if value is None or not (normalized := value.strip().lower()):
+        return None
+    canonical = canonicalize_harness(normalized) or normalized
+    if canonical.startswith("native-") and is_native_harness(canonical):
+        return f"{canonical.removeprefix('native-')}-native"
+    return canonical
+
+
+def _configured_harnesses(host: Mapping[str, object]) -> dict[str, HarnessAvailability] | None:
+    """Return host readiness keyed by canonical harness identifiers.
+
+    ``None`` remains distinct from an empty or partial map: it identifies an
+    older host that did not report readiness and may be used only after human
+    confirmation. When aliases disagree, retain the most informative
+    unavailable value instead of accidentally treating the harness as ready.
+    """
+    raw = host.get("configured_harnesses")
+    if not isinstance(raw, dict):
+        return None
+
+    readiness: dict[str, HarnessAvailability] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not is_harness_availability(value):
+            continue
+        canonical = _canonical_harness(key)
+        if canonical is None:
+            continue
+        current = readiness.get(canonical)
+        if (
+            current is None
+            or (current is True and value is not True)
+            or (current is False and isinstance(value, str))
+        ):
+            readiness[canonical] = value
+    return readiness
+
+
+def _placement_ineligibility_reasons(
+    *,
+    workspace_path: object,
+    expected_repository: str | None,
+    candidate_repository: object,
+    required_harness: str | None,
+    configured_harnesses: Mapping[str, HarnessAvailability] | None,
+    required_harness_readiness: HarnessAvailability | None,
+    available_gib: float | None,
+    required_gib: float,
+) -> list[str]:
+    """Return all hard and confirmable reasons a candidate cannot be placed."""
+    reasons: list[str] = []
+    if not isinstance(workspace_path, str) or not workspace_path.startswith("/"):
+        reasons.append("repository_path_unverified")
+    elif expected_repository is not None and candidate_repository is None:
+        reasons.append("repository_identity_unverified")
+    elif expected_repository is not None and candidate_repository != expected_repository:
+        reasons.append("repository_mismatch")
+
+    if required_harness is not None:
+        if configured_harnesses is None:
+            reasons.append("required_harness_readiness_unknown")
+        elif required_harness_readiness is not True:
+            reasons.append("required_harness_unavailable")
+
+    if available_gib is None:
+        reasons.append("memory_unknown")
+    elif available_gib < required_gib:
+        reasons.append("insufficient_advisory_memory")
+    return reasons
+
+
+def _override_allowed(reasons: Sequence[str]) -> bool:
+    """Return whether confirmation may override every placement failure."""
+    return bool(reasons) and all(reason in _CONFIRMABLE_REASONS for reason in reasons)
 
 
 def _duration_seconds(value: object) -> float | None:
@@ -494,6 +580,7 @@ async def discover_coder_hosts(
     memory_reserve_gib: float = DEFAULT_MEMORY_RESERVE_GIB,
     ssh_fallback: bool = True,
     repository_remote: str | None = None,
+    required_harness: str | None = None,
 ) -> JsonObject:
     """Return ranked Coder workspaces that also have an online Omni host.
 
@@ -504,6 +591,7 @@ async def discover_coder_hosts(
     """
     coder_url = _coder_url()
     expected_repository = _normalize_git_remote(repository_remote)
+    canonical_required_harness = _canonical_harness(required_harness)
     if not coder_url:
         return {
             "error": "coder_not_configured",
@@ -622,6 +710,12 @@ async def discover_coder_hosts(
                 )
                 continue
             host, identity_match = host_match
+            configured_harnesses = _configured_harnesses(host)
+            required_harness_readiness: HarnessAvailability | None = None
+            if canonical_required_harness is not None and configured_harnesses is not None:
+                required_harness_readiness = configured_harnesses.get(
+                    canonical_required_harness, False
+                )
             if not _workspace_is_running(workspace):
                 excluded.append(
                     {
@@ -705,24 +799,23 @@ async def discover_coder_hosts(
                 available_gib = (memory_total - memory_used) / (1024.0**3)
                 memory_ratio = memory_used / memory_total
             required_gib = requested_memory_gib + memory_reserve_gib
-            if available_gib is None:
-                eligible = False
-                capacity_reason = "memory_unknown"
-            elif available_gib < required_gib:
-                eligible = False
-                capacity_reason = "insufficient_advisory_memory"
-            elif not isinstance(workspace_path, str) or not workspace_path.startswith("/"):
-                eligible = False
-                capacity_reason = "repository_path_unverified"
-            elif expected_repository is not None and candidate_repository is None:
-                eligible = False
-                capacity_reason = "repository_identity_unverified"
-            elif expected_repository is not None and candidate_repository != expected_repository:
-                eligible = False
-                capacity_reason = "repository_mismatch"
-            else:
-                eligible = True
-                capacity_reason = "eligible"
+            # Non-overridable placement invariants lead the list. A simultaneous
+            # memory warning must never obscure an unverified checkout or an
+            # unavailable harness.
+            ineligibility_reasons = _placement_ineligibility_reasons(
+                workspace_path=workspace_path,
+                expected_repository=expected_repository,
+                candidate_repository=candidate_repository,
+                required_harness=canonical_required_harness,
+                configured_harnesses=configured_harnesses,
+                required_harness_readiness=required_harness_readiness,
+                available_gib=available_gib,
+                required_gib=required_gib,
+            )
+
+            eligible = not ineligibility_reasons
+            capacity_reason = ineligibility_reasons[0] if ineligibility_reasons else "eligible"
+            override_allowed = _override_allowed(ineligibility_reasons)
 
             normalized_load = None
             if isinstance(load_1m, (int, float)) and isinstance(logical_cpu_count, (int, float)):
@@ -732,6 +825,8 @@ async def discover_coder_hosts(
                 {
                     "host_id": host.get("host_id"),
                     "host_name": host.get("name"),
+                    "coder_workspace_id": workspace_id,
+                    "reported_coder_workspace_id": host.get("coder_workspace_id"),
                     "identity_match": identity_match,
                     "workspace_id": workspace_id,
                     "workspace_name": workspace_name,
@@ -741,6 +836,9 @@ async def discover_coder_hosts(
                     "workspace_path": workspace_path,
                     "repository_remote": candidate_repository,
                     "coder_reported_directory": reported_workspace_path,
+                    "configured_harnesses": configured_harnesses,
+                    "required_harness": canonical_required_harness,
+                    "required_harness_readiness": required_harness_readiness,
                     "memory_raw": memory_raw,
                     "memory_used_gib": (
                         round(memory_used / (1024.0**3), 2) if memory_used is not None else None
@@ -760,6 +858,8 @@ async def discover_coder_hosts(
                     "containers": containers,
                     "eligible": eligible,
                     "capacity_reason": capacity_reason,
+                    "ineligibility_reasons": ineligibility_reasons,
+                    "override_allowed": override_allowed,
                     "source": source,
                     "warnings": warnings,
                     "_memory_ratio": memory_ratio,
@@ -788,7 +888,11 @@ async def discover_coder_hosts(
         "requested_memory_gib": requested_memory_gib,
         "memory_reserve_gib": memory_reserve_gib,
         "expected_repository_remote": expected_repository,
-        "needs_confirmation": not any(bool(item.get("eligible")) for item in candidates),
+        "required_harness": canonical_required_harness,
+        "needs_confirmation": (
+            not any(bool(item.get("eligible")) for item in candidates)
+            and any(bool(item.get("override_allowed")) for item in candidates)
+        ),
         "ranking_note": (
             "memory is advisory; CPU, logical CPU count, load, and containers rank hosts "
             "but never cap coding-agent sessions"

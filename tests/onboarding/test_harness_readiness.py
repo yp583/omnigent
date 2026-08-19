@@ -227,11 +227,64 @@ def test_claude_ready_via_configured_provider_without_cli_login(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
 
-    def _must_not_probe(_key: str, **_kw: object) -> bool:
-        raise AssertionError("CLI login probed despite a configured provider")
+    def _must_not_probe(key: str, **_kw: object) -> bool:
+        if key == "anthropic":
+            raise AssertionError("Claude login probed despite a configured provider")
+        # ``configured_harness_map`` evaluates every installed harness. Keep
+        # unrelated families ready so this assertion stays scoped to Claude.
+        return True
 
     monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
-    assert configured_harness_map()["claude-native"] is True
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["claude_sdk"] is True
+    assert result["claude"] is True
+    assert result["claude-native"] is True
+
+
+def test_claude_sdk_provider_does_not_require_external_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider-backed Claude SDK remains ready without a system CLI.
+
+    ``claude-agent-sdk`` bundles its own executable. Requiring the separately
+    installed ``claude`` binary before checking an API-key/gateway provider
+    would incorrectly exclude a launchable host from Coder dispatch.
+    """
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured",
+        lambda harness: harness == "claude-sdk",
+    )
+
+    def _must_not_probe(_key: str, **_kw: object) -> bool:
+        raise AssertionError("CLI login probed despite a configured Claude SDK provider")
+
+    monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
+    result = configured_harness_map()
+    for spelling in ("claude-sdk", "claude_sdk", "claude"):
+        assert result[spelling] is True
+    # Native Claude still requires the external CLI even with a provider.
+    assert result["claude-native"] == "binary-missing"
+
+
+def test_claude_sdk_without_provider_or_probeable_login_needs_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bundled SDK CLI means absent system Claude is an auth issue.
+
+    Report ``needs-auth`` for every Claude SDK spelling so the UI offers an
+    authentication action instead of claiming the SDK's executable is absent.
+    Native Claude keeps the separate binary-missing verdict.
+    """
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
+    )
+    result = configured_harness_map()
+    for spelling in ("claude-sdk", "claude_sdk", "claude"):
+        assert result[spelling] == "needs-auth"
+    assert result["claude-native"] == "binary-missing"
 
 
 def test_family_provider_configured_excludes_subscription(
@@ -375,19 +428,14 @@ def test_configured_harness_map_gates_only_cli_harnesses(
 ) -> None:
     """With no CLI installed, only CLI-wrapping spellings read False.
 
-    SDK spellings (incl. the ``openai-agents-sdk`` workflow spelling and
-    the ``claude`` alias) stay True; the native + pi spellings flip to
-    False. A misclassified spelling would warn the wrong agents in the
-    picker — e.g. an SDK agent authenticating via a Databricks profile
-    flagged "needs setup" when it launches fine.
+    SDK spellings whose credentials cannot be probed stay True. Claude SDK is
+    auth-aware but not external-binary-gated; native and pi spellings are
+    binary-gated.
     """
     _no_clis_installed(monkeypatch)
     result = configured_harness_map()
     # SDK / alias spellings — never gated.
     for sdk in (
-        "claude-sdk",
-        "claude_sdk",
-        "claude",
         "openai-agents",
         "openai-agents-sdk",
         "agents_sdk",
@@ -432,6 +480,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "pi-native",
     ):
         assert result[missing] == "binary-missing", f"{missing} should name the missing CLI binary"
+    for sdk in ("claude-sdk", "claude_sdk", "claude"):
+        assert result[sdk] == "needs-auth", f"{sdk} should request auth, not an SDK binary"
 
 
 def test_copilot_ready_via_gh_cli_login_without_stored_token(

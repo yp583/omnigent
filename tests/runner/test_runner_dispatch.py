@@ -5816,6 +5816,45 @@ def test_coder_host_discovery_is_runner_local() -> None:
 
 
 @pytest.mark.asyncio
+async def test_coder_host_discovery_forwards_required_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner validation preserves the selected harness for placement."""
+    from omnigent import coder_dispatch
+    from omnigent.runner.tool_dispatch import _execute_coder_hosts
+
+    captured: dict[str, object] = {}
+
+    async def _discover(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"candidates": []}
+
+    monkeypatch.setattr(coder_dispatch, "discover_coder_hosts", _discover)
+    async with httpx.AsyncClient() as server_client:
+        result = await _execute_coder_hosts(
+            {"required_harness": " native-codex "},
+            server_client=server_client,
+        )
+
+    assert json.loads(result) == {"candidates": []}
+    assert captured["required_harness"] == "native-codex"
+
+
+@pytest.mark.asyncio
+async def test_coder_host_discovery_rejects_invalid_required_harness() -> None:
+    """Malformed harness identifiers do not reach discovery."""
+    from omnigent.runner.tool_dispatch import _execute_coder_hosts
+
+    async with httpx.AsyncClient() as server_client:
+        result = await _execute_coder_hosts(
+            {"required_harness": "codex native"},
+            server_client=server_client,
+        )
+
+    assert json.loads(result) == {"error": "invalid sys_coder_hosts arguments"}
+
+
+@pytest.mark.asyncio
 async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     """
     The global ``sessions`` view fetches GET /v1/sessions (forwarding the

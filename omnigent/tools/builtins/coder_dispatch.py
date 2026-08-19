@@ -26,8 +26,12 @@ class SysCoderHostsTool(Tool):
             "recommendation. CPU, logical CPU count, load, and container count "
             "only rank hosts and never cap coding-agent sessions. Returns the "
             "Omnigent host_id and verified repository workspace path needed by "
-            "sys_session_create. If needs_confirmation is true, ask the human "
-            "before dispatching to an over-capacity or unmeasured host."
+            "sys_session_create. A required_harness filters using each host's "
+            "reported readiness. Ask the human before using any candidate whose "
+            "override_allowed field is true. needs_confirmation indicates that "
+            "automatic placement has no eligible candidate but does have a "
+            "confirmable fallback; "
+            "repository and known harness failures cannot be overridden."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -108,6 +112,16 @@ class SysCoderHostsTool(Tool):
                                 "When supplied, only Coder workspaces whose probed "
                                 "origin matches it are eligible. Credentials are "
                                 "stripped before comparison or output."
+                            ),
+                        },
+                        "required_harness": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                            "description": (
+                                "Optional harness the child session must use. "
+                                "Aliases are canonicalized before comparing the "
+                                "connected host's configured-harness readiness."
                             ),
                         },
                     },

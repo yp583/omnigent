@@ -157,6 +157,8 @@ describe("harnessInstallableOnHost", () => {
 
 describe("harnessCredentialFamily", () => {
   it("maps Claude/Codex/Pi spellings to their provider family", () => {
+    expect(harnessCredentialFamily("claude-sdk")).toBe("anthropic");
+    expect(harnessCredentialFamily("claude_sdk")).toBe("anthropic");
     expect(harnessCredentialFamily("claude-native")).toBe("anthropic");
     expect(harnessCredentialFamily("native-claude")).toBe("anthropic");
     expect(harnessCredentialFamily("codex")).toBe("openai");
@@ -177,6 +179,7 @@ describe("harnessCredentialFamily", () => {
 
 describe("harnessCredentialAdoptFamilies", () => {
   it("returns the single own family for Claude/Codex", () => {
+    expect(harnessCredentialAdoptFamilies("claude-sdk")).toEqual(["anthropic"]);
     expect(harnessCredentialAdoptFamilies("claude-native")).toEqual(["anthropic"]);
     expect(harnessCredentialAdoptFamilies("codex")).toEqual(["openai"]);
     expect(harnessCredentialAdoptFamilies("codex-native")).toEqual(["openai"]);
@@ -198,6 +201,7 @@ describe("harnessAuthableOnHost", () => {
   const online = hostWith({ codex: "needs-auth" });
 
   it("true for Claude/Codex/Pi families when feature on and host online", () => {
+    expect(harnessAuthableOnHost(info(), "claude-sdk", online)).toBe(true);
     expect(harnessAuthableOnHost(info(), "codex-native", online)).toBe(true);
     expect(harnessAuthableOnHost(info(), "claude-native", online)).toBe(true);
     expect(harnessAuthableOnHost(info(), "pi", online)).toBe(true);

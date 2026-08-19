@@ -1215,6 +1215,15 @@ def test_ui_installable_harnesses_includes_native_spellings() -> None:
     assert "claude-sdk" not in installable
 
 
+def test_claude_sdk_is_ui_authable_without_becoming_installable() -> None:
+    """Claude SDK accepts provider credentials but ships its own executable."""
+    configurable = hi.ui_credential_configurable_harnesses()
+    assert {"claude-sdk", "claude_sdk"} <= configurable
+    assert hi.ui_credential_family("claude-sdk") == ANTHROPIC_FAMILY
+    assert hi.ui_credential_family("claude_sdk") == ANTHROPIC_FAMILY
+    assert hi.ui_install_key("claude-sdk") is None
+
+
 def test_ui_setup_steps_install_then_ui_auth_for_codex() -> None:
     """Codex: one-click install, then a UI-authable auth step. The step opens
     the credential form (action ``"auth"``) whose options include the ``codex
@@ -1262,12 +1271,22 @@ def test_ui_setup_steps_qwen_auth_stays_untracked_setup_fallback() -> None:
 
 def test_ui_setup_steps_generic_for_non_installable() -> None:
     """A non-installable harness (cursor) gets a single generic setup step."""
-    for harness in ("cursor", "claude-sdk"):
+    steps = hi.ui_setup_steps("cursor")
+    assert len(steps) == 1
+    assert steps[0].action == "setup"
+    assert steps[0].command == "omni setup"
+    assert steps[0].status_key is None
+
+
+def test_ui_setup_steps_claude_sdk_is_auth_only() -> None:
+    """Claude SDK needs provider/login auth but no separate CLI install."""
+    for harness in ("claude-sdk", "claude_sdk"):
         steps = hi.ui_setup_steps(harness)
         assert len(steps) == 1
-        assert steps[0].action == "setup"
-        assert steps[0].command == "omni setup"
-        assert steps[0].status_key is None
+        assert steps[0].kind == "auth"
+        assert steps[0].action == "auth"
+        assert steps[0].command == "claude auth login --claudeai"
+        assert steps[0].status_key == "authed"
 
 
 # ── Version-aware installed check ────────────────────────

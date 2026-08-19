@@ -17,7 +17,7 @@ import json
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, or_, select, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
+    SqlScheduledTask,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
@@ -34,6 +35,7 @@ from omnigent.db.utils import (
     now_epoch,
 )
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.server.auth import RESERVED_USER_LOCAL
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -359,7 +361,7 @@ class HostStore:
         harnesses_json: str | None,
         coder_workspace_id: str | None,
     ) -> SqlHost:
-        """Replace a host row's host_id while repointing its conversations.
+        """Replace a host row's host_id while repointing durable bindings.
 
         ``host_id`` is now part of the PK, so an in-place UPDATE is not
         possible via the ORM. The rotation is:
@@ -368,7 +370,8 @@ class HostStore:
         2. NULL them so nothing references the old PK value.
         3. DELETE the old row (host_id was the PK member being changed).
         4. INSERT a new row with the new host_id, preserving ``created_at``.
-        5. Reattach the captured conversations to the new host_id.
+        5. Reattach the captured conversations and owned scheduled tasks to
+           the new host_id.
 
         All steps run inside the caller's transaction so a failure rolls
         the whole upsert back.
@@ -447,6 +450,22 @@ class HostStore:
                 .values(host_id=new_host_id)
             )
             session.flush()
+
+        # Tasks have no host FK, so rebind their owned pins explicitly.
+        # Auth-disabled tasks persist NULL but resolve to the local owner.
+        scheduled_owner = SqlScheduledTask.user_id == user_id
+        if user_id == RESERVED_USER_LOCAL:
+            scheduled_owner = or_(scheduled_owner, SqlScheduledTask.user_id.is_(None))
+        session.execute(
+            update(SqlScheduledTask)
+            .where(
+                SqlScheduledTask.workspace_id == current_workspace_id(),
+                SqlScheduledTask.host_id == old_host_id,
+                scheduled_owner,
+            )
+            .values(host_id=new_host_id, updated_at=now)
+        )
+        session.flush()
 
         return new_row
 

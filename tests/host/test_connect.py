@@ -2962,6 +2962,33 @@ def test_handle_store_secret_pi_maps_to_anthropic_family(
     assert seen["family"] == "anthropic"
 
 
+@pytest.mark.parametrize("harness", ["claude-sdk", "claude_sdk"])
+def test_handle_store_secret_claude_sdk_maps_to_anthropic_family(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+) -> None:
+    """SDK spellings accept UI credentials without becoming installable."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _store(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "anthropic", None)
+
+    monkeypatch.setattr(connect, "store_harness_credential", _store)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {harness: True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="sdk-auth", harness=harness, kind="key", secret_value="x")
+    )
+
+    assert result.status == "ok"
+    assert seen["family"] == "anthropic"
+
+
 def test_handle_store_secret_adopt_calls_adopt_core(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

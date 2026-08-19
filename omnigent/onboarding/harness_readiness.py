@@ -5,21 +5,18 @@ it while connected (so the web agent picker can warn accurately), and
 re-checks the session's harness before spawning a runner (so an unconfigured
 launch fails clearly instead of dying inside the executor).
 
-"Configured" here is deliberately narrow: the **only** thing the daemon
-can reliably determine locally is whether a harness's wrapped CLI binary
-is on ``PATH``. That gates the native CLI harnesses (Claude Code / Codex
-via ``claude`` / ``codex``) and ``pi`` — the common "I picked Claude Code
-but never ran ``omnigent setup`` to install it" case.
+Launch gating here is deliberately narrow: the daemon checks binaries for
+CLI-wrapping harnesses but does not block on authentication. Picker readiness
+is richer where a local signal exists. In particular, ``claude-sdk`` uses its
+bundled Claude Code executable and reports ready when either an Omnigent
+Anthropic provider entry or the system Claude subscription login is present;
+otherwise it reports ``needs-auth`` without requiring a system CLI binary.
 
-In-process SDK harnesses (``claude-sdk``, ``openai-agents``) run without
-any CLI and resolve their model credentials at runtime from sources the
-daemon cannot enumerate — environment API keys, a Databricks profile /
-gateway, or the spec's ``executor.auth`` with ``${ENV}`` expansion. The
-daemon has no way to know whether those will resolve, so it never gates
-them (a genuine auth failure surfaces at the first turn via the
-executor's own error). Unknown harnesses fail open for the same reason.
-This keeps the check free of false negatives that would block a launch
-that would actually work.
+Other in-process SDK harnesses resolve credentials at runtime from sources the
+daemon cannot enumerate, including a spec's ``executor.auth`` with ``${ENV}``
+expansion, so they remain ungated. Unknown harnesses fail open for the same
+reason. A genuine unresolved credential still surfaces at the first turn via
+the executor's own error.
 """
 
 from __future__ import annotations
@@ -57,6 +54,7 @@ from omnigent.onboarding.harness_install import (
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
+    ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
@@ -65,11 +63,10 @@ from omnigent.onboarding.provider_config import (
     load_config,
 )
 
-# In-process SDK harnesses: no CLI binary, credentials resolved at runtime
-# from ambient/spec sources the daemon can't see. Never gated. Includes both
-# the canonical ``openai-agents`` and the ``openai-agents-sdk`` spelling the
-# workflow's ``AgentHarnessType`` uses; executor-type spellings (``claude_sdk``
-# / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
+# SDK harnesses whose credentials cannot be assessed by a vendor CLI remain
+# ungated. Claude SDK is handled separately below because it drives the bundled
+# Claude Code executable and can use either its subscription login or a
+# configured provider.
 # ``antigravity`` is the in-process Gemini SDK harness (its key resolves at
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
 # harness gated below on its binary plus a file-based OAuth credential.
@@ -297,7 +294,7 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
     return True
 
 
-# Native CLI harnesses that authenticate via their own login command and can
+# CLI harnesses that authenticate via their own login command and can
 # report auth state locally, so the picker map can distinguish "installed but
 # not signed in" (``needs-auth``) from "not installed" (``binary-missing``) —
 # the same two-step signal Codex already provides. This is picker-facing ONLY;
@@ -312,8 +309,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
 # so the picker can distinguish "not installed" from "installed but not signed
 # in", while the launch gate stays binary-only.
 _AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
-    "claude-native": "anthropic",
-    "native-claude": "anthropic",
+    "claude-native": ANTHROPIC_FAMILY,
+    "native-claude": ANTHROPIC_FAMILY,
     "opencode-native": OPENCODE_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
@@ -420,12 +417,38 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
     )
 
 
+def _claude_sdk_availability() -> HarnessAvailability:
+    """Return picker readiness for the Claude SDK harness.
+
+    ``claude-agent-sdk`` ships its own Claude Code executable, so an external
+    ``claude`` binary is not a launch requirement. An Omnigent provider can
+    therefore make the SDK ready even when no system CLI is installed. When no
+    provider is configured, ask the system CLI for subscription state when it
+    is available; otherwise report ``"needs-auth"`` rather than the inaccurate
+    ``"binary-missing"``.
+
+    :returns: ``True`` for a configured provider or Claude subscription login,
+        and ``"needs-auth"`` otherwise.
+    """
+    if _family_provider_configured("claude-sdk"):
+        return True
+    from omnigent.onboarding.harness_install import harness_cli_logged_in
+
+    return (
+        True
+        if harness_cli_logged_in(ANTHROPIC_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+        else "needs-auth"
+    )
+
+
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if _is_codex_family_harness(canonical):
         from omnigent.codex_native import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
+    if canonical == "claude-sdk":
+        return _claude_sdk_availability()
     install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
     if install_key is not None:
         # Cursor is auth-aware like the other native CLI harnesses, so a missing
@@ -482,14 +505,16 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
 
     Built so the server/web UI can do a plain dict lookup with whatever
     spelling it holds — canonical ids, executor-type spellings, the
-    ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
-    ``True`` (never gated); CLI-wrapping harnesses map to whether their
-    binary is on ``PATH``. Codex entries use a structured string reason when
+    ``claude`` alias, and ``pi``. Most SDK and unknown harnesses map to
+    ``True`` (never gated); Claude SDK additionally reports host-level provider
+    or subscription readiness. CLI-wrapping harnesses map to their local
+    binary/auth signal. Codex entries use a structured string reason when
     unavailable: ``"binary-missing"`` or ``"needs-auth"``.
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",
-        "claude-sdk": True, "openai-agents": True, "pi": True, "qwen": True}``.
+        "claude-sdk": "needs-auth", "openai-agents": True, "pi": True,
+        "qwen": True}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
     spellings.update(valid_harnesses())

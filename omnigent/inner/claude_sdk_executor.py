@@ -2988,7 +2988,7 @@ class ClaudeSDKExecutor(Executor):
                         "summary instead of the harness's real compacted state.",
                         claude_session_id,
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001 - third-party transcript recovery is best-effort
                 # WARNING, not DEBUG: a swallowed read here silently degrades
                 # EVERY later resume of this conversation. The runner persists a
                 # compaction item with no ``compacted_messages``, so resume

@@ -88,13 +88,13 @@ from omnigent.onboarding.harness_install import (
     harness_cli_installed,
     harness_setup_hint,
     try_install_harness_cli,
+    ui_credential_family,
     ui_install_key,
 )
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
@@ -2033,10 +2033,10 @@ class HostProcess:
         recomputes readiness so the result frame flips the badge (yellow →
         green) without a reconnect.
 
-        The ``ui_install_key`` guard re-checks the allowlist as defence in depth
-        against a spoofed frame — only the UI-auth families (Claude/Codex/Pi)
-        can drive the writer. The secret is never logged. Runs off the event
-        loop (keychain / file I/O).
+        The ``ui_credential_family`` guard re-checks the allowlist as defence
+        in depth against a spoofed frame — only the UI-auth families
+        (Claude/Codex/Pi) can drive the writer. The secret is never logged.
+        Runs off the event loop (keychain / file I/O).
 
         :param frame: The store-secret request. ``frame.harness`` is a UI
             harness id; ``frame.kind`` is ``"key"`` / ``"gateway"`` / ``"adopt"``.
@@ -2046,12 +2046,7 @@ class HostProcess:
         # Resolve the harness to a provider family, re-checking the allowlist.
         # claude→anthropic, codex→openai; pi consumes both and prefers anthropic
         # (its first fallback family), so a typed pi key lands on anthropic.
-        install_key = ui_install_key(frame.harness)
-        family = {
-            ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
-            OPENAI_FAMILY: OPENAI_FAMILY,
-            "pi": ANTHROPIC_FAMILY,
-        }.get(install_key or "")
+        family = ui_credential_family(frame.harness)
         if family is None:
             return HostStoreSecretResultFrame(
                 request_id=frame.request_id,

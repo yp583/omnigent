@@ -218,6 +218,22 @@ async def test_store_key_forwards_frame_and_returns_readiness(
     assert received[0].secret_value == "sk-ant-SECRET"
 
 
+async def test_store_claude_sdk_key_forwards_to_host(
+    cred_setup: tuple[
+        FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
+    ],
+) -> None:
+    """The canonical SDK spelling can use the same Anthropic credential flow."""
+    app, _reg, received, _replies = cred_setup
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/harnesses/claude-sdk/credential",
+            json={"kind": "key", "secret": "sk-ant-SECRET"},
+        )
+    assert resp.status_code == 200
+    assert received[-1].harness == "claude-sdk"
+
+
 async def test_store_credential_tolerates_a_garbled_gateway_inference(
     cred_setup: tuple[
         FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]

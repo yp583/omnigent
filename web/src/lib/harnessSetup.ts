@@ -143,7 +143,8 @@ export function harnessInstallableOnHost(
  */
 export function harnessCredentialFamily(harness: string | null | undefined): string | null {
   if (!harness) return null;
-  if (["claude", "claude-native", "native-claude"].includes(harness)) return "anthropic";
+  if (["claude", "claude-sdk", "claude_sdk", "claude-native", "native-claude"].includes(harness))
+    return "anthropic";
   if (["codex", "codex-native", "native-codex"].includes(harness)) return "openai";
   if (["pi", "pi-native", "native-pi"].includes(harness)) return "anthropic";
   return null;

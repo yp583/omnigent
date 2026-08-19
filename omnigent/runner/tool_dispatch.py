@@ -2465,6 +2465,7 @@ async def _execute_coder_hosts(
     )
     ssh_fallback = args.get("ssh_fallback", True)
     repository_remote = args.get("repository_remote")
+    required_harness = args.get("required_harness")
     if (
         None
         in (
@@ -2480,6 +2481,13 @@ async def _execute_coder_hosts(
         or (
             repository_remote is not None
             and (not isinstance(repository_remote, str) or not repository_remote.strip())
+        )
+        or (
+            required_harness is not None
+            and (
+                not isinstance(required_harness, str)
+                or re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", required_harness.strip()) is None
+            )
         )
     ):
         return json.dumps({"error": "invalid sys_coder_hosts arguments"})
@@ -2504,6 +2512,7 @@ async def _execute_coder_hosts(
         repository_remote=(
             repository_remote.strip() if isinstance(repository_remote, str) else None
         ),
+        required_harness=(required_harness.strip() if isinstance(required_harness, str) else None),
     )
     return json.dumps(result)
 
@@ -7294,8 +7303,10 @@ def _inject_orchestrator_skills(
     skill is injected from the canonical source at
     ``omnigent/onboarding/agent/skills/build-omnigent/`` when not
     already present in the bundled set. Agents with ``spawn: true`` also
-    receive ``coder-dispatch``, which pairs their placement-discovery and
-    arbitrary child-create grants.
+    receive canonical ``cloud-dispatch`` and the deprecated
+    ``coder-dispatch`` compatibility alias (scheduled for removal in
+    v0.12.0), which pair their placement-discovery and arbitrary child-create
+    grants.
 
     :param skills: The agent's current skill list (bundled +
         potentially others); mutated in-place and returned.
@@ -7306,7 +7317,7 @@ def _inject_orchestrator_skills(
     existing_names = {getattr(s, "name", None) for s in skills}
     wanted = {"build-omnigent"}
     if agent_spec is not None and agent_spec.spawn:
-        wanted.add("coder-dispatch")
+        wanted.update(("cloud-dispatch", "coder-dispatch"))
     missing = wanted - existing_names
     if not missing:
         return skills
@@ -7317,12 +7328,14 @@ def _inject_orchestrator_skills(
     )
     if not onboarding_skills_dir.is_dir():
         return skills
-    for spec in _discover_skills(onboarding_skills_dir, skipped=[]):
-        if spec.name in missing:
-            skills.append(spec)
-            missing.remove(spec.name)
-            if not missing:
-                break
+    skill_sources = (onboarding_skills_dir, onboarding_skills_dir / "_orchestration")
+    for skill_source in skill_sources:
+        for spec in _discover_skills(skill_source, skipped=[]):
+            if spec.name in missing:
+                skills.append(spec)
+                missing.remove(spec.name)
+                if not missing:
+                    return skills
     return skills
 
 
