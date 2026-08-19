@@ -51,9 +51,9 @@ const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
 );
-const ConductorPage = withPageView(
+const ConductorGate = withPageView(
   "conductor",
-  lazy(() => import("@/pages/ConductorPage").then((m) => ({ default: m.ConductorPage }))),
+  lazy(() => import("@/pages/ConductorGate").then((m) => ({ default: m.ConductorGate }))),
 );
 const TasksPage = withPageView(
   "tasks",
@@ -177,7 +177,7 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
-          <Route path={`${prefix}/conductor`} element={<ConductorPage />} />
+          <Route path={`${prefix}/conductor`} element={<ConductorGate />} />
           <Route
             path={`${prefix}/conductor/:conversationId`}
             element={<ConductorChatRoute fallbackPath={`${prefix}/conductor`} />}

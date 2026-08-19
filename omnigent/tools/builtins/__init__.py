@@ -40,6 +40,10 @@ from omnigent.tools.builtins.conductor import (
     SysConductorMemoryListTool,
     SysConductorMemoryReadTool,
     SysConductorMemoryWriteTool,
+    SysConductorPermissionTool,
+    SysConductorProjectTool,
+    SysConductorSessionUpdateTool,
+    SysConductorSettingsTool,
 )
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
@@ -96,6 +100,10 @@ __all__ = [
     "SysConductorMemoryListTool",
     "SysConductorMemoryReadTool",
     "SysConductorMemoryWriteTool",
+    "SysConductorPermissionTool",
+    "SysConductorProjectTool",
+    "SysConductorSessionUpdateTool",
+    "SysConductorSettingsTool",
     "SysListModelsTool",
     "SysReadInboxTool",
     "SysScheduledTaskCreateTool",

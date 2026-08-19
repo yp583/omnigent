@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   bindConductor,
+  ensureConductor,
   getConductorDashboard,
   readConductorMemory,
   updateConductorConfig,
@@ -27,6 +28,23 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Conductor API", () => {
+  it("ensures the caller's durable Conductor chat", async () => {
+    fetchMock.mockResolvedValueOnce(
+      response({
+        conversation_id: "session-conductor",
+        memory_provider: "markdown",
+        config: {},
+        created_at: 10,
+      }),
+    );
+
+    const binding = await ensureConductor();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/conductor/ensure");
+    expect(init.method).toBe("POST");
+    expect(binding.conversationId).toBe("session-conductor");
+  });
+
   it("parses the dashboard boundary into camelCase", async () => {
     fetchMock.mockResolvedValueOnce(
       response({

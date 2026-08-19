@@ -513,6 +513,10 @@ def test_conductor_gets_private_memory_tools_and_owned_session_copy() -> None:
         "sys_conductor_memory_list",
         "sys_conductor_memory_read",
         "sys_conductor_memory_write",
+        "sys_conductor_session_update",
+        "sys_conductor_permission",
+        "sys_conductor_project",
+        "sys_conductor_settings",
     } <= schemas.keys()
     assert "owned by the same user" in schemas["sys_session_send"]["description"]
 
@@ -523,6 +527,7 @@ def test_conductor_gets_private_memory_tools_and_owned_session_copy() -> None:
         ).get_tool_schemas()
     }
     assert "sys_conductor_memory_read" not in ordinary_names
+    assert "sys_conductor_session_update" not in ordinary_names
 
 
 def test_declared_agents_grant_send_close_but_not_create() -> None:

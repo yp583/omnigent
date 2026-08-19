@@ -33,6 +33,14 @@ from omnigent.stores.permission_store import PermissionStore
 CONDUCTOR_LABEL_KEY = "omnigent.conductor"
 CONDUCTOR_LABEL_VALUE = "true"
 CONDUCTOR_AGENT_NAME = "conductor"
+CONDUCTOR_PERMISSION_MODES = {
+    "default",
+    "auto",
+    "acceptEdits",
+    "plan",
+    "dontAsk",
+    "bypassPermissions",
+}
 
 
 def _scope_user(user_id: str | None) -> str:
@@ -85,6 +93,7 @@ def create_conductor_router(
 ) -> APIRouter:
     """Build the Conductor API with permission-aware cross-session scope."""
     router = APIRouter()
+    ensure_locks: dict[str, asyncio.Lock] = {}
 
     def _provider_for(conductor: Conductor):
         try:
@@ -216,6 +225,83 @@ def create_conductor_router(
             )
         return conductor
 
+    def _owned_runner_anchor(user_id: str | None) -> Conversation | None:
+        """Return the user's newest runner-backed top-level session.
+
+        Conductor does not need a repository workspace, but it does need a live
+        runner. Reusing the affinity of the user's newest normal session keeps
+        first open automatic without silently choosing another user's host.
+        """
+        scope_user = _scope_user(user_id)
+        page = conversation_store.list_conversations(
+            limit=200,
+            kind="default",
+            has_agent_id=True,
+            accessible_by=scope_user if permission_store is not None else None,
+            include_archived=False,
+            order="desc",
+            sort_by="updated_at",
+        )
+        for session in page.data:
+            if session.runner_id is None or _is_conductor_session(session):
+                continue
+            if permission_store is not None:
+                owner = conversation_store.get_session_owner(session.id)
+                if owner != scope_user:
+                    continue
+            return session
+        return None
+
+    def _ensure_conductor(scope_user: str, user_id: str | None) -> Conductor:
+        existing = conductor_store.get(scope_user)
+        if _binding_is_valid(existing):
+            assert existing is not None
+            return existing
+
+        agent = agent_store.get_by_name(CONDUCTOR_AGENT_NAME)
+        if agent is None:
+            raise OmnigentError(
+                "The built-in Conductor agent is not installed on this server",
+                code=ErrorCode.NOT_FOUND,
+            )
+        anchor = _owned_runner_anchor(user_id)
+        if anchor is None:
+            raise OmnigentError(
+                "Conductor needs an available runner. Start any normal session once, then retry.",
+                code=ErrorCode.CONFLICT,
+            )
+        conversation = conversation_store.create_conversation(
+            agent_id=agent.id,
+            title="Conductor",
+            runner_id=anchor.runner_id,
+            host_id=anchor.host_id,
+            workspace=anchor.workspace,
+            kind="default",
+        )
+        conversation_store.set_labels(
+            conversation.id,
+            {CONDUCTOR_LABEL_KEY: CONDUCTOR_LABEL_VALUE},
+        )
+        if permission_store is not None:
+            permission_store.ensure_user(scope_user)
+            permission_store.grant(scope_user, conversation.id, LEVEL_OWNER)
+
+        if existing is None:
+            conductor = conductor_store.create(scope_user, conversation.id)
+        else:
+            repaired = conductor_store.update(scope_user, conversation_id=conversation.id)
+            if repaired is None:
+                raise OmnigentError(
+                    "Conductor binding disappeared during repair",
+                    code=ErrorCode.CONFLICT,
+                )
+            conversation_store.delete_label(existing.conversation_id, CONDUCTOR_LABEL_KEY)
+            conductor = repaired
+        provider = _provider_for(conductor)
+        if isinstance(provider, MarkdownArtifactMemoryProvider):
+            provider.ensure_defaults(scope_user)
+        return conductor
+
     @router.get("/conductor")
     async def get_conductor(request: Request) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
@@ -237,6 +323,16 @@ def create_conductor_router(
             "memory_providers": memory_providers.names(),
             "sessions": sessions,
         }
+
+    @router.post("/conductor/ensure")
+    async def ensure_conductor(request: Request) -> dict[str, Any]:
+        """Create or resume the caller's one private Conductor transcript."""
+        user_id = require_user(request, auth_provider)
+        scope_user = _scope_user(user_id)
+        lock = ensure_locks.setdefault(scope_user, asyncio.Lock())
+        async with lock:
+            conductor = await asyncio.to_thread(_ensure_conductor, scope_user, user_id)
+        return _conductor_dict(conductor)
 
     @router.put("/conductor")
     async def bind_conductor(request: Request, body: BindConductorRequest) -> dict[str, Any]:
@@ -320,6 +416,13 @@ def create_conductor_router(
                 memory_providers.get(body.memory_provider)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if body.config is not None and "permission_mode" in body.config:
+            mode = body.config["permission_mode"]
+            if not isinstance(mode, str) or mode not in CONDUCTOR_PERMISSION_MODES:
+                raise OmnigentError(
+                    "config.permission_mode is not a supported Conductor approval mode",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         conductor = await asyncio.to_thread(
             conductor_store.update,
             scope_user,

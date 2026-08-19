@@ -1,4 +1,3 @@
-import AVFoundation
 import SwiftUI
 import UIKit
 import WebKit
@@ -238,23 +237,6 @@ struct OmnigentWebView: UIViewRepresentable {
           });
           return Promise.resolve(true);
         },
-        speak(params) {
-          const text = params && typeof params.text === "string" ? params.text : "";
-          if (!text) return Promise.resolve(false);
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "speak",
-            params: {
-              text,
-              language:
-                params && typeof params.language === "string" ? params.language : "en-US",
-              rate: params && Number.isFinite(params.rate) ? params.rate : 1,
-            },
-          });
-          return Promise.resolve(true);
-        },
-        stopSpeaking() {
-          window.webkit.messageHandlers.omnigentNative.postMessage({ method: "stopSpeaking" });
-        },
         onNotificationActivated(callback) {
           if (typeof callback !== "function") return () => {};
           callbacks.add(callback);
@@ -325,7 +307,6 @@ struct OmnigentWebView: UIViewRepresentable {
     private var rootBounces = 0
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
-    private let speechSynthesizer = AVSpeechSynthesizer()
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -347,7 +328,6 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func detach() {
       parent.model.cancelServerSwitcherWatchdog()
-      speechSynthesizer.stopSpeaking(at: .immediate)
       urlObservation = nil
       webView = nil
     }
@@ -464,20 +444,6 @@ struct OmnigentWebView: UIViewRepresentable {
           body: params["body"] as? String,
           navigatePath: params["navigatePath"] as? String
         )
-      case "speak":
-        guard let params = body["params"] as? [String: Any],
-          let text = params["text"] as? String,
-          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return }
-        speechSynthesizer.stopSpeaking(at: .immediate)
-        let utterance = AVSpeechUtterance(string: String(text.prefix(8_000)))
-        let language = (params["language"] as? String) ?? "en-US"
-        utterance.voice = AVSpeechSynthesisVoice(language: language)
-        let requestedRate = (params["rate"] as? NSNumber)?.floatValue ?? 1
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * min(max(requestedRate, 0.5), 2)
-        speechSynthesizer.speak(utterance)
-      case "stopSpeaking":
-        speechSynthesizer.stopSpeaking(at: .immediate)
       case "setServerSwitcherHidden":
         parent.model.serverSwitcherHidden = (body["hidden"] as? NSNumber)?.boolValue ?? true
       case "setSidebarOpen":

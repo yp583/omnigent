@@ -182,6 +182,8 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
+const CONDUCTOR_LABEL_KEY = "omnigent.conductor";
+
 // Positioning for a row's trailing session-state badge. On desktop it shares
 // the controls' right-1 edge and fades on hover so the pin + kebab take its
 // place; on mobile it sits left of the always-visible controls.
@@ -1442,7 +1444,10 @@ function ConversationList({
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
-    const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
+    const allWithPinned = dedupeConversationsById([
+      ...allConversations,
+      ...pinnedConversations,
+    ]).filter((conversation) => conversation.labels[CONDUCTOR_LABEL_KEY] !== "true");
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // The filter picks the slice; the Pinned / Projects / Sessions structure is
     // then built from it, so every filter reuses the same layout.

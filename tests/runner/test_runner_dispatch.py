@@ -76,6 +76,7 @@ from omnigent.inner.executor import (
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _RUNNER_TURN_CONTEXT_DESYNC_CODE,
+    _apply_conductor_permission_mode,
     _build_spawn_env_from_spec,
     _evaluate_policy_via_omnigent,
     _forward_harness_response,
@@ -7482,6 +7483,218 @@ async def test_conductor_memory_dispatch_requires_active_binding() -> None:
             agent_spec=SimpleNamespace(name="conductor"),
         )
     assert json.loads(output)["error"] == "active_conductor_required"
+
+
+@pytest.mark.asyncio
+async def test_conductor_session_update_returns_compact_receipt() -> None:
+    """Operator writes use authenticated server routes and report the result."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, object]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.url.path == "/v1/conductor":
+            return httpx.Response(
+                200,
+                json={"conductor": {"conversation_id": "conv_conductor"}, "sessions": []},
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "Release"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_conductor_session_update",
+            arguments=json.dumps(
+                {"action": "rename", "session_id": "conv_target", "title": "Release"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_conductor",
+            agent_spec=SimpleNamespace(name="conductor"),
+        )
+
+    assert requests[-1] == (
+        "PATCH",
+        "/v1/sessions/conv_target",
+        {"title": "Release"},
+    )
+    assert json.loads(output) == {
+        "kind": "conductor_action",
+        "tool": "sys_conductor_session_update",
+        "action": "rename",
+        "session_id": "conv_target",
+        "href": "/c/conv_target",
+        "status": "completed",
+        "result": {"id": "conv_target", "title": "Release"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_conductor_permission_grant_uses_server_permission_contract() -> None:
+    """Permission grants use the authenticated numeric-level endpoint."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, object]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.url.path == "/v1/conductor":
+            return httpx.Response(
+                200,
+                json={"conductor": {"conversation_id": "conv_conductor"}, "sessions": []},
+            )
+        if request.url.path == "/v1/sessions/conv_target/permissions":
+            return httpx.Response(
+                200,
+                json={
+                    "user_id": "pm@example.com",
+                    "conversation_id": "conv_target",
+                    "level": 2,
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_conductor_permission",
+            arguments=json.dumps(
+                {
+                    "action": "grant",
+                    "session_id": "conv_target",
+                    "user_id": "pm@example.com",
+                    "level": "edit",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_conductor",
+            agent_spec=SimpleNamespace(name="conductor"),
+        )
+
+    assert requests[-1] == (
+        "PUT",
+        "/v1/sessions/conv_target/permissions",
+        {"user_id": "pm@example.com", "level": 2},
+    )
+    receipt = json.loads(output)
+    assert receipt["action"] == "grant"
+    assert receipt["level"] == "edit"
+    assert receipt["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_conductor_project_create_uses_project_crud_contract() -> None:
+    """Project creation forwards both the name and optional defaults."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, object]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.url.path == "/v1/conductor":
+            return httpx.Response(
+                200,
+                json={"conductor": {"conversation_id": "conv_conductor"}, "sessions": []},
+            )
+        if request.url.path == "/v1/projects":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "project_1",
+                    "object": "project",
+                    "name": "Launch",
+                    "config": {"workspace": "/repo"},
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_conductor_project",
+            arguments=json.dumps(
+                {
+                    "action": "create",
+                    "name": " Launch ",
+                    "config": {"workspace": "/repo"},
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_conductor",
+            agent_spec=SimpleNamespace(name="conductor"),
+        )
+
+    assert requests[-1] == (
+        "POST",
+        "/v1/projects",
+        {"name": "Launch", "config": {"workspace": "/repo"}},
+    )
+    receipt = json.loads(output)
+    assert receipt["action"] == "create"
+    assert receipt["status"] == "completed"
+    assert receipt["result"]["id"] == "project_1"
+
+
+@pytest.mark.asyncio
+async def test_conductor_operator_rejects_inactive_binding() -> None:
+    """Typed admin tools are unavailable to a same-named unbound agent."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"conductor": {"conversation_id": "conv_other"}, "sessions": []},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_conductor_project",
+            arguments=json.dumps({"action": "list"}),
+            server_client=server_client,
+            conversation_id="conv_impostor",
+            agent_spec=SimpleNamespace(name="conductor"),
+        )
+
+    assert json.loads(output)["error"] == "active_conductor_required"
+
+
+@pytest.mark.asyncio
+async def test_conductor_permission_mode_overlays_spawn_environment() -> None:
+    """The per-user binding overrides the shared built-in bundle at launch."""
+
+    async def _server_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "conductor": {
+                    "conversation_id": "conv_conductor",
+                    "config": {"permission_mode": "plan"},
+                }
+            },
+        )
+
+    env = {"HARNESS_CLAUDE_SDK_PERMISSION_MODE": "default"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        await _apply_conductor_permission_mode(
+            env,
+            spec=AgentSpec(spec_version=1, name="conductor"),
+            session_id="conv_conductor",
+            server_client=server_client,
+        )
+
+    assert env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] == "plan"
 
 
 @pytest.mark.parametrize("empty_output", ["", "   ", "\n\t "])

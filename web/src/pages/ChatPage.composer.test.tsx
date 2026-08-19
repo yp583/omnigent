@@ -57,6 +57,7 @@ import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage
 import type { Session } from "@/lib/types";
 import type { QueuedMessage } from "@/store/chatStore";
 import * as sessionsApi from "@/lib/sessionsApi";
+import * as conductorApi from "@/lib/conductorApi";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -1818,6 +1819,61 @@ describe("Composer config gear", () => {
     expect(stopSession).toHaveBeenCalledWith("conv_test");
     expect(calls).toEqual(["update", "stop", "retry"]);
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("persists the Conductor approval mode and restarts its ordinary chat", async () => {
+    const getDashboard = vi.spyOn(conductorApi, "getConductorDashboard").mockResolvedValue({
+      conductor: {
+        conversationId: "conv_test",
+        memoryProvider: "markdown",
+        config: { keep: "value", permission_mode: "default" },
+        createdAt: 1,
+        updatedAt: null,
+      },
+      memoryProviders: ["markdown"],
+      sessions: [],
+    });
+    const updateConfig = vi.spyOn(conductorApi, "updateConductorConfig").mockResolvedValue({
+      conversationId: "conv_test",
+      memoryProvider: "markdown",
+      config: { keep: "value", permission_mode: "plan" },
+      createdAt: 1,
+      updatedAt: 2,
+    });
+    const stopSession = vi
+      .spyOn(sessionsApi, "stopSession")
+      .mockResolvedValue({} as PostEventResponse);
+    const retrySession = vi
+      .spyOn(sessionsApi, "retrySession")
+      .mockResolvedValue({} as PostEventResponse);
+    useSessionMockState.session = { hostId: null, permissionLevel: 4, labels: {} };
+    useChatStore.setState({
+      conversationId: "conv_test",
+      sessionHarness: "claude-sdk",
+      status: "idle",
+      sessionStatus: "idle",
+    });
+
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          isConductorChat: true,
+          showEffort: false,
+          showModels: false,
+          costRoutingEligible: false,
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(getDashboard).toHaveBeenCalled());
+    fireEvent.click(gear()!);
+    fireEvent.click(await screen.findByTestId("composer-config-permission"));
+    fireEvent.click(screen.getByRole("option", { name: "Plan" }));
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+
+    await waitFor(() => expect(retrySession).toHaveBeenCalledWith("conv_test"));
+    expect(updateConfig).toHaveBeenCalledWith({ keep: "value", permission_mode: "plan" });
+    expect(stopSession).toHaveBeenCalledWith("conv_test");
   });
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {

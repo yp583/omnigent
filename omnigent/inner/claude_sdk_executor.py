@@ -911,6 +911,36 @@ def _build_mcp_tools(
     return mcp_tools
 
 
+_CONDUCTOR_READ_ONLY_TOOLS = {
+    "sys_session_list",
+    "sys_session_get_history",
+    "sys_session_get_info",
+    "sys_agent_list",
+    "sys_agent_get",
+    "sys_agent_download",
+    "sys_conductor_memory_list",
+    "sys_conductor_memory_read",
+}
+
+
+def _allowed_mcp_tools(
+    tools: list[ToolSpec],
+    *,
+    permission_mode: str,
+    agent_name: str | None,
+) -> list[str]:
+    """Return Claude SDK allow-list entries for the current approval mode."""
+    allow_all = permission_mode in ("auto", "bypassPermissions")
+    allowed: list[str] = []
+    for schema in tools:
+        raw_name = schema.get("name")
+        if not isinstance(raw_name, str) or not raw_name:
+            continue
+        if allow_all or (agent_name == "conductor" and raw_name in _CONDUCTOR_READ_ONLY_TOOLS):
+            allowed.append(f"mcp__omnigent__{raw_name}")
+    return allowed
+
+
 def _augment_system_prompt_for_omnigent_mcp_tools(
     system_prompt: str,
     tool_schemas: list[ToolSpec],
@@ -2257,19 +2287,11 @@ class ClaudeSDKExecutor(Executor):
         # elicitation system when an elicitation handler is wired in.
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
-        allowed_tools: list[str] = []
-        if self._permission_mode in ("auto", "bypassPermissions"):
-            # Allow all Omnigent MCP tools (no per-call human gate needed)
-            for schema in tools:
-                raw_tname = schema.get("name")
-                # Claude SDK's ``allowed_tools`` requires concrete strings;
-                # Omnigent tool schemas always carry a name (see
-                # ``Tool.tool_schema``), but defend against malformed specs
-                # by skipping unnamed entries rather than producing a
-                # bogus ``mcp__omnigent__`` allow-entry.
-                if not isinstance(raw_tname, str) or not raw_tname:
-                    continue
-                allowed_tools.append(f"mcp__omnigent__{raw_tname}")
+        allowed_tools = _allowed_mcp_tools(
+            tools,
+            permission_mode=self._permission_mode,
+            agent_name=self._agent_name,
+        )
 
         # cfg.model > spec model > Databricks default (only on the
         # Databricks-profile gateway path) > None (lets the SDK pick its own

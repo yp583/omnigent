@@ -145,6 +145,14 @@ export async function getConductorDashboard(): Promise<ConductorDashboard> {
   };
 }
 
+/** Create the caller's private Conductor on first use, or resume it. */
+export async function ensureConductor(): Promise<ConductorBinding> {
+  const wire = await readJson<BindingWire>(
+    await authenticatedFetch("/v1/conductor/ensure", { method: "POST" }),
+  );
+  return parseBinding(wire);
+}
+
 export async function bindConductor(
   conversationId: string,
   memoryProvider = "markdown",

@@ -85,6 +85,53 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   },
   sys_agent_list: () => verbOnly("List agents"),
 
+  // Conductor operator tools render like short audit receipts. The full
+  // request and server response remain available in the expandable body.
+  sys_conductor_session_update: (args) => {
+    const action = asString(args.action);
+    const sessionId = asString(args.session_id) ?? "session";
+    const verb =
+      action === "rename"
+        ? "Rename session:"
+        : action === "archive"
+          ? "Archive session:"
+          : action === "unarchive"
+            ? "Restore session:"
+            : action === "stop"
+              ? "Stop session:"
+              : "Update session:";
+    return { verb, body: sessionId };
+  },
+  sys_conductor_permission: (args) => {
+    const action = asString(args.action);
+    const userId = asString(args.user_id) ?? "user";
+    return {
+      verb: action === "revoke" ? "Revoke session access:" : "Grant session access:",
+      body: userId,
+    };
+  },
+  sys_conductor_project: (args) => {
+    const action = asString(args.action);
+    const project = asString(args.name) ?? asString(args.project_id) ?? "projects";
+    const verbs: Record<string, string> = {
+      list: "List projects",
+      create: "Create project:",
+      update: "Update project:",
+      delete: "Delete project:",
+    };
+    return {
+      verb: action ? (verbs[action] ?? "Manage project:") : "Manage project:",
+      body: project,
+    };
+  },
+  sys_conductor_settings: (args) =>
+    asString(args.action) === "get"
+      ? verbOnly("Read Conductor settings")
+      : verbOnly("Update Conductor settings"),
+  sys_conductor_memory_list: () => verbOnly("List Conductor memory"),
+  sys_conductor_memory_read: (args) => withPath("Read Conductor memory", args.path),
+  sys_conductor_memory_write: (args) => withPath("Update Conductor memory", args.path),
+
   // Async dispatch + inbox.
   sys_call_async: (args) => {
     const tool = asString(args.tool);

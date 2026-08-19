@@ -8,7 +8,6 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { bindConductor } from "@/lib/conductorApi";
 import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -76,7 +75,6 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
-vi.mock("@/lib/conductorApi", () => ({ bindConductor: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -264,7 +262,6 @@ beforeEach(() => {
   pushMatchers.length = 0;
   announcePushedSession = null;
   vi.mocked(authenticatedFetch).mockReset();
-  vi.mocked(bindConductor).mockReset();
   routingSearchParams = new URLSearchParams();
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
@@ -313,35 +310,6 @@ describe("NewChatLandingScreen create flow", () => {
 
     // On success the screen routes to the freshly created session.
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
-  });
-
-  it("preselects, binds, and opens a dedicated Conductor chat", async () => {
-    routingSearchParams = new URLSearchParams("agent=conductor&conductorSetup=1");
-    setAgents([
-      agent(),
-      agent({ id: "ag_conductor", name: "conductor", display_name: "Conductor" }),
-    ]);
-    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ id: "conv_conductor" }),
-    } as unknown as Response);
-    vi.mocked(bindConductor).mockResolvedValue({
-      conversationId: "conv_conductor",
-      memoryProvider: "markdown",
-      config: {},
-      createdAt: 1,
-      updatedAt: null,
-    });
-
-    renderLanding();
-    await waitForWorkspaceSeed();
-    typeMessage("What needs my attention?");
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-
-    await waitFor(() => expect(bindConductor).toHaveBeenCalledWith("conv_conductor"));
-    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toMatchObject({ agent_id: "ag_conductor" });
-    expect(navigateMock).toHaveBeenCalledWith("/conductor/conv_conductor");
   });
 
   it("opens the session on the stream's announcement instead of waiting for the create", async () => {

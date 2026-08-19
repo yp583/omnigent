@@ -47,6 +47,25 @@ describe("formatToolTitle", () => {
     });
   });
 
+  it("formats Conductor mutations as compact operator receipts", () => {
+    expect(
+      formatToolTitle("sys_conductor_session_update", {
+        action: "archive",
+        session_id: "conv_123",
+      }),
+    ).toEqual({ verb: "Archive session:", body: "conv_123" });
+    expect(
+      formatToolTitle("sys_conductor_permission", {
+        action: "grant",
+        user_id: "teammate@example.com",
+      }),
+    ).toEqual({ verb: "Grant session access:", body: "teammate@example.com" });
+    expect(formatToolTitle("sys_conductor_settings", { action: "update" })).toEqual({
+      verb: "Update Conductor settings",
+      body: "",
+    });
+  });
+
   it("formats argument-less tools as verb-only (empty body)", () => {
     expect(formatToolTitle("sys_session_list", {})).toEqual({
       verb: "List child sessions",

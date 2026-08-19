@@ -1637,6 +1637,24 @@ class TestSkillsFilterTranslation(unittest.TestCase):
 
 
 class TestStreamEventStreaming(unittest.TestCase):
+    def test_conductor_default_mode_preapproves_reads_but_not_writes(self):
+        from omnigent.inner.claude_sdk_executor import _allowed_mcp_tools
+
+        tools = [
+            {"name": "sys_session_list", "parameters": {"type": "object"}},
+            {"name": "sys_conductor_session_update", "parameters": {"type": "object"}},
+            {"name": "sys_conductor_memory_read", "parameters": {"type": "object"}},
+            {"name": "sys_conductor_memory_write", "parameters": {"type": "object"}},
+        ]
+
+        self.assertEqual(
+            _allowed_mcp_tools(tools, permission_mode="default", agent_name="conductor"),
+            [
+                "mcp__omnigent__sys_session_list",
+                "mcp__omnigent__sys_conductor_memory_read",
+            ],
+        )
+
     def test_live_clients_are_reused_per_omnigent_session(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 

@@ -29,9 +29,11 @@ import re
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from urllib.parse import quote
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -312,6 +314,15 @@ _CONDUCTOR_MEMORY_TOOLS = frozenset(
     }
 )
 
+_CONDUCTOR_OPERATOR_TOOLS = frozenset(
+    {
+        "sys_conductor_session_update",
+        "sys_conductor_permission",
+        "sys_conductor_project",
+        "sys_conductor_settings",
+    }
+)
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -468,6 +479,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _CONDUCTOR_MEMORY_TOOLS
+    | _CONDUCTOR_OPERATOR_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -4096,6 +4108,177 @@ async def _execute_conductor_memory_tool(
     return json.dumps(response.json())
 
 
+async def _execute_conductor_operator_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+    agent_spec: AgentSpec | None,
+) -> str:
+    """Dispatch permission-checked Omnigent operations for the active Conductor."""
+    if not _is_conductor_agent(agent_spec):
+        return json.dumps({"error": "active_conductor_required"})
+    if server_client is None or conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires server access and a session id"})
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    try:
+        dashboard = await server_client.get("/v1/conductor", timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} authorization failed: {exc}"})
+    if dashboard.status_code != 200:
+        return json.dumps({"error": "active_conductor_required"})
+    body = _string_object_dict(dashboard.json())
+    binding = _string_object_dict(body.get("conductor")) if body is not None else None
+    if binding is None or binding.get("conversation_id") != conversation_id:
+        return json.dumps({"error": "active_conductor_required"})
+
+    method: str
+    path: str
+    request_json: object | None = None
+    receipt: dict[str, Any] = {"kind": "conductor_action", "tool": tool_name}
+
+    if tool_name == "sys_conductor_session_update":
+        session_id = args.get("session_id")
+        action = args.get("action")
+        if not isinstance(session_id, str) or not session_id or session_id == conversation_id:
+            return json.dumps({"error": "a non-Conductor session_id is required"})
+        if action == "rename":
+            title = args.get("title")
+            if not isinstance(title, str) or not title.strip():
+                return json.dumps({"error": "rename requires a non-empty title"})
+            method, path, request_json = (
+                "PATCH",
+                f"/v1/sessions/{quote(session_id, safe='')}",
+                {"title": title.strip()},
+            )
+        elif action in {"archive", "unarchive"}:
+            method, path, request_json = (
+                "PATCH",
+                f"/v1/sessions/{quote(session_id, safe='')}",
+                {"archived": action == "archive"},
+            )
+        elif action == "stop":
+            method, path, request_json = (
+                "POST",
+                f"/v1/sessions/{quote(session_id, safe='')}/events",
+                {"type": "stop_session", "data": {}},
+            )
+        else:
+            return json.dumps({"error": "unsupported session action"})
+        receipt.update(action=action, session_id=session_id, href=f"/c/{session_id}")
+    elif tool_name == "sys_conductor_permission":
+        session_id = args.get("session_id")
+        action = args.get("action")
+        user_id = args.get("user_id")
+        if not isinstance(session_id, str) or not session_id or session_id == conversation_id:
+            return json.dumps({"error": "a non-Conductor session_id is required"})
+        if not isinstance(user_id, str) or not user_id:
+            return json.dumps({"error": "user_id is required"})
+        if action == "grant":
+            level_name = args.get("level", "read")
+            level = (
+                {"read": 1, "edit": 2, "manage": 3}.get(level_name)
+                if isinstance(level_name, str)
+                else None
+            )
+            if level is None:
+                return json.dumps({"error": "level must be read, edit, or manage"})
+            method, path, request_json = (
+                "PUT",
+                f"/v1/sessions/{quote(session_id, safe='')}/permissions",
+                {"user_id": user_id, "level": level},
+            )
+            receipt["level"] = level_name
+        elif action == "revoke":
+            method = "DELETE"
+            path = (
+                f"/v1/sessions/{quote(session_id, safe='')}/permissions/{quote(user_id, safe='')}"
+            )
+        else:
+            return json.dumps({"error": "permission action must be grant or revoke"})
+        receipt.update(
+            action=action,
+            session_id=session_id,
+            user_id=user_id,
+            href=f"/c/{session_id}",
+        )
+    elif tool_name == "sys_conductor_project":
+        action = args.get("action")
+        project_id = args.get("project_id")
+        if action == "list":
+            method, path = "GET", "/v1/projects"
+        elif action == "create":
+            name = args.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return json.dumps({"error": "create requires a non-empty name"})
+            payload: dict[str, Any] = {"name": name.strip()}
+            if isinstance(args.get("config"), dict):
+                payload["config"] = args["config"]
+            method, path, request_json = "POST", "/v1/projects", payload
+        elif action == "update" and isinstance(project_id, str) and project_id:
+            payload = {}
+            if isinstance(args.get("name"), str) and args["name"].strip():
+                payload["name"] = args["name"].strip()
+            if isinstance(args.get("config"), dict):
+                payload["config"] = args["config"]
+            if not payload:
+                return json.dumps({"error": "update requires name or config"})
+            method, path, request_json = (
+                "PATCH",
+                f"/v1/projects/{quote(project_id, safe='')}",
+                payload,
+            )
+        elif action == "delete" and isinstance(project_id, str) and project_id:
+            method, path = "DELETE", f"/v1/projects/{quote(project_id, safe='')}"
+        else:
+            return json.dumps({"error": "invalid project action or missing project_id"})
+        receipt.update(action=action, project_id=project_id)
+    else:
+        action = args.get("action")
+        if action == "get":
+            return json.dumps(
+                {
+                    "kind": "conductor_settings",
+                    "memory_provider": binding.get("memory_provider"),
+                    "config": binding.get("config") or {},
+                    "memory_providers": body.get("memory_providers") if body else [],
+                }
+            )
+        if action != "update":
+            return json.dumps({"error": "settings action must be get or update"})
+        payload = {}
+        if isinstance(args.get("memory_provider"), str) and args["memory_provider"]:
+            payload["memory_provider"] = args["memory_provider"]
+        if isinstance(args.get("config"), dict):
+            payload["config"] = args["config"]
+        if not payload:
+            return json.dumps({"error": "update requires memory_provider or config"})
+        method, path, request_json = "PATCH", "/v1/conductor", payload
+        receipt["action"] = "update"
+
+    try:
+        response = await server_client.request(method, path, timeout=30.0, json=request_json)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"{tool_name} returned {response.status_code}",
+                "detail": response.text[:500],
+            }
+        )
+    receipt["status"] = "completed"
+    if response.status_code != 204:
+        with suppress(ValueError):
+            receipt["result"] = response.json()
+    return json.dumps(receipt)
+
+
 async def _execute_session_query_tool(
     tool_name: str,
     arguments: str,
@@ -5628,6 +5811,14 @@ async def execute_tool(
             )
         elif tool_name in _CONDUCTOR_MEMORY_TOOLS:
             output = await _execute_conductor_memory_tool(
+                tool_name,
+                arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+                agent_spec=agent_spec,
+            )
+        elif tool_name in _CONDUCTOR_OPERATOR_TOOLS:
+            output = await _execute_conductor_operator_tool(
                 tool_name,
                 arguments,
                 conversation_id=conversation_id,

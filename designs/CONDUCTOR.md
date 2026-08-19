@@ -1,123 +1,102 @@
 # Conductor
 
-Conductor is a user-private meta-session for supervising work across Omnigent.
-It is not a new execution runtime: it is a normal, durable agent transcript with
-an owner-scoped control plane, pluggable memory, and a focused operational UI.
+Conductor is a user-private chat agent that supervises work across Omnigent. It
+is not a dashboard and it is not a new execution runtime. It is one ordinary,
+durable transcript backed by the existing session runtime, plus a narrow set of
+typed, server-authorized operator tools and pluggable long-term memory.
 
 ## Product contract
 
-- One active Conductor transcript per `(workspace, user)`.
-- The active transcript must be a top-level session whose bound agent is named
-  `conductor`; ordinary Claude, Codex, and custom-agent history is never
-  eligible. The server enforces this independently of the UI.
-- The dashboard lists top-level sessions the user owns plus sessions directly
-  shared with that user. Public-link-only sessions never enter Conductor scope.
-- The Conductor may read an owned or shared session and any descendant in that
-  session's spawn tree. Steering requires edit-or-higher access; a read grant is
-  never treated as control authority.
-- Cross-session steering queues a normal user message in the target. The target
-  remains independent; it is not registered as a fake Conductor child and does
-  not fan results into the Conductor inbox.
-- Merge, deploy, archive, stop, permission, destructive, and sensitive approval
-  actions remain human-gated.
-- The transcript is ordinary session history. Durable memory is a separate,
-  provider-neutral collection of small Markdown documents.
+- `/conductor` creates the caller's Conductor on first open and resumes that
+  same transcript thereafter. There is no setup screen or agent picker.
+- The Conductor conversation is top-level, bound to the built-in `conductor`
+  agent, labelled `omnigent.conductor=true`, and omitted from ordinary sidebar
+  session rows. The dedicated Conductor navigation item is its only primary
+  entry point.
+- First creation reuses the runner and host affinity of the caller's newest
+  owned runner-backed session. If no such session exists, the UI explains that
+  the user must start one normal session once and offers an in-place retry.
+- An existing valid binding is idempotently reused. An old binding to an
+  ordinary transcript is invalid and is repaired with a new dedicated chat.
+- The transcript uses the normal chat surface: streaming, history, attachments,
+  approvals, compaction, and the composer all behave like another agent chat.
+- No separate dashboard, session tree, status grid, PR rail, memory editor, or
+  special voice panel is mounted inside the Conductor route.
 
-## Runtime boundary
+## Scope and authorization
 
-The built-in `conductor` agent receives the standard session inspection and
-spawn tools plus three memory tools. Naming an arbitrary agent `conductor` is
-not sufficient: every privileged runtime operation also proves that the caller
-conversation is the user's active Conductor binding at the server.
+Conductor can inspect top-level sessions the user owns and sessions directly
+shared with that user. Public-link-only sessions are excluded. Descendants are
+read through their permission root, so a shared root's sub-agent transcript is
+available only while the caller retains the root grant.
 
-For a target session, the server resolves its `root_conversation_id` and checks
-the caller's current grant on that root for every read or steering request. A
-foreign target returns the same not-found response as a missing target; a
-read-only shared target returns an explicit non-steerable authorization result.
-Single-user deployments treat local sessions as owner-scoped.
+- Read access permits metadata and transcript inspection.
+- Edit-or-higher access permits steering and ordinary session mutations.
+- Manage access is required for changing another user's grant.
+- Every privileged runtime request independently verifies both the active
+  Conductor binding and the target's current server-side permission. Naming an
+  arbitrary custom agent `conductor` grants nothing.
+- Foreign and missing sessions have the same not-found behavior.
+- The Conductor cannot target its own session.
+
+Shared transcript content is untrusted input. The system prompt tells the agent
+to treat instructions found inside another session as data, not authority, and
+to avoid copying shared content into personal memory unless the user explicitly
+asks for that.
+
+## Operator tools
+
+The built-in agent receives the existing typed session, agent, policy,
+scheduled-task, browser, and spawn tools. Conductor-only tools add:
+
+- rename, archive, restore, and stop for accessible sessions;
+- grant/change/revoke session permissions;
+- list/create/update/delete projects;
+- read/update Conductor settings; and
+- list/read/write durable memory.
+
+These tools call authenticated Omnigent server endpoints; Conductor receives no
+general-purpose shell tool. The transcript renders their calls as compact
+plain-English action rows, with the complete request and server response behind
+the normal disclosure affordance.
+
+## Approval modes
+
+The composer gear exposes the same Claude approval-mode choices as other Claude
+sessions. The selected value is stored in the per-user Conductor binding and is
+overlaid when its harness starts; the shared built-in agent bundle is never
+mutated.
+
+`default` is the initial mode. In that mode, read-only discovery and memory
+reads are pre-approved so routine supervision does not produce approval spam,
+while mutations pass through the existing elicitation flow. Changing the mode
+is owner-only, requires an idle session, and restarts the harness without adding
+a transcript message. Dangerous modes retain the existing warning treatment.
 
 ## Memory providers
 
-`MemoryProviderRegistry` makes the selected provider a Conductor setting. The
-initial `markdown` provider stores UTF-8 Markdown blobs in the configured
-artifact store and keeps an owner-private SQL manifest with immutable revisions.
-Paths are canonical relative `.md` paths; traversal, absolute paths, control
-characters, and documents over 512 KiB are rejected. Writes use an expected
-revision so concurrent edits produce a conflict instead of silent overwrite.
+`MemoryProviderRegistry` makes memory provider selection a per-user Conductor
+setting. The initial `markdown` provider stores UTF-8 Markdown blobs in the
+configured artifact store and keeps an owner-private SQL manifest with
+immutable revisions. Paths are canonical relative `.md` paths; traversal,
+absolute paths, control characters, and documents over 512 KiB are rejected.
+Writes use an expected revision so concurrent changes conflict instead of
+silently overwriting one another.
 
-The canonical starter set is:
+The starter set is:
 
 - `MEMORY.md`
 - `profile/preferences.md`
 - `skills/observations.md`
 
 A future provider implements the same list/read/write/history/delete contract
-and registers under a stable name. Switching providers never replaces the
-Conductor transcript.
+and registers under a stable name. Switching provider does not replace or
+rewrite the Conductor transcript.
 
-## Shared team session sources
+## Deliberate follow-ups
 
-The Conductor includes sessions that teammates explicitly share with the
-current user. Shared sessions are additional permissioned sources, not a
-widening to every session in a workspace.
-
-- The existing direct session grant is the opt-in boundary. Merely belonging to
-  a workspace and public-link access do not add a transcript to the ledger.
-- Results retain source, owner, workspace, and sharing provenance so the UI and
-  the Conductor can distinguish personal work from team context.
-- Access is checked when listing and every time content is read. Revoking the
-  underlying share removes the session from Conductor scope immediately.
-- A read grant remains read-only. The existing edit-or-higher grant is the
-  operator grant for steering; spawning, approval, and other consequential
-  actions retain their separate gates.
-- The shipped Conductor prompt forbids silently copying shared content into
-  durable personal memory. An explicit user request is required, and saved
-  material retains the source session id and owner as provenance.
-- The dashboard supports personal-only, shared-with-me, and combined views,
-  with the personal-only view as the safe default.
-
-Team-collection opt-in and global cross-session content indexing remain future
-work. The first implementation uses the existing workspace identity and direct,
-durable session grants and performs targeted transcript reads through the
-normal session authorization path.
-
-## UI
-
-`/conductor` provides:
-
-- a quiet, status-first session ledger with inline steering and transcript links;
-- a desktop PR rail backed by the existing native GitHub bridge;
-- a Markdown memory desk with visible revisions and conflict errors;
-- a provider selector when more than one backend is registered; and
-- a responsive layout suitable for the mobile web shell.
-
-The initial setup starts a dedicated transcript with the shipped Conductor
-agent. Existing Conductor-agent sessions may be resumed, but ordinary session
-history is never offered. Legacy invalid bindings are shown as unconfigured and
-are repaired when the dedicated Conductor chat is created.
-
-## Mobile voice
-
-Voice is isolated on `personal/mobile-conductor-voice` and should land only
-after this core passes human testing. The first registered provider is the
-session pipeline: the existing browser/server dictation path supplies STT, a
-normal visible message runs through the active Conductor transcript, and the
-device supplies TTS. The web layer owns a small provider interface so a future
-realtime provider can replace that route without changing the panel or the
-Conductor authorization boundary. Voice preferences live under `config.voice`
-and do not affect the selected memory provider.
-
-The foreground panel is push-to-talk and review-before-send. Even an ordinary
-dictated turn requires a Send tap. Requests that mention merge, deploy,
-deletion, production, permissions, or approval get an additional warning;
-speech never submits a runner elicitation. The Conductor's agent prompt treats
-`[Voice request]` messages as spoken output and responds in short, listenable
-sentences while directing consequential work back to on-screen approval cards.
-
-iOS uses `AVSpeechSynthesizer`, Android uses `TextToSpeech`, and older native
-shells fall back to the Web Speech API. Closing the panel cancels response
-polling and active speech. The existing native notification path continues to
-surface session completion and blocked/elicitation transitions while the app is
-running. True background APNs/FCM delivery and proactive mobile PR polling need
-device-token registration plus a deployment-owned push provider; they are not
-silently represented as working by this foreground branch.
+Team-wide collections, organization-level transcript indexing, proactive
+background notifications, and a realtime STT/LLM/TTS chief-of-staff experience
+remain separate follow-ups. The ordinary composer microphone remains available
+on mobile, but this release does not claim background voice operation or add a
+second Conductor-specific interaction model.

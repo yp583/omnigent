@@ -25,7 +25,6 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
-    private lateinit var speech: RecordingSpeech
 
     private val badgeId = 1
 
@@ -33,12 +32,10 @@ class OmnigentBridgeListenerTest {
     fun setUp() {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         context = ApplicationProvider.getApplicationContext()
-        speech = RecordingSpeech()
         listener =
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
-                speech = speech,
             )
         shadow =
             shadowOf(
@@ -129,52 +126,10 @@ class OmnigentBridgeListenerTest {
     }
 
     @Test
-    fun `speak and stop messages route to native speech`() {
-        listener.handle(
-            """{"method":"speak","params":{"text":"Status ready","language":"en-GB","rate":1.25}}""",
-        )
-        listener.handle("""{"method":"stopSpeaking"}""")
-
-        assertEquals("Status ready", speech.text)
-        assertEquals("en-GB", speech.language)
-        assertEquals(1.25f, speech.rate)
-        assertEquals(1, speech.stopCount)
-    }
-
-    @Test
-    fun `speak without text is dropped`() {
-        listener.handle("""{"method":"speak","params":{"language":"en-US"}}""")
-        assertNull(speech.text)
-    }
-
-    @Test
     fun `malformed and unknown messages are dropped without crashing`() {
         listener.handle("not json at all")
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
-    }
-
-    private class RecordingSpeech : NativeSpeech {
-        var text: String? = null
-        var language: String? = null
-        var rate: Float? = null
-        var stopCount = 0
-
-        override fun speak(
-            text: String,
-            language: String,
-            rate: Float,
-        ) {
-            this.text = text
-            this.language = language
-            this.rate = rate
-        }
-
-        override fun stop() {
-            stopCount += 1
-        }
-
-        override fun shutdown() = Unit
     }
 }

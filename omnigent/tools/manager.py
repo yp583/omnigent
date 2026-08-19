@@ -32,6 +32,10 @@ from omnigent.tools.builtins import (
     SysConductorMemoryListTool,
     SysConductorMemoryReadTool,
     SysConductorMemoryWriteTool,
+    SysConductorPermissionTool,
+    SysConductorProjectTool,
+    SysConductorSessionUpdateTool,
+    SysConductorSettingsTool,
     SysListModelsTool,
     SysReadInboxTool,
     SysScheduledTaskCreateTool,
@@ -216,6 +220,10 @@ class ToolManager:
             SysConductorMemoryListTool(),
             SysConductorMemoryReadTool(),
             SysConductorMemoryWriteTool(),
+            SysConductorSessionUpdateTool(),
+            SysConductorPermissionTool(),
+            SysConductorProjectTool(),
+            SysConductorSettingsTool(),
         ):
             self._tools[tool.name()] = tool
 
