@@ -948,6 +948,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        defer_launch: bool = False,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -968,6 +969,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            defer_launch=defer_launch,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -982,20 +984,33 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        defer_launch: bool = False,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
 
-        instance = await self._terminal_registry.launch(
-            conversation_id=session_id,
-            terminal_name=terminal_name,
-            session_key=session_key,
-            spec=spec,
-            parent_os_env=parent_os_env,
-            cwd_override=cwd_override,
-            sandbox_override=sandbox_override,
-        )
+        if defer_launch:
+            instance = await self._terminal_registry.launch(
+                conversation_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                spec=spec,
+                parent_os_env=parent_os_env,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+                defer_launch=True,
+            )
+        else:
+            instance = await self._terminal_registry.launch(
+                conversation_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                spec=spec,
+                parent_os_env=parent_os_env,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+            )
         return await self._observe_terminal_with_lifecycle(
             lifecycle,
             session_id=session_id,
@@ -1003,6 +1018,7 @@ class SessionResourceRegistry:
             session_key=session_key,
             instance=instance,
             resource_role=resource_role,
+            allow_deferred=defer_launch,
         )
 
     async def observe_required_terminal(
@@ -1060,11 +1076,18 @@ class SessionResourceRegistry:
         session_key: str,
         instance: TerminalInstance,
         resource_role: str | None = None,
+        allow_deferred: bool = False,
     ) -> SessionResourceView:
         """Project and observe an already-launched terminal instance."""
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
-        if not getattr(instance, "running", False) or not await instance.is_alive():
+        is_deferred = bool(getattr(instance, "deferred_launch", False))
+        if not getattr(instance, "running", False) and not (allow_deferred and is_deferred):
+            await self._terminal_registry.close(session_id, terminal_name, session_key)
+            raise RuntimeError(
+                f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
+            )
+        if getattr(instance, "running", False) and not await instance.is_alive():
             await self._terminal_registry.close(session_id, terminal_name, session_key)
             raise RuntimeError(
                 f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
@@ -1083,15 +1106,16 @@ class SessionResourceRegistry:
             self._terminal_lifecycles[(session_id, resource_id)] = lifecycle
             if resource_role is not None:
                 self._terminal_roles[(session_id, resource_id)] = resource_role
-        self._start_terminal_activity_watcher(
-            session_id,
-            terminal_name,
-            session_key,
-            instance,
-            resource_role,
-            lifecycle,
-            replace=True,
-        )
+        if getattr(instance, "running", False):
+            self._start_terminal_activity_watcher(
+                session_id,
+                terminal_name,
+                session_key,
+                instance,
+                resource_role,
+                lifecycle,
+                replace=True,
+            )
         return terminal_resource_view(
             session_id,
             TerminalListEntry(

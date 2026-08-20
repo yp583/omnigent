@@ -11,11 +11,14 @@ is covered without paying the server-boot cost.
 from __future__ import annotations
 
 import argparse
+import io
+import tarfile
 from pathlib import Path
 from typing import cast
 
 import httpx
 import pytest
+import yaml
 
 from dev.benchmarks.omnigent import run as bench_run
 from dev.benchmarks.omnigent.environment import BenchEnvironment, _sse_session_status
@@ -326,6 +329,41 @@ def test_host_resource_environment_can_disable_extra_boot_runner() -> None:
     assert env.with_runner
     assert env.with_host
     assert not env.with_boot_runner
+
+
+@pytest.mark.parametrize(
+    ("harness", "family", "expected_base_url"),
+    [
+        ("codex", "openai", "http://127.0.0.1:43210/v1"),
+        ("claude-sdk", "anthropic", "http://127.0.0.1:43210"),
+    ],
+)
+def test_vendor_benchmark_bundle_selects_isolated_mock_provider(
+    harness: str,
+    family: str,
+    expected_base_url: str,
+) -> None:
+    """Vendor harness benchmarks cannot fall through to user credentials."""
+    env = BenchEnvironment(with_runner=True, harness=harness)
+    env.mock_url = "http://127.0.0.1:43210"
+
+    with tarfile.open(fileobj=io.BytesIO(env._agent_bundle("provider-test")), mode="r:gz") as tf:
+        config_file = tf.extractfile("config.yaml")
+        assert config_file is not None
+        agent_config = yaml.safe_load(config_file)
+
+    auth = agent_config["executor"]["auth"]
+    assert auth == {"type": "provider", "name": "omnigent-benchmark-mock"}
+    assert "connection" not in agent_config["executor"]
+
+    provider_config = env._mock_provider_config()
+    assert provider_config is not None
+    providers = _d(provider_config["providers"])
+    provider = _d(providers["omnigent-benchmark-mock"])
+    assert provider["default"] == [family]
+    family_config = _d(provider[family])
+    assert family_config["base_url"] == expected_base_url
+    assert family_config["api_key"] == "mock-key"
 
 
 # ── per-journey iteration cap (no server) ────────────────────

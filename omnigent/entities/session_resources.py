@@ -156,7 +156,7 @@ def terminal_resource_view(session_id: str, entry: TerminalListEntry) -> Session
         metadata={
             "terminal_name": terminal_name,
             "session_key": session_key,
-            "running": entry.instance.running,
+            "running": entry.instance.running or entry.instance.deferred_launch,
             "tmux_socket": str(entry.instance.socket_path),
             "tmux_target": entry.instance.tmux_target,
             # Effective web-attach transport (``"pty"`` / ``"control"``) absent
@@ -262,7 +262,7 @@ def list_session_resources_from_terminal_registry(
         entries = [
             entry
             for entry in terminal_registry.list_for_conversation(session_id)
-            if entry.instance.running
+            if entry.instance.running or entry.instance.deferred_launch
         ]
         for entry in entries:
             resources.append(terminal_resource_view(session_id, entry))
@@ -335,7 +335,7 @@ def resolve_terminal_entry_by_resource_id(
     if terminal_registry is None:
         return None
     for entry in terminal_registry.list_for_conversation(session_id):
-        if not entry.instance.running:
+        if not (entry.instance.running or entry.instance.deferred_launch):
             continue
         if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
             return entry

@@ -645,6 +645,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            defer_launch: bool = False,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -665,6 +666,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             # so the pane's activity still does not drive the
             # session's working status.
             assert resource_role == OMNIGENT_REPL_TERMINAL_ROLE
+            assert defer_launch is True
             launched_specs.append(spec)
             return SessionResourceView(
                 id="terminal_tui_main",
@@ -717,9 +719,8 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
         "--server",
         "http://ap.example",
     ]
-    # Deferred start: the REPL process must not run until the first web
-    # client attaches — never-opened terminals stay an idle tmux pane,
-    # and the session is fully live by first attach.
+    # The REPL command waits for the first tmux client after the registry
+    # creates tmux on demand. Never-opened terminals create no processes.
     assert launched.tmux_start_on_attach is True
     # cwd pins to the runner workspace (same convention as the
     # claude-native terminal); a wrong cwd drops the REPL into $HOME.
@@ -788,9 +789,11 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            defer_launch: bool = False,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and return a resource view."""
             del terminal_name, session_key, resource_role
+            assert defer_launch is True
             captured["spec"] = spec
             captured["parent_os_env"] = parent_os_env
             return SessionResourceView(

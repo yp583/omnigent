@@ -167,6 +167,7 @@ class TerminalRegistry:
         parent_os_env: OSEnvSpec | None = None,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
+        defer_launch: bool = False,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -198,6 +199,8 @@ class TerminalRegistry:
             ``allow_cwd_override`` flag.
         :param sandbox_override: Optional sandbox override, already
             vetted against ``allow_sandbox_override``.
+        :param defer_launch: Register the terminal without starting tmux. The
+            caller must invoke :meth:`activate` before attaching.
         :returns: The (possibly newly created) :class:`TerminalInstance`.
         :raises RuntimeError: If tmux isn't on PATH or the launch
             fails. Inner code surfaces a clear error; the caller
@@ -206,6 +209,8 @@ class TerminalRegistry:
         key = (terminal_name, session_key)
         with self._lock:
             existing = self._by_conversation.get(conversation_id, {}).get(key)
+        if existing is not None and existing.deferred_launch:
+            return existing
         if existing is not None and existing.running:
             if await existing.is_alive():
                 return existing
@@ -227,20 +232,24 @@ class TerminalRegistry:
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
-        await created.instance.launch(cwd=created.cwd)
-        if not await created.instance.is_alive():
-            try:
-                await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Newly launched terminal close timed out for %s:%s in conv %s",
-                    terminal_name,
-                    session_key,
-                    conversation_id,
+        if defer_launch:
+            created.instance.deferred_launch = True
+            created.instance.launch_cwd = str(created.cwd)
+        else:
+            await created.instance.launch(cwd=created.cwd)
+            if not await created.instance.is_alive():
+                try:
+                    await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Newly launched terminal close timed out for %s:%s in conv %s",
+                        terminal_name,
+                        session_key,
+                        conversation_id,
+                    )
+                raise RuntimeError(
+                    f"terminal {terminal_name}:{session_key} exited before it became available"
                 )
-            raise RuntimeError(
-                f"terminal {terminal_name}:{session_key} exited before it became available"
-            )
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})
@@ -249,7 +258,7 @@ class TerminalRegistry:
             # ours and return the racer's. Avoids two live tmux
             # sessions for the same key.
             racer = slot.get(key)
-            if racer is not None and racer.running:
+            if racer is not None and (racer.running or racer.deferred_launch):
                 # Close ours outside the lock; racer wins.
                 instance_to_close: TerminalInstance | None = created.instance
                 winning_instance = racer
@@ -276,6 +285,31 @@ class TerminalRegistry:
                     conversation_id,
                 )
         return winning_instance
+
+    async def activate(
+        self,
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+    ) -> TerminalInstance | None:
+        """Start a terminal previously registered with ``defer_launch=True``."""
+        with self._lock:
+            instance = self._by_conversation.get(conversation_id, {}).get(
+                (terminal_name, session_key)
+            )
+        if instance is None:
+            return None
+        if instance.running:
+            return instance if await instance.is_alive() else None
+        if not instance.deferred_launch:
+            return None
+        await instance.launch()
+        if not await instance.is_alive():
+            await self.close(conversation_id, terminal_name, session_key)
+            raise RuntimeError(
+                f"terminal {terminal_name}:{session_key} exited before it became available"
+            )
+        return instance
 
     def get_instance_lock(
         self,

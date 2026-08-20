@@ -258,6 +258,16 @@ and capability fingerprints. This branch deliberately keeps one Codex vendor
 process per managed conversation while removing the redundant Omnigent worker;
 native Codex subagents remain owned by Codex itself.
 
+### Process-free presentation terminals
+
+Top-level SDK sessions advertise the same embedded Omnigent REPL terminal as
+before, but registration is process-free. The runner creates the tmux server
+and launches `omnigent attach` only when a client first attaches to that
+terminal. First attach retains the original cwd, sandbox, transport, sizing,
+and lifecycle behavior; later attaches reuse the live pane. Native harness
+terminals are unchanged because their vendor TUI is the harness runtime, not an
+optional presentation layer.
+
 ### Hierarchical resource governor
 
 The host owns admission because per-runner semaphores cannot coordinate a

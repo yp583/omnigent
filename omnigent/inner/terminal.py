@@ -930,6 +930,8 @@ class TerminalInstance:
         tmux passthrough escapes to query/control the attached terminal.
     :param tmux_start_on_attach: Whether to delay command startup until
         the first tmux client attaches to the session.
+    :param deferred_launch: Whether the registry has prepared this instance
+        without starting its tmux server yet.
     :param running: Whether the tmux server is currently expected to
         be alive.
     """
@@ -962,6 +964,7 @@ class TerminalInstance:
     scrollback: int = 10000
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
+    deferred_launch: bool = False
     # Keep the private tmux server alive after the pane's inner process exits
     # (``remain-on-exit`` / ``exit-empty off``). Opt-in per terminal because it
     # changes the ``has-session``-means-alive contract: with it on, liveness is
@@ -1115,7 +1118,7 @@ class TerminalInstance:
         """Start the tmux session."""
         if self.running:
             return
-        effective_cwd = str(cwd or self.private_dir)
+        effective_cwd = str(cwd or self.launch_cwd or self.private_dir)
 
         # Do NOT advertise the tmux control socket path to the
         # pane. The tmux server runs unsandboxed, so exposing its socket
@@ -1252,6 +1255,7 @@ class TerminalInstance:
             )
 
         self.running = True
+        self.deferred_launch = False
         self.launch_cwd = effective_cwd
 
     async def send(

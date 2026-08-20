@@ -80,6 +80,7 @@ _CANCELLATION_MARKER = "interrupted"
 # the spec so the harness has a concrete model to send.
 _DEFAULT_MODEL = "mock-bench-brain"
 _DEFAULT_HARNESS = "openai-agents"
+_MOCK_PROVIDER_NAME = "omnigent-benchmark-mock"
 
 # Server-side prompt-policy classifier queue key. In runner mode we set an
 # ALLOW fallback here so a classifier call (if the agent trips one) never
@@ -290,6 +291,15 @@ class BenchEnvironment:
             base_env["OPENAI_API_KEY"] = "mock-key"
             # The OpenAI SDK appends /responses, so include /v1 in the base.
             base_env["OPENAI_BASE_URL"] = f"{self.mock_url}/v1"
+            provider_config = self._mock_provider_config()
+            if provider_config is not None:
+                config_home = self._tmp / "config"
+                config_home.mkdir(parents=True, exist_ok=True)
+                (config_home / "config.yaml").write_text(
+                    yaml.safe_dump(provider_config),
+                    encoding="utf-8",
+                )
+                base_env["OMNIGENT_CONFIG_HOME"] = str(config_home)
         # Prepend the worktree so subprocesses import this branch's source.
         apply_server_env(base_env, _REPO_ROOT)
         # Retained so the host daemon (with_host) is built with the same
@@ -756,14 +766,45 @@ class BenchEnvironment:
         """
         await self._mock_post("/mock/set_fallback", {"key": key, "text": text, "stream": stream})
 
+    def _mock_provider_config(self) -> dict[str, object] | None:
+        """Return isolated provider config for vendor-CLI benchmark harnesses."""
+        if self.harness == "codex":
+            family = "openai"
+            family_config: dict[str, object] = {
+                "base_url": f"{self.mock_url}/v1",
+                "api_key": "mock-key",
+                "wire_api": "responses",
+                "models": {"default": self.model},
+            }
+        elif self.harness == "claude-sdk":
+            family = "anthropic"
+            family_config = {
+                "base_url": self.mock_url,
+                "api_key": "mock-key",
+                "models": {"default": self.model},
+            }
+        else:
+            return None
+        return {
+            "providers": {
+                _MOCK_PROVIDER_NAME: {
+                    "kind": "key",
+                    "default": [family],
+                    family: family_config,
+                }
+            }
+        }
+
     # ── agent + session primitives ───────────────────────────
 
     def _agent_bundle(self, name: str) -> bytes:
         """Build a ``spec_version: 1`` agent bundle.
 
-        In runner mode the executor is wired at the mock LLM (auth +
-        connection). Server-only, no LLM is ever called, so the bundle just
-        needs to be a valid spec the server can register and bind sessions to.
+        In runner mode the executor is wired at the mock LLM. Vendor CLI
+        harnesses select the isolated provider config written by :meth:`_start`;
+        SDK-only harnesses use the legacy inline auth + connection fields.
+        Server-only mode never calls an LLM, so the bundle only needs to be a
+        valid spec the server can register and bind sessions to.
         """
         executor: dict[str, object] = {
             "type": "omnigent",
@@ -777,12 +818,18 @@ class BenchEnvironment:
             "executor": executor,
         }
         if self.with_runner:
-            executor["auth"] = {
-                "type": "api_key",
-                "api_key": "mock-key",
-                "base_url": f"{self.mock_url}/v1",
-            }
-            executor["connection"] = {"base_url": f"{self.mock_url}/v1", "api_key": "mock-key"}
+            if self._mock_provider_config() is not None:
+                executor["auth"] = {"type": "provider", "name": _MOCK_PROVIDER_NAME}
+            else:
+                executor["auth"] = {
+                    "type": "api_key",
+                    "api_key": "mock-key",
+                    "base_url": f"{self.mock_url}/v1",
+                }
+                executor["connection"] = {
+                    "base_url": f"{self.mock_url}/v1",
+                    "api_key": "mock-key",
+                }
             # A filesystem env so the runner can serve the resource endpoints
             # (read_runner_file). Without os_env the runner has no primary
             # environment to materialize and the filesystem proxy 404s.

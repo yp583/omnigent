@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import os
+import errno
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from omnigent.entities import LoadedAgent
@@ -47,6 +48,17 @@ class AgentCache:
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
+        self._lock_guard = threading.Lock()
+        self._agent_locks: dict[str, threading.Lock] = {}
+
+    def _lock_for(self, agent_id: str) -> threading.Lock:
+        """Return the stable lock serializing one agent's cache mutations."""
+        with self._lock_guard:
+            lock = self._agent_locks.get(agent_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._agent_locks[agent_id] = lock
+            return lock
 
     def load(
         self,
@@ -80,24 +92,37 @@ class AgentCache:
             on-disk working directory.
         """
         workdir = self._cache_dir / agent_id
+        with self._lock_for(agent_id):
+            # Tier 1: in-memory spec. The cached spec was parsed with the
+            # *expand_env* value of whichever caller populated it first.
+            # That is consistent across callers because *expand_env* is
+            # derived from the agent's immutable ``session_id`` provenance,
+            # which never changes for a given ``agent_id``.
+            if agent_id in self._specs:
+                return LoadedAgent(spec=self._specs[agent_id], workdir=workdir)
 
-        # Tier 1: in-memory spec. The cached spec was parsed with the
-        # *expand_env* value of whichever caller populated it first.
-        # That is consistent across callers because *expand_env* is
-        # derived from the agent's immutable ``session_id`` provenance,
-        # which never changes for a given ``agent_id``.
-        if agent_id in self._specs:
-            return LoadedAgent(spec=self._specs[agent_id], workdir=workdir)
+            # Tier 2: disk cache (directory already extracted). A directory
+            # left by an older non-atomic writer is discarded and rebuilt.
+            if workdir.is_dir():
+                try:
+                    spec = load_spec(
+                        workdir,
+                        expand_env=expand_env,
+                        prune_invalid_sub_agents=True,
+                    )
+                except FileNotFoundError:
+                    shutil.rmtree(workdir, ignore_errors=True)
+                else:
+                    self._specs[agent_id] = spec
+                    return LoadedAgent(spec=spec, workdir=workdir)
 
-        # Tier 2: disk cache (directory already extracted)
-        if workdir.is_dir():
-            spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
-            self._specs[agent_id] = spec
-            return LoadedAgent(spec=spec, workdir=workdir)
-
-        # Cache miss — download bundle, write to temp file, extract
-        bundle_bytes = self._artifact_store.get(bundle_location)
-        return self._extract_and_cache(agent_id, bundle_bytes, workdir, expand_env=expand_env)
+            bundle_bytes = self._artifact_store.get(bundle_location)
+            return self._extract_and_cache(
+                agent_id,
+                bundle_bytes,
+                workdir,
+                expand_env=expand_env,
+            )
 
     def replace(
         self,
@@ -131,32 +156,23 @@ class AgentCache:
             directory.
         """
         workdir = self._cache_dir / agent_id
-        staging_dir = self._cache_dir / f"{agent_id}_staging"
+        with self._lock_for(agent_id):
+            staging_dir = self._new_staging_dir()
+            try:
+                spec = load_spec(
+                    bundle_bytes,
+                    dest=staging_dir,
+                    expand_env=expand_env,
+                    prune_invalid_sub_agents=True,
+                )
+                if workdir.is_dir():
+                    shutil.rmtree(workdir)
+                staging_dir.rename(workdir)
+            finally:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
-        # Extract new bundle to staging directory
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
-        try:
-            tmp_path.write_bytes(bundle_bytes)
-            spec = load_spec(
-                tmp_path,
-                dest=staging_dir,
-                expand_env=expand_env,
-                prune_invalid_sub_agents=True,
-            )
-        finally:
-            tmp_path.unlink()
-
-        # Swap in-memory entry (atomic dict assignment)
-        self._specs[agent_id] = spec
-
-        # Replace disk directory: remove old, rename staging into place
-        if workdir.is_dir():
-            shutil.rmtree(workdir)
-        staging_dir.rename(workdir)
-
-        return LoadedAgent(spec=spec, workdir=workdir)
+            self._specs[agent_id] = spec
+            return LoadedAgent(spec=spec, workdir=workdir)
 
     def evict(self, agent_id: str) -> None:
         """
@@ -166,10 +182,16 @@ class AgentCache:
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
         """
-        self._specs.pop(agent_id, None)
-        workdir = self._cache_dir / agent_id
-        if workdir.is_dir():
-            shutil.rmtree(workdir)
+        with self._lock_for(agent_id):
+            self._specs.pop(agent_id, None)
+            workdir = self._cache_dir / agent_id
+            if workdir.is_dir():
+                shutil.rmtree(workdir)
+
+    def _new_staging_dir(self) -> Path:
+        """Create a unique same-filesystem directory for atomic publication."""
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix=".agent-staging-", dir=self._cache_dir))
 
     def _extract_and_cache(
         self,
@@ -191,19 +213,28 @@ class AgentCache:
             :meth:`load` for the rationale.
         :returns: A LoadedAgent with the parsed spec and workdir.
         """
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
+        staging_dir = self._new_staging_dir()
         try:
-            tmp_path.write_bytes(bundle_bytes)
             spec = load_spec(
-                tmp_path,
-                dest=workdir,
+                bundle_bytes,
+                dest=staging_dir,
                 expand_env=expand_env,
                 prune_invalid_sub_agents=True,
             )
+            try:
+                staging_dir.rename(workdir)
+            except OSError as exc:
+                # A different server process may have published the same
+                # complete cache entry first. Prefer that winner.
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY} or not workdir.is_dir():
+                    raise
+                spec = load_spec(
+                    workdir,
+                    expand_env=expand_env,
+                    prune_invalid_sub_agents=True,
+                )
         finally:
-            tmp_path.unlink()
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
         self._specs[agent_id] = spec
         return LoadedAgent(spec=spec, workdir=workdir)

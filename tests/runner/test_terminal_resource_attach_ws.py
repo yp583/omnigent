@@ -318,6 +318,69 @@ def test_runner_resource_attach_dead_tmux_with_stale_flag_closes_4404(
     assert stale.running is False
 
 
+def test_runner_resource_attach_activates_deferred_repl_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First attach starts the prepared REPL exactly once before bridging."""
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("tui", "main", tmp_path, running=False)
+    instance.deferred_launch = True
+    instance.launch_cwd = str(tmp_path / "workspace")
+    launch_cwds: list[Path | None] = []
+
+    async def launch(*, cwd: Path | None = None) -> None:
+        launch_cwds.append(cwd)
+        instance.running = True
+        instance.deferred_launch = False
+
+    async def is_alive() -> bool:
+        return instance.running
+
+    instance.launch = launch  # type: ignore[method-assign]
+    instance.is_alive = is_alive  # type: ignore[method-assign]
+    _seed_registry(registry, "conv_abc", instance)
+
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    resource_registry._terminal_roles[("conv_abc", "terminal_tui_main")] = (
+        OMNIGENT_REPL_TERMINAL_ROLE
+    )
+    monkeypatch.setattr(
+        resource_registry,
+        "_start_terminal_activity_watcher",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def must_not_recreate(*_args: object, **_kwargs: object) -> SessionResourceView:
+        raise AssertionError("deferred REPL should activate instead of being recreated")
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_repl_terminal", must_not_recreate)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    attach_argvs: list[list[str]] = []
+    _patch_attach_spawn(
+        monkeypatch,
+        lambda _path, argv, _env: attach_argvs.append(argv),
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="child exited"):
+            with TestClient(app).websocket_connect(
+                "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
+            ):
+                pass
+
+    assert launch_cwds == [None]
+    assert instance.running is True
+    assert instance.deferred_launch is False
+    assert len(attach_argvs) == 2
+    assert all(str(tmp_path / "tui-main.sock") in argv for argv in attach_argvs)
+
+
 def test_runner_resource_attach_recreates_dead_repl_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

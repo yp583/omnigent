@@ -6744,10 +6744,10 @@ async def _auto_create_repl_terminal(
     The REPL is a pure co-drive client: it joins the live session over
     HTTP+SSE and dispatches turns to this runner, so the web chat view and
     the embedded terminal stay in sync. The tmux command is deferred until
-    the first client attaches (``tmux_start_on_attach``): a session whose
-    terminal is never opened pays only for an idle tmux pane, and by first
-    attach the session is fully live (``omnigent attach`` fails loud on a
-    non-live session) with the REPL sized to the real attached terminal.
+    the first client attaches: a session whose terminal is never opened has no
+    tmux server or waiting shell, and by first attach the session is fully live
+    (``omnigent attach`` fails loud on a non-live session) with the REPL sized
+    to the real attached terminal.
 
     Auth parity with the native terminals: the spawned ``omnigent
     attach`` resolves credentials for ``--server`` the same way a
@@ -6806,6 +6806,7 @@ async def _auto_create_repl_terminal(
         # this terminal when its tmux session has died (the REPL exited
         # or crashed) instead of rejecting the attach.
         resource_role=OMNIGENT_REPL_TERMINAL_ROLE,
+        defer_launch=True,
     )
     # Stamp the presentation label that gates the web UI's Chat/Terminal
     # pill (web TerminalFirstContext). Stamped here — not at session

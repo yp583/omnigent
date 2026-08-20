@@ -7932,7 +7932,22 @@ def create_runner_app(
         lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             existing = registry.get(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
-            if existing is None or not existing.running or not await existing.is_alive():
+            if existing is not None and existing.deferred_launch:
+                activated = await registry.activate(
+                    session_id,
+                    _REPL_TERMINAL_NAME,
+                    _REPL_TERMINAL_SESSION_KEY,
+                )
+                if activated is None:
+                    return None
+                await resource_registry.observe_auxiliary_terminal(
+                    session_id,
+                    _REPL_TERMINAL_NAME,
+                    _REPL_TERMINAL_SESSION_KEY,
+                    activated,
+                    resource_role=OMNIGENT_REPL_TERMINAL_ROLE,
+                )
+            elif existing is None or not existing.running or not await existing.is_alive():
                 await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
                 try:
                     repl_agent_spec = await _resolve_session_agent_spec(session_id)

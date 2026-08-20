@@ -22,6 +22,8 @@ from omnigent.entities.session_resources import (
     SessionResourceView,
     default_environment_resource,
     environment_safety_metadata,
+    list_session_resources_from_terminal_registry,
+    resolve_terminal_entry_by_resource_id,
     terminal_resource_id,
     terminal_resource_view,
 )
@@ -113,6 +115,24 @@ def _seed_registry(
     slot = registry._by_conversation.setdefault(conversation_id, {})
     for instance in instances:
         slot[(instance.name, instance.session_key)] = instance
+
+
+def test_deferred_terminal_is_visible_before_first_attach(tmp_path: Path) -> None:
+    """A process-free REPL registration still appears as an attachable resource."""
+    session_id = "deferred-session"
+    registry = TerminalRegistry()
+    instance = _make_instance("tui", "main", tmp_path, running=False)
+    instance.deferred_launch = True
+    _seed_registry(registry, session_id, [instance])
+
+    resources = list_session_resources_from_terminal_registry(session_id, registry)
+    terminal = next(resource for resource in resources.data if resource.type == "terminal")
+
+    assert terminal.id == "terminal_tui_main"
+    assert terminal.metadata["running"] is True
+    resolved = resolve_terminal_entry_by_resource_id(session_id, terminal.id, registry)
+    assert resolved is not None
+    assert resolved.instance is instance
 
 
 class _CapturingResourceRegistry:

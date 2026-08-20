@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import io
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
+from omnigent.runtime import agent_cache as agent_cache_module
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 
@@ -135,6 +138,71 @@ def test_load_disk_cache_hit(
     second = cache_2.load("agent-3", loc)
     assert second.spec.name == first.spec.name
     assert second.workdir == first.workdir
+
+
+def test_concurrent_load_waits_for_complete_cache_publication(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second load never observes the first load's partial extraction."""
+    loc = "agent-concurrent/hash"
+    _store_bundle(artifact_store, loc)
+    real_load_spec = agent_cache_module.load_spec
+    extraction_started = threading.Event()
+    release_extraction = threading.Event()
+    second_lock_attempted = threading.Event()
+    first_extract = True
+
+    class _SignallingLock:
+        """Expose when the concurrent reader reaches the held agent lock."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._attempts = 0
+
+        def __enter__(self) -> None:
+            self._attempts += 1
+            if self._attempts == 2:
+                second_lock_attempted.set()
+            self._lock.acquire()
+
+        def __exit__(self, *_args: object) -> None:
+            self._lock.release()
+
+    agent_cache._agent_locks["agent-concurrent"] = _SignallingLock()  # type: ignore[assignment]
+
+    def _paused_load_spec(*args: object, **kwargs: object) -> object:
+        nonlocal first_extract
+        dest = kwargs.get("dest")
+        if first_extract and isinstance(dest, Path):
+            first_extract = False
+            dest.mkdir(parents=True, exist_ok=True)
+            extraction_started.set()
+            assert release_extraction.wait(timeout=5)
+        return real_load_spec(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(agent_cache_module, "load_spec", _paused_load_spec)
+
+    def _second_load() -> object:
+        return agent_cache.load("agent-concurrent", loc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(agent_cache.load, "agent-concurrent", loc)
+        assert extraction_started.wait(timeout=5)
+        second = pool.submit(_second_load)
+        assert second_lock_attempted.wait(timeout=5)
+        try:
+            assert not second.done(), "concurrent reader bypassed the in-flight extraction"
+        finally:
+            release_extraction.set()
+        first_loaded = first.result(timeout=5)
+        second_loaded = second.result(timeout=5)
+
+    assert first_loaded.spec is second_loaded.spec
+    assert (cache_dir / "agent-concurrent" / "config.yaml").is_file()
+    assert not list(cache_dir.glob(".agent-staging-*"))
 
 
 def test_load_missing_agent_raises_key_error(

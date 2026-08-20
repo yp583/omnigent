@@ -220,6 +220,61 @@ async def test_launch_replaces_stale_running_entry(
     assert reg.get("conv_x", "shell", "s1") is created
 
 
+async def test_deferred_launch_registers_without_tmux_then_activates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prepared auxiliary terminal starts no process before first attach."""
+
+    class _DeferredTerminal(TerminalInstance):
+        launch_calls: int = 0
+
+        async def launch(self, *, cwd: Path | None = None) -> None:
+            self.launch_calls += 1
+            self.launch_cwd = str(cwd or self.launch_cwd or self.private_dir)
+            self.running = True
+            self.deferred_launch = False
+
+        async def is_alive(self) -> bool:
+            return self.running
+
+    instance = _DeferredTerminal(
+        name="tui",
+        session_key="main",
+        socket_path=tmp_path / "deferred.sock",
+        private_dir=tmp_path / "deferred",
+    )
+
+    def _fake_create_terminal_instance(*_args: object, **_kwargs: object) -> TerminalCreateResult:
+        return TerminalCreateResult(instance=instance, cwd=tmp_path)
+
+    monkeypatch.setattr(registry_mod, "create_terminal_instance", _fake_create_terminal_instance)
+    registry = TerminalRegistry()
+
+    prepared = await registry.launch(
+        "conv_deferred",
+        "tui",
+        "main",
+        TerminalEnvSpec(command="omnigent"),
+        defer_launch=True,
+    )
+
+    assert prepared is instance
+    assert instance.deferred_launch is True
+    assert instance.running is False
+    assert instance.launch_calls == 0
+    assert registry.get("conv_deferred", "tui", "main") is instance
+
+    activated = await registry.activate("conv_deferred", "tui", "main")
+
+    assert activated is instance
+    assert instance.deferred_launch is False
+    assert instance.running is True
+    assert instance.launch_calls == 1
+    assert await registry.activate("conv_deferred", "tui", "main") is instance
+    assert instance.launch_calls == 1
+
+
 def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:
     """
     Terminal transfer changes ownership without touching the instance.
