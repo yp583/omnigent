@@ -240,6 +240,8 @@ async def test_create_passes_branch_and_base_branch_to_host(
     # The returned worktree path becomes the session workspace, and the
     # branch is persisted (drives sidebar display + delete cleanup).
     body = resp.json()
+    assert body["kind"] == "default"
+    assert body["parent_session_id"] is None
     assert body["git_branch"] == "feature/login"
     assert body["workspace"] == f"{_SOURCE_REPO}-worktrees/feature-login"
 

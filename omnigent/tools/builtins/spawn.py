@@ -813,7 +813,7 @@ class SysSessionShareTool(Tool):
 
 class SysSessionCreateTool(Tool):
     """
-    Create a child session from an existing agent or a local bundle.
+    Create a child session, or dispatch a detached host session.
 
     The child is a separate Omnigent agent session — its own
     conversation, visible in the session tree, optionally a different
@@ -821,14 +821,20 @@ class SysSessionCreateTool(Tool):
     subagent/Task tool (which remains the right choice for quick
     in-context helpers).
 
-    A **child-only write**: the new session's ``parent_session_id`` is
-    forced to the caller's own session, so an orchestrator can only spawn
-    sessions inside its own subtree — never a top-level or sibling
-    session. By default the child inherits the caller's runner
-    (co-location), so it starts executing as soon as a message is queued.
-    Existing-agent mode may instead target a connected external host with
-    ``host_id`` plus an absolute ``workspace``. Supplying ``branch_name``
-    creates an isolated git worktree on that host before the child starts.
+    The default remains a **child-only write**: the new session's
+    ``parent_session_id`` is forced to the caller's own session. By default
+    the child inherits the caller's runner (co-location), so it starts
+    executing as soon as a message is queued. Existing-agent mode may instead
+    target a connected external host with ``host_id`` plus an absolute
+    ``workspace``. Supplying ``branch_name`` creates an isolated git worktree
+    on that host before the session starts.
+
+    Explicit host placement may set ``detached=true`` to create a normal
+    top-level session instead. Detached mode is intentionally limited to an
+    existing agent plus ``host_id`` and ``workspace``: without an explicit
+    host, a top-level session has no runner to inherit. A detached session
+    appears in the owner's main session list and is not registered in the
+    caller's child-session rail or completion inbox.
 
     Two addressing modes — exactly one of ``agent_id`` or
     ``config_path`` must be given:
@@ -851,16 +857,16 @@ class SysSessionCreateTool(Tool):
     to create a new worktree and optionally ``base_branch`` to select its
     starting revision.
 
-    An optional ``message`` is queued as the child's first user turn;
+    An optional ``message`` is queued as the new session's first user turn;
     an optional ``title`` labels the session.
 
-    Returns a handle ``{conversation_id, agent_id, title, status}``. The
-    session runs asynchronously — use ``sys_session_get_history`` /
-    ``sys_session_get_info`` to monitor it, or ``sys_session_send`` (with
-    the returned ``conversation_id``) to drive it further.
+    Returns a handle ``{conversation_id, agent_id, title, status, detached}``.
+    The session runs asynchronously. Child sessions can be driven further via
+    ``sys_session_send``; detached sessions are continued from the main session
+    list.
 
-    Runner-dispatched: both modes force ``parent_session_id`` to the
-    caller.
+    Runner-dispatched: child mode forces ``parent_session_id`` to the caller;
+    detached mode omits it.
     """
 
     @classmethod
@@ -872,7 +878,8 @@ class SysSessionCreateTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Create a child session from an agent. This launches a "
+            "Create a child session from an agent, or dispatch a detached "
+            "top-level session to an explicit host. This launches a "
             "separate Omnigent agent session — its own conversation, "
             "visible in the session tree, optionally a different "
             "registered agent. It is not your harness's built-in "
@@ -889,18 +896,21 @@ class SysSessionCreateTool(Tool):
             "with sys_os_write) and launches it. Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
-            "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions). "
+            "message. The new session is a child of the calling session by "
+            "default. Set detached=true only with existing-agent host "
+            "placement to create a top-level session in the owner's main "
+            "session list; detached sessions do not report completion to the "
+            "calling session. "
             "Existing-agent mode can target another online registered "
             "host by passing host_id with its absolute workspace path; "
             "branch_name creates an isolated git worktree there and "
             "base_branch selects its starting revision. Placement fields "
             "are not supported with config_path. Returns "
             "{conversation_id, agent_id, title, status, host_id, workspace, "
-            "git_branch}; the "
-            "session runs asynchronously — monitor it with "
-            "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send."
+            "git_branch, detached}; the session runs asynchronously. Monitor "
+            "it with sys_session_get_history / sys_session_get_info. Child "
+            "sessions can also be driven with sys_session_send; open detached "
+            "sessions from the main session list to continue them."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -955,10 +965,10 @@ class SysSessionCreateTool(Tool):
                         "message": {
                             "type": "string",
                             "description": (
-                                "Optional first user message to queue "
-                                "for the child. Omit to create an idle "
-                                "session and drive it later via "
-                                "sys_session_send."
+                                "Optional first user message to queue for the "
+                                "new session. Omit to create it idle. A child "
+                                "can be driven later via sys_session_send; a "
+                                "detached session is continued independently."
                             ),
                         },
                         "model": {
@@ -986,7 +996,7 @@ class SysSessionCreateTool(Tool):
                                 "Existing-agent mode only: absolute source-repository "
                                 "path on host_id, e.g. '/workspace/project'. Must be "
                                 "paired with host_id. When branch_name is present, "
-                                "Omnigent creates the child worktree from this repo."
+                                "Omnigent creates the session worktree from this repo."
                             ),
                         },
                         "branch_name": {
@@ -1003,6 +1013,17 @@ class SysSessionCreateTool(Tool):
                                 "Optional starting revision for branch_name, e.g. "
                                 "'origin/main'. Requires branch_name. Never guess it "
                                 "when the user has not supplied or confirmed a base."
+                            ),
+                        },
+                        "detached": {
+                            "type": "boolean",
+                            "description": (
+                                "Existing-agent, explicit-host mode only. When true, "
+                                "create a top-level session in the owner's main "
+                                "session list instead of a child under the caller. "
+                                "Requires host_id and workspace. The detached session "
+                                "runs independently and does not report completion to "
+                                "the caller. Defaults to false."
                             ),
                         },
                     },

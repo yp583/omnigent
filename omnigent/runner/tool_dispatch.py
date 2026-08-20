@@ -2354,16 +2354,17 @@ def _build_session_create_body(
     workspace: str | None = None,
     branch_name: str | None = None,
     base_branch: str | None = None,
+    detached: bool = False,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
-    ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
-    what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``. Explicit host placement is
-    forwarded with optional git worktree creation.
+    ``parent_session_id`` is hard-forced to ``conversation_id`` for the
+    default child mode. Detached explicit-host dispatch omits the parent so
+    the server creates a normal top-level session. A non-empty ``title``,
+    ``message``, and ``model`` are included when provided; the message becomes
+    the session's first queued user turn via ``initial_items``. Explicit host
+    placement is forwarded with optional git worktree creation.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2377,12 +2378,12 @@ def _build_session_create_body(
     :param workspace: Absolute source-repository path on ``host_id``.
     :param branch_name: Optional branch for a new isolated worktree.
     :param base_branch: Optional starting revision for ``branch_name``.
+    :param detached: Omit ``parent_session_id`` for a top-level host dispatch.
     :returns: The JSON request body.
     """
-    body: _JsonObject = {
-        "agent_id": agent_id,
-        "parent_session_id": conversation_id,
-    }
+    body: _JsonObject = {"agent_id": agent_id}
+    if not detached:
+        body["parent_session_id"] = conversation_id
     if isinstance(title, str) and title:
         body["title"] = title
     if isinstance(model, str) and model:
@@ -2412,15 +2413,15 @@ def _finalize_created_session(
     agent_id: str,
     title: object,
     publish_event: Callable[[str, _JsonObject], None] | None,
+    detached: bool = False,
 ) -> str:
     """
     Register fan-out, emit ``session.created``, and build the handle.
 
-    Records the child→parent mapping so the child's status/preview
-    deltas fan out onto the caller's stream, publishes a transient
-    ``session.created`` event (durability comes from the server's
-    conversation row), and returns the handle the orchestrator uses to
-    drive / monitor the child.
+    Child mode records the child→parent mapping so status/preview deltas fan
+    out onto the caller's stream and publishes a transient
+    ``session.created`` event. Detached mode skips both: the server's normal
+    user-session announcement places it in the main session list instead.
 
     :param data: The :class:`SessionResponse` JSON from the create call.
     :param conversation_id: The caller (parent) session id.
@@ -2428,38 +2429,42 @@ def _finalize_created_session(
     :param title: The caller-supplied title (or non-str when absent).
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
+    :param detached: Whether this is an independent top-level session.
     :returns: JSON handle ``{conversation_id, kind, agent_id,
         agent_name, title, status, host_id, workspace, git_branch}``.
     """
     from omnigent.runner import app as _runner_app
     from omnigent.server.schemas import SessionCreatedEvent
 
-    child_id = data.get("id")
-    if not isinstance(child_id, str) or not child_id:
-        return json.dumps({"error": "server did not return child session id"})
+    created_id = data.get("id")
+    if not isinstance(created_id, str) or not created_id:
+        return json.dumps({"error": "server did not return created session id"})
     agent_name = data.get("agent_name")
     agent_label = agent_name if isinstance(agent_name, str) and agent_name else "agent"
     label = title if isinstance(title, str) else ""
-    _runner_app.register_child_session(
-        child_id,
-        parent_session_id=conversation_id,
-        title=label,
-        tool=agent_label,
-        session_name=label,
-    )
-    evt = SessionCreatedEvent(
-        type="session.created",
-        conversation_id=conversation_id,
-        child_session_id=child_id,
-        agent_id=agent_id,
-        parent_session_id=conversation_id,
-    )
-    if publish_event is not None:
-        publish_event(conversation_id, evt.model_dump())
+    if not detached:
+        _runner_app.register_child_session(
+            created_id,
+            parent_session_id=conversation_id,
+            title=label,
+            tool=agent_label,
+            session_name=label,
+        )
+        evt = SessionCreatedEvent(
+            type="session.created",
+            conversation_id=conversation_id,
+            child_session_id=created_id,
+            agent_id=agent_id,
+            parent_session_id=conversation_id,
+        )
+        if publish_event is not None:
+            publish_event(conversation_id, evt.model_dump())
     return json.dumps(
         {
-            "conversation_id": child_id,
-            "kind": "sub_agent",
+            "conversation_id": created_id,
+            "kind": "default" if detached else "sub_agent",
+            "detached": detached,
+            "parent_session_id": None if detached else conversation_id,
             "agent_id": agent_id,
             "agent_name": data.get("agent_name"),
             "title": title if isinstance(title, str) else None,
@@ -2590,7 +2595,7 @@ async def _execute_session_create(
     runner_workspace: Path | None = None,
 ) -> str:
     """
-    Create a child session (``sys_session_create``).
+    Create a session (``sys_session_create``).
 
     Two modes, split on the provided argument (exactly one required):
 
@@ -2601,14 +2606,14 @@ async def _execute_session_create(
       inside the caller's working directory) via the multipart
       ``POST /v1/sessions`` create.
 
-    Both modes force ``parent_session_id`` to the caller (child-only).
-    By default the child inherits the caller's runner. Existing-agent mode
-    may explicitly target a registered host and optionally create an isolated
-    git worktree there. Returns a handle
-    the orchestrator can monitor (``sys_session_get_history`` /
-    ``sys_session_get_info``) or drive (``sys_session_send`` by
-    ``conversation_id``) — unlike named-mode send, it does NOT block on
-    the child turn.
+    Both modes create a child by default. Existing-agent mode may explicitly
+    target a registered host and optionally create an isolated git worktree
+    there. Such a targeted create may set ``detached=true`` to omit the parent
+    and create a normal top-level session instead. Returns a handle the
+    orchestrator can monitor (``sys_session_get_history`` /
+    ``sys_session_get_info``); child sessions can also be driven with
+    ``sys_session_send`` by ``conversation_id``. Detached sessions are opened
+    and continued independently from the main session list.
 
     Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``.
 
@@ -2616,8 +2621,9 @@ async def _execute_session_create(
         ``config_path`` required, ``title`` / ``message`` optional.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
-    :param conversation_id: The caller's session id — the forced parent;
-        ``None`` returns an error string.
+    :param conversation_id: The caller's session id — the forced parent for
+        child mode and the authorization context for detached mode; ``None``
+        returns an error string.
     :param publish_event: SSE publish callback for ``session.created``.
     :param agent_spec: The calling agent's spec, used (with
         ``conversation_id`` / ``runner_workspace``) to resolve the
@@ -2634,6 +2640,9 @@ async def _execute_session_create(
     config_path = args.get("config_path")
     has_agent_id = isinstance(agent_id, str) and bool(agent_id)
     has_config_path = isinstance(config_path, str) and bool(config_path)
+    detached = args.get("detached", False)
+    if not isinstance(detached, bool):
+        return json.dumps({"error": "'detached' must be a boolean"})
     if has_agent_id == has_config_path:
         # Fail loud on both-or-neither: the two modes create different
         # agents, so silently preferring one would mislaunch.
@@ -2647,9 +2656,14 @@ async def _execute_session_create(
             }
         )
     placement_names = ("host_id", "workspace", "branch_name", "base_branch")
-    if has_config_path and any(name in args for name in placement_names):
+    if has_config_path and (detached or any(name in args for name in placement_names)):
         return json.dumps(
-            {"error": "host placement is supported only with existing-agent agent_id mode"}
+            {
+                "error": (
+                    "host placement and detached mode are supported only with "
+                    "existing-agent agent_id mode"
+                )
+            }
         )
     placement: dict[str, str | None] = {}
     for name in placement_names:
@@ -2680,6 +2694,10 @@ async def _execute_session_create(
             runner_workspace=runner_workspace,
         )
     targeted = host_id is not None
+    if detached and not targeted:
+        return json.dumps(
+            {"error": "'detached' requires existing-agent host_id and workspace placement"}
+        )
     message = args.get("message")
     body = _build_session_create_body(
         str(agent_id),
@@ -2691,6 +2709,7 @@ async def _execute_session_create(
         workspace=workspace,
         branch_name=branch_name,
         base_branch=base_branch,
+        detached=detached,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2710,16 +2729,19 @@ async def _execute_session_create(
         return json.dumps({"error": error, "detail": resp.text[:200]})
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
-        return json.dumps({"error": "server did not return a child session id"})
+        return json.dumps({"error": "server did not return a created session id"})
     handle = _finalize_created_session(
         data,
         conversation_id=conversation_id,
         agent_id=str(agent_id),
         title=args.get("title"),
         publish_event=publish_event,
+        detached=detached,
     )
     if targeted and isinstance(message, str) and message:
-        message_error = await _post_child_first_message(data["id"], message, server_client)
+        message_error = await _post_created_session_first_message(
+            data["id"], message, server_client
+        )
         if message_error is not None:
             return message_error
     return handle
@@ -2766,29 +2788,29 @@ def _bundle_local_agent_source(source: Path) -> bytes:
         return buf.getvalue()
 
 
-async def _post_child_first_message(
-    child_session_id: str,
+async def _post_created_session_first_message(
+    created_session_id: str,
     message: str,
     server_client: httpx.AsyncClient,
 ) -> str | None:
     """
-    Queue a bundle-created child's first user message.
+    Queue a newly-created session's first user message.
 
     Posted as a separate event so the server's post_event forwards it
-    to the runner and starts the child turn (same pattern as
+    to the runner and starts the turn (same pattern as
     named-mode ``sys_session_send``).
 
-    :param child_session_id: The new child session id,
+    :param created_session_id: The new session id,
         e.g. ``"conv_abc123"``.
     :param message: The first user message text.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: ``None`` on success; a JSON error string (carrying the
-        created ``conversation_id`` so the orchestrator can retry via
-        ``sys_session_send``) on failure.
+    :returns: ``None`` on success; a JSON error string carrying the created
+        ``conversation_id`` so the caller can locate the still-existing
+        session on failure.
     """
     try:
         msg_resp = await server_client.post(
-            f"/v1/sessions/{child_session_id}/events",
+            f"/v1/sessions/{created_session_id}/events",
             json={
                 "type": "message",
                 "data": {
@@ -2801,18 +2823,18 @@ async def _post_child_first_message(
     except httpx.HTTPError as exc:
         return json.dumps(
             {
-                "error": f"child session created but message failed: {exc}",
-                "conversation_id": child_session_id,
+                "error": f"session created but message failed: {exc}",
+                "conversation_id": created_session_id,
             }
         )
     if msg_resp.status_code >= 400:
         return json.dumps(
             {
                 "error": (
-                    "child session created but message failed: "
+                    "session created but message failed: "
                     f"{msg_resp.status_code} {msg_resp.text[:200]}"
                 ),
-                "conversation_id": child_session_id,
+                "conversation_id": created_session_id,
             }
         )
     return None
@@ -2901,7 +2923,7 @@ async def _session_create_from_config_path(
     Delegates the resolve/bundle/upload pipeline to
     :func:`_upload_config_bundle`, validates the server's
     ``CreatedSessionResponse``, queues the optional first ``message``
-    via :func:`_post_child_first_message`, and returns the
+    via :func:`_post_created_session_first_message`, and returns the
     orchestrator handle.
 
     :param config_path: Caller-supplied path to the agent config YAML,
@@ -2943,7 +2965,9 @@ async def _session_create_from_config_path(
 
     message = args.get("message")
     if isinstance(message, str) and message:
-        message_error = await _post_child_first_message(child_session_id, message, server_client)
+        message_error = await _post_created_session_first_message(
+            child_session_id, message, server_client
+        )
         if message_error is not None:
             return message_error
 

@@ -480,9 +480,11 @@ class ToolManager:
           tombstone the children it creates); without declared
           sub-agents, send's schema omits the named-mode parameters.
 
-        The spawn writes are child-only and ``sys_session_share`` is
-        owner-authority-bounded, both enforced at dispatch/server level;
-        the opt-ins control advertisement, not authority.
+        Spawn writes create children by default. Explicit-host detached
+        creates are owner- and placement-authority-bounded, and
+        ``sys_session_share`` is owner-authority-bounded; these constraints
+        are enforced at dispatch/server level. The opt-ins control
+        advertisement, not authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
         """

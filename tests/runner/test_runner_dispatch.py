@@ -6270,12 +6270,11 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
 @pytest.mark.asyncio
 async def test_sys_session_create_spawns_child_under_caller() -> None:
     """
-    ``sys_session_create`` POSTs a JSON create with
-    ``parent_session_id`` forced to the caller (child-only), passes the
-    agent_id, title, and a queued initial message, and returns a handle
-    carrying the new child's id. If parent_session_id weren't forced to
-    the caller, an orchestrator could create top-level/sibling sessions —
-    so the asserted request body is the security-critical check.
+    Default ``sys_session_create`` POSTs a JSON create with
+    ``parent_session_id`` forced to the caller, passes the agent_id, title,
+    and a queued initial message, and returns a handle carrying the new
+    child's id. Only explicit-host detached mode may omit the parent, so the
+    asserted default request body protects ordinary spawn behavior.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -6388,6 +6387,91 @@ async def test_sys_session_create_targets_host_then_posts_first_message() -> Non
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_detaches_explicit_host_from_parent_rail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detached cloud dispatch creates a top-level session with no child event."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+    registered: list[str] = []
+    published: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **_kwargs: registered.append(child_id),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append((request.method, request.url.path, body))
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_detached",
+                    "agent_id": "ag_x",
+                    "agent_name": "claude-native-ui",
+                    "status": "idle",
+                    "host_id": "host_ypbox1",
+                    "workspace": "/workspace/.worktrees/detached",
+                    "git_branch": "omni/detached-a1b2",
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_detached/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "title": "independent task",
+                    "message": "implement it independently",
+                    "host_id": "host_ypbox1",
+                    "workspace": "/workspace/omnigent",
+                    "branch_name": "omni/detached-a1b2",
+                    "base_branch": "origin/main",
+                    "detached": True,
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent",
+            publish_event=_capturing_publish_event(published),
+        )
+
+    assert [entry[1] for entry in requests] == [
+        "/v1/sessions",
+        "/v1/sessions/conv_detached/events",
+    ]
+    create_body = requests[0][2]
+    assert "parent_session_id" not in create_body
+    assert create_body["host_id"] == "host_ypbox1"
+    assert create_body["workspace"] == "/workspace/omnigent"
+    assert create_body["git"] == {
+        "branch_name": "omni/detached-a1b2",
+        "base_branch": "origin/main",
+    }
+    assert registered == []
+    assert published == []
+
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_detached"
+    assert handle["kind"] == "default"
+    assert handle["detached"] is True
+    assert handle["parent_session_id"] is None
+    assert handle["host_id"] == "host_ypbox1"
+    assert handle["workspace"] == "/workspace/.worktrees/detached"
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_rejects_placement_for_config_upload() -> None:
     """Bundle mode cannot silently discard explicit remote placement."""
     from omnigent.runner.tool_dispatch import execute_tool
@@ -6413,8 +6497,65 @@ async def test_sys_session_create_rejects_placement_for_config_upload() -> None:
         )
 
     assert json.loads(output)["error"] == (
-        "host placement is supported only with existing-agent agent_id mode"
+        "host placement and detached mode are supported only with existing-agent agent_id mode"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (
+            {"agent_id": "ag_x", "detached": True},
+            "'detached' requires existing-agent host_id and workspace placement",
+        ),
+        (
+            {"config_path": "helper.yaml", "detached": True},
+            (
+                "host placement and detached mode are supported only with "
+                "existing-agent agent_id mode"
+            ),
+        ),
+        (
+            {"agent_id": "ag_x", "detached": "true"},
+            "'detached' must be a boolean",
+        ),
+    ],
+)
+async def test_sys_session_create_rejects_invalid_detached_mode(
+    arguments: dict[str, Any],
+    expected: str,
+) -> None:
+    """Detached mode is narrow: boolean, existing agent, explicit host."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_parent",
+        )
+
+    assert json.loads(output)["error"] == expected
+
+
+def test_sys_session_create_schema_advertises_detached_host_mode() -> None:
+    """The model sees the opt-in that cloud dispatch depends on."""
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+    function = SysSessionCreateTool().get_schema()["function"]
+    detached = function["parameters"]["properties"]["detached"]
+
+    assert detached["type"] == "boolean"
+    assert "top-level session" in detached["description"]
+    assert "host_id and workspace" in detached["description"]
 
 
 @pytest.mark.asyncio

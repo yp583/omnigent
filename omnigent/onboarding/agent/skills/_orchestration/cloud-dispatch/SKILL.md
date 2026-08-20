@@ -1,14 +1,16 @@
 ---
 name: cloud-dispatch
-description: Dispatch durable Codex or Claude Omnigent child sessions to connected Coder boxes, including an explicitly selected box, using isolated git worktrees.
+description: Dispatch durable, independent Codex or Claude Omnigent sessions to connected Coder boxes using isolated git worktrees.
 ---
 
 # Omnigent Cloud Dispatch
 
 Use this skill when the user asks to run coding work in the cloud, on a Coder
 box, on another host, or as a multi-box fan-out. In Omnigent, **cloud
-dispatch means an Omnigent child session on a connected Coder workspace**. It
-does not mean `claude --remote`, claude.ai Tasks, or a local background task.
+dispatch means an independent, top-level Omnigent session on a connected Coder
+workspace**. It does not mean `claude --remote`, claude.ai Tasks, or a local
+background task. The dispatched session belongs in the main session list, not
+under the current chat's sub-agent rail.
 
 This workflow requires `sys_agent_list`, `sys_coder_hosts`, and
 `sys_session_create`. If any is unavailable, explain that the current session
@@ -100,9 +102,10 @@ Use only the returned `workspace_path`; never use
 For each task:
 
 1. Generate a unique branch named `omni/<task-slug>-<short-random-suffix>`.
-2. Call `sys_session_create` with the selected existing `agent_id`, `host_id`,
-   verified absolute `workspace_path` as `workspace`, generated `branch_name`,
-   exact `base_branch`, concise `title`, and complete task as `message`.
+2. Call `sys_session_create` with `detached: true`, the selected existing
+   `agent_id`, `host_id`, verified absolute `workspace_path` as `workspace`,
+   generated `branch_name`, exact `base_branch`, concise `title`, and complete
+   task as `message`. Never omit `detached: true` for cloud dispatch.
 3. Include this safety boundary in the message:
 
    > Work only inside the isolated worktree created for this session. Do not
@@ -114,8 +117,10 @@ For each task:
    `placement_unavailable`, or a host disconnect. Do not retry another host
    when the user selected a box.
 5. Report the returned conversation ID, provider and harness, selected box,
-   host ID, branch, and worktree. Monitor later with
-   `sys_session_get_info` or `sys_session_get_history` when requested.
+   host ID, branch, and worktree. Explain that it is an independent session in
+   the main session list and will not report completion into the current chat.
+   Monitor later with `sys_session_get_info` or `sys_session_get_history` when
+   requested.
 
 ## Safety
 

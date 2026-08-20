@@ -1,6 +1,6 @@
 # Coder-backed cloud dispatch
 
-Omnigent can place durable child sessions on connected Coder workspaces
+Omnigent can place durable, independent sessions on connected Coder workspaces
 without running its own host resource-telemetry service. Coder remains the
 source for dashboard metadata; Omni supplies session authorization, host
 launch, and git worktree lifecycle.
@@ -23,14 +23,17 @@ An orchestrator with `spawn: true` receives two framework-owned capabilities:
   eligible host (or honors an explicit box selection), and calls the existing
   `sys_session_create` tool with that host, the verified source repository,
   and a unique branch. Omni's existing worktree protocol creates an isolated
-  checkout and starts the child runner in it.
+  checkout and starts a detached top-level runner in it.
 
 `coder-dispatch` is a compatibility alias for `cloud-dispatch` and is expected
 to be removed in v0.12.0. This workflow does not use Claude's hosted
 `claude --remote` service.
 
-Explicit host placement intentionally bypasses normal parent-runner affinity.
-An untargeted child still inherits its parent's runner exactly as before.
+Cloud dispatch uses explicit host placement with `detached=true`. The session
+therefore appears in the owner's main session list and does not register in the
+dispatching chat's child rail or completion inbox. Ordinary untargeted
+`sys_session_create` calls remain child sessions and inherit their parent's
+runner exactly as before.
 
 ## Coder and host setup
 
@@ -99,10 +102,11 @@ name. A pinned dispatch never silently falls back to another box.
 - Coder tokens are kept in process memory and never logged or returned.
 - SSH executes one fixed, input-free probe; task text is never interpolated
   into the command.
-- Remote sessions are child-only and still pass the existing agent, host,
-  workspace, and worktree authorization checks.
+- Detached remote sessions are limited to existing-agent explicit-host
+  placement and still pass the existing user, agent, host, workspace, and
+  worktree authorization checks.
 - The Codex/Claude-only rule is workflow policy in `cloud-dispatch`; the
-  underlying discovery and child-create tools remain generic orchestration
+  underlying discovery and session-create tools remain generic orchestration
   primitives and do not enforce a provider allowlist themselves.
 - Dispatch does not authorize commits, pushes, pull requests, merges, or
   deployments. Those remain explicit human actions.

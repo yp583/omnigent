@@ -122,6 +122,8 @@ def test_cloud_dispatch_skill_pins_provider_box_and_safety_contract() -> None:
     assert "Never reroute a pinned dispatch" in content
     assert "Refuse `pi`" in content
     assert "isolated worktree" in content
+    assert "`detached: true`" in content
+    assert "main session list" in content
 
 
 def test_coder_dispatch_alias_names_removal_version() -> None:
