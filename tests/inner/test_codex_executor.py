@@ -3320,6 +3320,28 @@ def test_clean_codex_env_deny_wins_over_extra_allow(monkeypatch):
     assert "OPENAI_API_KEY" not in _clean_codex_env(["OPENAI_API_KEY"])
 
 
+def test_clean_codex_env_uses_explicit_session_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent in-process sessions do not read ambient launch values."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("HOME", "/ambient/home")
+    env = _clean_codex_env(
+        source={
+            "HOME": "/session/home",
+            "PATH": "/session/bin",
+            "HARNESS_CODEX_MINIMAL_CONFIG": "1",
+            "OPENAI_API_KEY": "must-not-leak",
+        }
+    )
+
+    assert env["HOME"] == "/session/home"
+    assert env["PATH"] == "/session/bin"
+    assert env["HARNESS_CODEX_MINIMAL_CONFIG"] == "1"
+    assert "OPENAI_API_KEY" not in env
+
+
 def test_declared_passthrough_reads_sandbox_env_passthrough():
     # Codex consumes the shared helper in agent_env rather than keeping its own
     # copy; this still covers the codex spawn path's source of extra_allowed.

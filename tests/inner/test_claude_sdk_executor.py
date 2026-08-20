@@ -1636,6 +1636,63 @@ class TestSkillsFilterTranslation(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestStrictMCPConfig(unittest.TestCase):
+    def test_ambient_mcp_behavior_is_preserved_by_default(self) -> None:
+        from omnigent.inner.claude_sdk_executor import (
+            _STRICT_MCP_CONFIG_ENV,
+            _strict_mcp_config_enabled,
+            _strict_mcp_config_options,
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(_STRICT_MCP_CONFIG_ENV, None)
+            self.assertFalse(_strict_mcp_config_enabled())
+            self.assertEqual(_strict_mcp_config_options(), {})
+
+    def test_strict_mcp_is_explicitly_opt_in(self) -> None:
+        from omnigent.inner.claude_sdk_executor import (
+            _STRICT_MCP_CONFIG_ENV,
+            _strict_mcp_config_enabled,
+            _strict_mcp_config_options,
+        )
+
+        with patch.dict(os.environ, {_STRICT_MCP_CONFIG_ENV: "true"}):
+            self.assertTrue(_strict_mcp_config_enabled())
+            self.assertEqual(_strict_mcp_config_options(), {"strict_mcp_config": True})
+
+
+class TestConnectTimeoutConfig(unittest.TestCase):
+    def test_connect_timeout_preserves_default(self) -> None:
+        from omnigent.inner.claude_sdk_executor import (
+            _CONNECT_TIMEOUT_ENV,
+            _CONNECT_TIMEOUT_SECONDS,
+            _connect_timeout_seconds,
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(_CONNECT_TIMEOUT_ENV, None)
+            self.assertEqual(_connect_timeout_seconds(), _CONNECT_TIMEOUT_SECONDS)
+
+    def test_connect_timeout_accepts_positive_override(self) -> None:
+        from omnigent.inner.claude_sdk_executor import (
+            _CONNECT_TIMEOUT_ENV,
+            _connect_timeout_seconds,
+        )
+
+        with patch.dict(os.environ, {_CONNECT_TIMEOUT_ENV: "180"}):
+            self.assertEqual(_connect_timeout_seconds(), 180.0)
+
+    def test_connect_timeout_rejects_invalid_override(self) -> None:
+        from omnigent.inner.claude_sdk_executor import (
+            _CONNECT_TIMEOUT_ENV,
+            _CONNECT_TIMEOUT_SECONDS,
+            _connect_timeout_seconds,
+        )
+
+        with patch.dict(os.environ, {_CONNECT_TIMEOUT_ENV: "0"}):
+            self.assertEqual(_connect_timeout_seconds(), _CONNECT_TIMEOUT_SECONDS)
+
+
 class TestStreamEventStreaming(unittest.TestCase):
     def test_live_clients_are_reused_per_omnigent_session(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -1678,6 +1735,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                             "tools": getattr(self.options, "tools", None),
                             "allowed_tools": getattr(self.options, "allowed_tools", None),
                             "env": getattr(self.options, "env", None),
+                            "strict_mcp_config": getattr(self.options, "strict_mcp_config", None),
                         }
                     )
                     result_session_id = (
@@ -1718,6 +1776,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch"])
             self.assertEqual(query_calls[0]["env"]["ENABLE_TOOL_SEARCH"], "true")
             self.assertEqual(query_calls[0]["allowed_tools"], [])
+            self.assertIsNone(query_calls[0]["strict_mcp_config"])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
             self.assertEqual(query_calls[2]["session_id"], "session-a")
             self.assertEqual(len(connect_calls), 2)

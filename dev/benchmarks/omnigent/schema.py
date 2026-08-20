@@ -25,7 +25,10 @@ import subprocess
 # ``http_requests``, ``"METHOD /route" -> count``); ``summary`` gains a
 # ``network_routes`` appendix (``[{route, requests, per_op}]`` sorted by
 # ``per_op`` desc) when any run recorded a breakdown.
-SCHEMA_VERSION = 6
+# v7: Linux ``resource_usage`` now measures and attributes the complete
+# Omnigent process tree with raw PSS/USS/RSS/CPU/process/thread/FD samples.
+# The legacy top-level CPU/RSS summaries remain for dashboard compatibility.
+SCHEMA_VERSION = 7
 
 
 def _git(*args: str) -> str:
@@ -88,8 +91,9 @@ def build_report(
         mock_llm) for provenance.
     :param harness: Harness driving full-turn journeys, e.g.
         ``"openai-agents"``.
-    :param resource_usage: Optional server-process CPU/memory stats collected
-        during the run (see :meth:`BenchEnvironment.resource_usage`).
+    :param resource_usage: Optional whole-process-tree resource stats collected
+        during the run (server-only RSS fallback off Linux; see
+        :meth:`BenchEnvironment.resource_usage`).
     :returns: The JSON-serializable report document.
     """
     return {

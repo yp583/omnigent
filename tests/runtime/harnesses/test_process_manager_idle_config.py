@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 
 from omnigent.runtime.harnesses.process_manager import (
+    _CHILD_HARNESS_IDLE_TIMEOUT_ENV,
+    _DEFAULT_CHILD_HARNESS_IDLE_TIMEOUT_S,
     _DEFAULT_IDLE_TIMEOUT_S,
     _HARNESS_IDLE_TIMEOUT_ENV,
     HarnessProcessManager,
@@ -52,3 +54,38 @@ def test_manager_explicit_value_overrides_env(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setenv(_HARNESS_IDLE_TIMEOUT_ENV, "1800")
     mgr = HarnessProcessManager(idle_timeout_s=42.0, tmp_parent=tmp_path)
     assert mgr._idle_timeout_s == 42.0
+
+
+def test_child_hibernation_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.delenv(_CHILD_HARNESS_IDLE_TIMEOUT_ENV, raising=False)
+    mgr = HarnessProcessManager(idle_timeout_s=3600.0, tmp_parent=tmp_path)
+    mgr.register_session_tree("root", root_session_id="root", parent_session_id=None)
+    mgr.register_session_tree("child", root_session_id="root", parent_session_id="root")
+
+    assert mgr._idle_timeout_for("root") == 3600.0
+    assert _DEFAULT_CHILD_HARNESS_IDLE_TIMEOUT_S == 0.0
+    assert mgr._idle_timeout_for("child") == 3600.0
+    snapshot = mgr.resource_diagnostics()
+    assert snapshot["child_idle_timeout_seconds"] == _DEFAULT_CHILD_HARNESS_IDLE_TIMEOUT_S
+
+
+def test_child_sessions_use_opt_in_shorter_idle_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv(_CHILD_HARNESS_IDLE_TIMEOUT_ENV, "120")
+    mgr = HarnessProcessManager(idle_timeout_s=3600.0, tmp_parent=tmp_path)
+    mgr.register_session_tree("child", root_session_id="root", parent_session_id="root")
+
+    assert mgr._idle_timeout_for("child") == 120.0
+
+
+def test_zero_child_window_falls_back_to_main_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv(_CHILD_HARNESS_IDLE_TIMEOUT_ENV, "0")
+    mgr = HarnessProcessManager(idle_timeout_s=3600.0, tmp_parent=tmp_path)
+    mgr.register_session_tree("child", root_session_id="root", parent_session_id="root")
+
+    assert mgr._idle_timeout_for("child") == 3600.0

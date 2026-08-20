@@ -20,7 +20,7 @@ import logging
 import os
 import shutil
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 
@@ -74,6 +74,7 @@ def resolve_cli_binary(
     *,
     env_var: str | None = None,
     which: Callable[[str], str | None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> str | None:
     """Resolve a CLI binary that may live off the process ``PATH``.
 
@@ -90,11 +91,22 @@ def resolve_cli_binary(
     :param which: PATH-lookup hook, defaulting to :func:`shutil.which`. The
         native harness resolvers thread their own test seam through here; the
         fallback ladder always uses the real filesystem.
+    :param env: Environment used for the override and ``PATH`` lookup. Defaults
+        to :data:`os.environ`.
     :returns: An absolute path to the executable, or ``None``.
     """
-    which = shutil.which if which is None else which
+    env_source = os.environ if env is None else env
+    if which is None:
+        if env is None:
+            which = shutil.which
+        else:
+            search_path = env_source.get("PATH")
+
+            def which(command: str) -> str | None:
+                return shutil.which(command, path=search_path)
+
     if env_var:
-        override = os.environ.get(env_var, "").strip()
+        override = env_source.get(env_var, "").strip()
         if override:
             resolved = which(override)
             if resolved:

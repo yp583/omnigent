@@ -783,6 +783,44 @@ class _FakeEndpoint:
         pass
 
 
+async def test_child_reaper_waits_for_runner_work_then_hibernates(tmp_path: Path) -> None:
+    """A child init/turn lease blocks reap; clearing it triggers the cache hook."""
+    mgr = HarnessProcessManager(idle_timeout_s=60.0, reaper_interval_s=0.01, tmp_parent=tmp_path)
+    mgr._child_idle_timeout_s = 0.02
+    mgr.register_session_tree("child", root_session_id="root", parent_session_id="root")
+    entry = _SubprocessEntry(
+        _FakeReapProc(),
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "h",  # type: ignore[arg-type]
+    )
+    entry.last_used_at = time.monotonic() - 100.0
+    mgr._entries = {"child": entry}
+    busy = True
+    hibernated: list[str] = []
+    mgr.set_resource_hooks(
+        is_busy=lambda session_id: busy and session_id == "child",
+        on_idle_reap=hibernated.append,
+    )
+
+    reaper = asyncio.create_task(mgr._idle_reaper_loop())
+    try:
+        await asyncio.sleep(0.08)
+        assert not entry.process.killed
+        assert not hibernated
+
+        busy = False
+        deadline = time.monotonic() + 1.0
+        while not entry.process.killed:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.01)
+        assert hibernated == ["child"]
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+
+
 async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> None:
     """A turn that starts while an earlier stale entry tears down is not reaped.
 

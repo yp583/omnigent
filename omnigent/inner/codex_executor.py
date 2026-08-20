@@ -52,6 +52,7 @@ from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
+from .codex_startup_admission import admit_codex_startup
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -329,9 +330,11 @@ def _kill_process_tree(process: _Process | None) -> None:
 _CODEX_PATH_ENV = "OMNIGENT_CODEX_PATH"
 
 
-def _find_codex_cli() -> str | None:
+def _find_codex_cli(env: Mapping[str, str] | None = None) -> str | None:
     """Resolve the ``codex`` CLI binary (override → ``PATH`` → global dirs)."""
-    return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
+    if env is None:
+        return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
+    return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV, env=env)
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -405,7 +408,11 @@ async def _create_subprocess_exec(
     )
 
 
-def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
+def _clean_codex_env(
+    extra_allow: Iterable[str] = (),
+    *,
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
 
@@ -433,7 +440,12 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
+        source=source,
     )
+
+
+class _ExplicitCodexEnvironment(dict[str, str]):
+    """Filtered child environment backed by a caller-owned snapshot."""
 
 
 def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
@@ -688,7 +700,9 @@ def _resolve_codex_home_config_source(source_dir: Path, home_codex_home: Path) -
     return source_dir
 
 
-def _codex_home_config_source_from_env() -> Path:
+def _codex_home_config_source_from_env(
+    env: Mapping[str, str] | None = None,
+) -> Path:
     """
     Return the Codex home whose auth/config should be bridged.
 
@@ -701,9 +715,10 @@ def _codex_home_config_source_from_env() -> Path:
     :returns: Host Codex home to read ``auth.json`` and ``config.toml`` from,
         e.g. ``Path.home() / ".codex"`` or an explicit user ``CODEX_HOME``.
     """
-    home_codex_home = Path.home() / ".codex"
+    env_source = os.environ if env is None else env
+    home_codex_home = Path(env_source.get("HOME") or str(Path.home())) / ".codex"
     return _resolve_codex_home_config_source(
-        Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),
+        Path(env_source.get("CODEX_HOME") or str(home_codex_home)),
         home_codex_home,
     )
 
@@ -715,6 +730,8 @@ def _populate_codex_home_config(
     minimal_config: bool | None = None,
     inject_hooks: bool = False,
     extend_model_catalog: bool = False,
+    codex_path: str | None = None,
+    source_env: Mapping[str, str] | None = None,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -756,12 +773,16 @@ def _populate_codex_home_config(
         its own catalog plus the gateway-only arms. Costs a ``codex debug
         models`` probe, so it is reserved for Smart Routing sessions whose
         turns/spawns can land on such an arm.
+    :param codex_path: Resolved Codex binary for the optional catalog probe.
+    :param source_env: Explicit environment for process-local config flags and
+        the optional catalog probe. Defaults to :data:`os.environ`.
     """
     if not source_dir.is_dir():
         return
 
     if minimal_config is None:
-        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+        env_source = os.environ if source_env is None else source_env
+        minimal_config = env_source.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
             "1",
             "true",
             "yes",
@@ -839,8 +860,16 @@ def _populate_codex_home_config(
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
+                resolved_codex_path = codex_path if source_env is not None else None
+                if resolved_codex_path is None:
+                    resolved_codex_path = (
+                        _find_codex_cli() if source_env is None else _find_codex_cli(source_env)
+                    )
                 catalog_path = write_codex_model_catalog(
-                    target_dir, codex_path=_find_codex_cli(), source_home=source_dir
+                    target_dir,
+                    codex_path=resolved_codex_path,
+                    source_home=source_dir,
+                    source_env=source_env,
                 )
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
@@ -1235,6 +1264,7 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
 #: ``_clean_codex_env``'s filtered copy — so they must be allowed through it or
 #: both features silently never engage on the wrapped ``codex`` harness.
 _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
+    _CODEX_MINIMAL_CONFIG_ENV,
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     CODEX_EXTENDED_CATALOG_ENV_VAR,
@@ -1382,6 +1412,7 @@ def read_codex_model_catalog(
     source_home: Path,
     *,
     timeout: float = 10.0,
+    source_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """
     Ask the codex CLI for its own model catalog, once per host process.
@@ -1396,6 +1427,7 @@ def read_codex_model_catalog(
     :param codex_path: The codex binary.
     :param source_home: ``CODEX_HOME`` to resolve config from.
     :param timeout: Seconds to wait; a slow probe must not delay session boot.
+    :param source_env: Explicit environment for the probe subprocess.
     :returns: ``{"models": [...]}``, or ``None`` on any failure.
     """
     cache_key = _model_catalog_cache_key(codex_path, source_home)
@@ -1408,7 +1440,19 @@ def read_codex_model_catalog(
             if time.monotonic() < failed_until:
                 return None
             del _MODEL_CATALOG_FAILURES[cache_key]
-        catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
+        if source_env is None:
+            catalog = _probe_codex_model_catalog(
+                codex_path,
+                source_home,
+                timeout=timeout,
+            )
+        else:
+            catalog = _probe_codex_model_catalog(
+                codex_path,
+                source_home,
+                timeout=timeout,
+                source_env=source_env,
+            )
         if catalog is None:
             _MODEL_CATALOG_FAILURES[cache_key] = time.monotonic() + _MODEL_CATALOG_FAILURE_TTL_S
             return None
@@ -1421,6 +1465,7 @@ def _probe_codex_model_catalog(
     source_home: Path,
     *,
     timeout: float,
+    source_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Run ``codex debug models``, returning ``None`` on any failure."""
     try:
@@ -1429,7 +1474,10 @@ def _probe_codex_model_catalog(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "CODEX_HOME": str(source_home)},
+            env={
+                **(os.environ if source_env is None else source_env),
+                "CODEX_HOME": str(source_home),
+            },
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1458,6 +1506,7 @@ def write_codex_model_catalog(
     *,
     codex_path: str | None,
     source_home: Path,
+    source_env: Mapping[str, str] | None = None,
 ) -> Path | None:
     """
     Give the session a model catalog its ``spawn_agent`` can route across.
@@ -1474,11 +1523,19 @@ def write_codex_model_catalog(
     :param target_dir: The per-session private ``CODEX_HOME``.
     :param codex_path: The codex binary, or ``None`` when unresolved.
     :param source_home: ``CODEX_HOME`` the probe should resolve config from.
+    :param source_env: Explicit environment for the probe subprocess.
     :returns: The written catalog path, or ``None`` when nothing was written.
     """
     if codex_path is None:
         return None
-    catalog = read_codex_model_catalog(codex_path, source_home)
+    if source_env is None:
+        catalog = read_codex_model_catalog(codex_path, source_home)
+    else:
+        catalog = read_codex_model_catalog(
+            codex_path,
+            source_home,
+            source_env=source_env,
+        )
     if catalog is None:
         return None
     extended = extended_model_catalog(catalog)
@@ -2088,7 +2145,13 @@ class _CodexAppServerSession:
         # definitions) from ``$CODEX_HOME``; without this step a freshly-
         # created temp dir has neither, causing 401 Unauthorized errors
         # for subscription-authenticated users.
-        config_source = _codex_home_config_source_from_env()
+        source_env: Mapping[str, str] | None = (
+            self._env if isinstance(self._env, _ExplicitCodexEnvironment) else None
+        )
+        if source_env is None:
+            config_source = _codex_home_config_source_from_env()
+        else:
+            config_source = _codex_home_config_source_from_env(source_env)
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness
@@ -2114,6 +2177,8 @@ class _CodexAppServerSession:
             config_source,
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
+            codex_path=self._codex_path,
+            source_env=source_env,
         )
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
@@ -2131,33 +2196,36 @@ class _CodexAppServerSession:
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
         try:
-            argv = [self._codex_path, "app-server"]
-            for override in self._codex_config_overrides:
-                argv.extend(["-c", override])
-            self._proc = await _create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-                **_proc.spawn_kwargs(),
-                cwd=self._cwd or os.getcwd(),
-            )
-            self._reader_task = asyncio.create_task(self._reader_loop())
-            self._stderr_task = asyncio.create_task(self._stderr_loop())
-            await self._request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "omnigent",
-                        "version": "0.1",
+            async with admit_codex_startup() as queued_seconds:
+                argv = [self._codex_path, "app-server"]
+                for override in self._codex_config_overrides:
+                    argv.extend(["-c", override])
+                self._proc = await _create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=proc_env,
+                    **_proc.spawn_kwargs(),
+                    cwd=self._cwd or os.getcwd(),
+                )
+                self._reader_task = asyncio.create_task(self._reader_loop())
+                self._stderr_task = asyncio.create_task(self._stderr_loop())
+                await self._request(
+                    "initialize",
+                    {
+                        "clientInfo": {
+                            "name": "omnigent",
+                            "version": "0.1",
+                        },
+                        "capabilities": {
+                            "experimentalApi": True,
+                        },
                     },
-                    "capabilities": {
-                        "experimentalApi": True,
-                    },
-                },
-            )
-            self._started = True
+                )
+                self._started = True
+            if queued_seconds >= 1.0:
+                logger.info("Codex app-server startup admitted after %.1fs", queued_seconds)
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
                 # routing hooks need the trust handshake to be enforced.
@@ -2978,6 +3046,7 @@ class CodexExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        source_env: Mapping[str, str] | None = None,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -3050,7 +3119,11 @@ class CodexExecutor(Executor):
             empty so Codex sees no skills; a list exposes only the
             named skills (looked up across all sources, bundle wins
             on name conflict).
+        :param source_env: Immutable launch environment for this executor.
+            Defaults to :data:`os.environ`; in-process adapters pass their
+            per-session snapshot to preserve subprocess-style isolation.
         """
+        source_env_snapshot = dict(os.environ if source_env is None else source_env)
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
@@ -3068,7 +3141,7 @@ class CodexExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
-        resolved_codex = codex_path or _find_codex_cli()
+        resolved_codex = codex_path or _find_codex_cli(source_env_snapshot)
         if not resolved_codex:
             raise ImportError(
                 "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
@@ -3076,7 +3149,15 @@ class CodexExecutor(Executor):
                 f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
             )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
+        filtered_env = _clean_codex_env(
+            declared_passthrough(self._os_env_spec),
+            source=source_env_snapshot,
+        )
+        self._env: dict[str, str]
+        if source_env is None:
+            self._env = filtered_env
+        else:
+            self._env = _ExplicitCodexEnvironment(filtered_env)
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()

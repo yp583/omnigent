@@ -219,6 +219,19 @@ def test_resolve_harness_path_canonical_env_wins(monkeypatch: pytest.MonkeyPatch
     assert resolve_harness_path("codex") == "/canonical/codex"
 
 
+def test_resolve_harness_path_uses_explicit_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/ambient/codex")
+    assert (
+        resolve_harness_path(
+            "codex",
+            env={"OMNIGENT_CODEX_PATH": "/session/codex"},
+        )
+        == "/session/codex"
+    )
+
+
 def test_resolve_harness_path_legacy_env_warns(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
     """A legacy ``HARNESS_<NAME>_PATH`` value is returned + a deprecation warning."""
     from omnigent.harness_startup_config import _LEGACY_PATH_WARNED

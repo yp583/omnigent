@@ -1,5 +1,5 @@
 """
-Per-conversation harness subprocess lifecycle.
+Per-conversation harness runtime lifecycle.
 
 Owns the contract from §Process management of
 ``designs/SERVER_HARNESS_CONTRACT.md``: one subprocess per AP
@@ -9,12 +9,11 @@ reaper for abandoned subprocesses, crash detection, and AP-startup
 orphan sweep so a previous Omnigent crash doesn't leave runner processes
 behind.
 
-This module knows nothing about the harness API — it spawns a
-:mod:`omnigent.runtime.harnesses._runner` subprocess per
-conversation and hands callers an ``httpx.AsyncClient`` pointed at
-the per-conversation Unix socket. Everything HTTP-shaped is in
-:mod:`omnigent.server.schemas`; everything FastAPI-shaped is in
-the per-harness ``create_app()`` factories.
+Most harnesses run in a :mod:`omnigent.runtime.harnesses._runner`
+subprocess. Explicitly safe official adapters may instead run in the owning
+runner process behind the same HTTP/SSE contract. Everything
+HTTP-shaped is in :mod:`omnigent.server.schemas`; everything FastAPI-shaped
+is in the per-harness factories.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,7 +41,12 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.inner.startup_admission import (
+    StartupAdmission,
+    resolve_startup_capacity,
+    scoped_admission_namespace,
+)
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR, strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
@@ -115,6 +119,79 @@ _DEFAULT_REAPER_INTERVAL_S = 60
 # without code changes (mirrors the runner-level ``runner.idle_timeout_s``).
 # ``0`` disables harness reaping entirely.
 _HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
+_CHILD_HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_CHILD_HARNESS_IDLE_TIMEOUT_S"
+# Disabled by default until every supported harness passes resume conformance.
+# Operators may opt into a shorter child-only window after validating their
+# harness/version matrix; ``0`` falls back to the main idle window.
+_DEFAULT_CHILD_HARNESS_IDLE_TIMEOUT_S = 0.0
+
+# Importing and binding a harness worker is bursty CPU and filesystem work even
+# when its vendor SDK has not started yet. Bound that phase independently from
+# provider-specific handshakes so a large sub-agent fan-out cannot launch dozens
+# of Python workers at once. Queue time is outside the worker's bind timeout.
+_HARNESS_STARTUP_CONCURRENCY_ENV = "OMNIGENT_HARNESS_STARTUP_CONCURRENCY"
+_DEFAULT_HARNESS_STARTUP_CONCURRENCY = 6
+_HARNESS_STARTUP_ADMISSION = StartupAdmission(
+    "harness-worker",
+    resolve_startup_capacity(
+        _HARNESS_STARTUP_CONCURRENCY_ENV,
+        _DEFAULT_HARNESS_STARTUP_CONCURRENCY,
+    ),
+)
+
+# Official adapters with explicit per-session state can run in the owning
+# runner process and remove one redundant Python/uvicorn worker per session.
+# The empty default preserves the current topology.
+_IN_PROCESS_HARNESSES_ENV = "OMNIGENT_IN_PROCESS_HARNESSES"
+# Compatibility alias for the initial native-only rollout flag.
+_IN_PROCESS_NATIVE_HARNESSES_ENV = "OMNIGENT_IN_PROCESS_NATIVE_HARNESSES"
+
+
+def _parse_in_process_allowlist(
+    raw: str,
+    supported: frozenset[str],
+    *,
+    env_name: str,
+) -> frozenset[str]:
+    """Parse one in-process adapter allowlist."""
+    if not raw.strip():
+        return frozenset()
+    if raw.strip().lower() in {"1", "true", "yes", "all"}:
+        return supported
+    requested = frozenset(part.strip() for part in raw.split(",") if part.strip())
+    unknown = requested - supported
+    if unknown:
+        _logger.warning(
+            "%s contains unsupported harnesses %s; ignoring them",
+            env_name,
+            sorted(unknown),
+        )
+    return requested & supported
+
+
+def _resolve_in_process_harnesses() -> frozenset[str]:
+    """Resolve official adapters hosted in the owning runner process."""
+    from omnigent.runtime.harnesses.in_process_backend import (
+        IN_PROCESS_HARNESSES,
+        IN_PROCESS_NATIVE_HARNESSES,
+    )
+
+    configured = _parse_in_process_allowlist(
+        os.environ.get(_IN_PROCESS_HARNESSES_ENV, ""),
+        IN_PROCESS_HARNESSES,
+        env_name=_IN_PROCESS_HARNESSES_ENV,
+    )
+    legacy_native = _parse_in_process_allowlist(
+        os.environ.get(_IN_PROCESS_NATIVE_HARNESSES_ENV, ""),
+        IN_PROCESS_NATIVE_HARNESSES,
+        env_name=_IN_PROCESS_NATIVE_HARNESSES_ENV,
+    )
+    return configured | legacy_native
+
+
+def _resolve_in_process_native_harnesses() -> frozenset[str]:
+    """Compatibility wrapper for the initial resolver name."""
+    return _resolve_in_process_harnesses()
 
 
 def _resolve_harness_idle_timeout_s() -> float:
@@ -146,6 +223,26 @@ def _resolve_harness_idle_timeout_s() -> float:
             _DEFAULT_IDLE_TIMEOUT_S,
         )
         return float(_DEFAULT_IDLE_TIMEOUT_S)
+    return value
+
+
+def _resolve_child_harness_idle_timeout_s() -> float:
+    """Resolve the shorter idle window used for rehydratable child agents."""
+    raw = os.environ.get(_CHILD_HARNESS_IDLE_TIMEOUT_ENV)
+    if not raw:
+        return _DEFAULT_CHILD_HARNESS_IDLE_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if value < 0:
+        _logger.warning(
+            "%s=%r is invalid; using default %ss",
+            _CHILD_HARNESS_IDLE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_CHILD_HARNESS_IDLE_TIMEOUT_S,
+        )
+        return _DEFAULT_CHILD_HARNESS_IDLE_TIMEOUT_S
     return value
 
 
@@ -465,17 +562,23 @@ class _SubprocessEntry:
 
     def __init__(
         self,
-        process: asyncio.subprocess.Process | Any,
+        process: asyncio.subprocess.Process | Any | None,
         client: httpx.AsyncClient,
-        endpoint: _HarnessEndpoint,
+        endpoint: _HarnessEndpoint | None,
         harness: str,
         model: str | None = None,
+        startup_queue_seconds: float = 0.0,
+        backend: str = "subprocess",
+        shutdown: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.process = process
         self.client = client
         self.endpoint = endpoint
         self.harness = harness
         self.model = model
+        self.startup_queue_seconds = startup_queue_seconds
+        self.backend = backend
+        self.shutdown = shutdown
         self.last_used_at: float = 0.0
 
 
@@ -557,6 +660,7 @@ class HarnessProcessManager:
             idle_timeout_s if idle_timeout_s is not None else _resolve_harness_idle_timeout_s()
         )
         self._reaper_interval_s = reaper_interval_s
+        self._child_idle_timeout_s = _resolve_child_harness_idle_timeout_s()
         self._tmp_parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
         # Pre-allocate the instance dir path so it stays stable
         # across re-entrant ``start()`` calls (idempotent boot).
@@ -574,6 +678,10 @@ class HarnessProcessManager:
         # and the idle reaper skips any conversation present here so an
         # actively-streaming turn is never reaped mid-flight.
         self._in_flight_response_ids: dict[str, str] = {}
+        self._session_resource_roots: dict[str, str] = {}
+        self._child_sessions: set[str] = set()
+        self._session_busy: Callable[[str], bool] | None = None
+        self._on_idle_reap: Callable[[str], None] | None = None
         # Per-conversation spawn lock — see §Process management:
         # Spawn lock. The lock guards the lazy-init window in
         # ``get_client``; uncontested after the first spawn for a
@@ -601,6 +709,16 @@ class HarnessProcessManager:
         # first failure so we fall back to a direct exec for the process's life.
         self._harness_zygote = HarnessZygoteClient.from_env()
         self._harness_zygote_disabled = False
+        self._in_process_harnesses = _resolve_in_process_harnesses()
+        resource_root = os.environ.get(RUNNER_ID_ENV_VAR, "").strip()
+        self._root_startup_admission = (
+            StartupAdmission(
+                scoped_admission_namespace("harness-root", resource_root),
+                1,
+            )
+            if resource_root and _HARNESS_STARTUP_ADMISSION.capacity > 0
+            else None
+        )
         # Hook called when a mid-response entry is respawned (model/harness switch).
         # Only fires when the replaced process had an in-flight response; invoked
         # outside the spawn lock so the callback can re-enter get_client without deadlock.
@@ -620,6 +738,45 @@ class HarnessProcessManager:
             runner is wired).
         """
         self._on_harness_respawn = hook
+
+    def set_resource_hooks(
+        self,
+        *,
+        is_busy: Callable[[str], bool] | None,
+        on_idle_reap: Callable[[str], None] | None,
+    ) -> None:
+        """Wire runner lifecycle state into safe hibernation decisions."""
+        self._session_busy = is_busy
+        self._on_idle_reap = on_idle_reap
+
+    def register_session_tree(
+        self,
+        conversation_id: str,
+        *,
+        root_session_id: str | None,
+        parent_session_id: str | None,
+    ) -> None:
+        """Attribute a conversation to its top-level resource root."""
+        self._session_resource_roots[conversation_id] = (
+            root_session_id or parent_session_id or conversation_id
+        )
+        if parent_session_id:
+            self._child_sessions.add(conversation_id)
+        else:
+            self._child_sessions.discard(conversation_id)
+
+    def forget_session_tree(self, conversation_id: str) -> None:
+        """Drop resource ownership metadata when a session is deleted."""
+        self._session_resource_roots.pop(conversation_id, None)
+        self._child_sessions.discard(conversation_id)
+
+    def _idle_timeout_for(self, conversation_id: str) -> float:
+        if conversation_id not in self._child_sessions or self._child_idle_timeout_s <= 0:
+            return self._idle_timeout_s
+        return min(self._idle_timeout_s, self._child_idle_timeout_s)
+
+    def _is_session_busy(self, conversation_id: str) -> bool:
+        return self._session_busy is not None and self._session_busy(conversation_id)
 
     @property
     def instance_dir(self) -> Path:
@@ -762,7 +919,11 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
-            if entry is not None and entry.process.returncode is not None:
+            if (
+                entry is not None
+                and entry.process is not None
+                and entry.process.returncode is not None
+            ):
                 # Prior subprocess died; drop the stale entry and
                 # respawn below. The dead client is closed on
                 # next ``release`` / ``shutdown`` — leaving it in
@@ -989,6 +1150,36 @@ class HarnessProcessManager:
         """
         return conversation_id in self._in_flight_response_ids
 
+    def resource_diagnostics(self) -> dict[str, object]:
+        """Return payload-free ownership metadata for resident harness workers."""
+        now = time.monotonic()
+        entries = [
+            {
+                "conversation_id": conversation_id,
+                "root_session_id": self._session_resource_roots.get(
+                    conversation_id, conversation_id
+                ),
+                "is_child": conversation_id in self._child_sessions,
+                "harness": entry.harness,
+                "pid": getattr(entry.process, "pid", None),
+                "backend": entry.backend,
+                "in_flight": conversation_id in self._in_flight_response_ids,
+                "idle_seconds": max(0.0, now - entry.last_used_at),
+                "startup_queue_seconds": entry.startup_queue_seconds,
+                "idle_timeout_seconds": self._idle_timeout_for(conversation_id),
+            }
+            for conversation_id, entry in self._entries.items()
+        ]
+        entries.sort(key=lambda row: (-float(row["idle_seconds"]), str(row["conversation_id"])))
+        return {
+            "resident_count": len(entries),
+            "in_flight_count": len(self._in_flight_response_ids),
+            "idle_timeout_seconds": self._idle_timeout_s,
+            "child_idle_timeout_seconds": self._child_idle_timeout_s,
+            "startup_capacity": _HARNESS_STARTUP_ADMISSION.capacity,
+            "entries": entries,
+        }
+
     def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
         """
         Record that *conversation_id* has a live harness turn.
@@ -1076,6 +1267,7 @@ class HarnessProcessManager:
                         current is None
                         or current.last_used_at > only_if_idle_cutoff
                         or conversation_id in self._in_flight_response_ids
+                        or self._is_session_busy(conversation_id)
                     ):
                         _logger.info(
                             "skipping idle reap for conversation %s: entry became "
@@ -1093,6 +1285,8 @@ class HarnessProcessManager:
             if entry is None:
                 return
             await self._close_entry(entry)
+            if only_if_idle_cutoff is not None and self._on_idle_reap is not None:
+                self._on_idle_reap(conversation_id)
 
     async def shutdown(self) -> None:
         """
@@ -1171,19 +1365,35 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        # Always build an explicit env dict (never ``None``): the harness
+        # inherits runner PATH/HOME/provider credentials plus per-session
+        # overrides, without the runner's control-plane auth secret.
+        effective_env: dict[str, str] = _build_harness_spawn_env(env)
+        if harness in self._in_process_harnesses:
+            try:
+                return await self._spawn_in_process_entry(
+                    conversation_id,
+                    harness,
+                    effective_env,
+                    model=(env or {}).get(_model_env_key(harness)),
+                )
+            except Exception:
+                # The optimized backend is a rollout choice, not a correctness
+                # dependency. Preserve the established isolated-worker path if
+                # initialization, lifespan, or its health probe is incompatible.
+                _logger.exception(
+                    "in-process harness failed; falling back to worker: "
+                    "harness=%s conversation=%s",
+                    harness,
+                    conversation_id,
+                )
+
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
         # would block uvicorn binding. Best-effort delete (UDS only).
         endpoint.cleanup()
 
-        # Always build an explicit env dict (never ``None``): the
-        # subprocess inherits AP's env (PATH, HOME, PYTHONPATH, provider
-        # creds) plus any caller overrides, but the runner's
-        # control-plane auth secret is stripped first so the agent
-        # payload running in the harness can't impersonate the runner.
-        # See ``_build_harness_spawn_env``.
-        effective_env: dict[str, str] = _build_harness_spawn_env(env)
         # S1 (security): on Windows the harness IPC is a loopback-TCP listener
         # reachable by any local process, so mint a fresh per-spawn bearer token
         # as the access boundary the uid-isolated UDS provides on POSIX. This is
@@ -1218,10 +1428,30 @@ class HarnessProcessManager:
             "--parent-pid",
             str(parent_pid),
         ]
-        process = await self._spawn_harness_process(runner_argv, effective_env)
+        async with self._admit_harness_startup() as queued_seconds:
+            process = await self._spawn_harness_process(runner_argv, effective_env)
+            try:
+                await _wait_for_bind(process, endpoint, harness, conversation_id)
+            except BaseException:
+                # The process does not have an entry owner until bind succeeds.
+                if process.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(process.wait())
+                with contextlib.suppress(Exception):
+                    close_subprocess_transport(process)
+                with contextlib.suppress(Exception):
+                    endpoint.cleanup()
+                raise
+        if queued_seconds >= 1.0:
+            _logger.info(
+                "harness worker startup admitted after %.1fs: harness=%s conversation=%s",
+                queued_seconds,
+                harness,
+                conversation_id,
+            )
         try:
-            await _wait_for_bind(process, endpoint, harness, conversation_id)
-
             # ``base_url`` is required for relative-URL routing; the
             # actual host portion is irrelevant under uds transport,
             # but httpx insists on a syntactically-valid URL. The
@@ -1254,6 +1484,7 @@ class HarnessProcessManager:
                 # triggers a respawn in ``get_client`` — the model is a fixed
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
+                startup_queue_seconds=queued_seconds,
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:
@@ -1275,6 +1506,67 @@ class HarnessProcessManager:
             with contextlib.suppress(Exception):
                 endpoint.cleanup()
             raise
+
+    async def _spawn_in_process_entry(
+        self,
+        conversation_id: str,
+        harness: str,
+        effective_env: dict[str, str],
+        *,
+        model: str | None,
+    ) -> _SubprocessEntry:
+        """Build a safe official adapter in the owning runner process."""
+        from omnigent.runtime.harnesses._streaming_asgi_transport import (
+            StreamingASGITransport,
+        )
+        from omnigent.runtime.harnesses.in_process_backend import build_in_process_runtime
+
+        runtime = build_in_process_runtime(
+            harness,
+            conversation_id,
+            effective_env,
+        )
+        await runtime.start()
+        transport = StreamingASGITransport(runtime.app, raise_app_exceptions=False)
+        client = httpx.AsyncClient(
+            transport=transport,
+            base_url="http://harness.local",
+            timeout=httpx.Timeout(5.0, read=None),
+        )
+        try:
+            health = await client.get("/health")
+            health.raise_for_status()
+        except BaseException:
+            await client.aclose()
+            await runtime.close()
+            raise
+        _logger.info(
+            "hosting harness adapter in runner process: harness=%s conversation=%s",
+            harness,
+            conversation_id,
+        )
+        return _SubprocessEntry(
+            process=None,
+            client=client,
+            endpoint=None,
+            harness=harness,
+            model=model,
+            backend="in_process",
+            shutdown=runtime.close,
+        )
+
+    @contextlib.asynccontextmanager
+    async def _admit_harness_startup(self) -> AsyncIterator[float]:
+        """Apply one-per-root and machine-wide worker startup budgets."""
+        root_wait = 0.0
+        if self._root_startup_admission is None:
+            async with _HARNESS_STARTUP_ADMISSION.acquire() as permit:
+                yield permit.wait_seconds
+            return
+        async with self._root_startup_admission.acquire() as root_permit:
+            root_wait = root_permit.wait_seconds
+            async with _HARNESS_STARTUP_ADMISSION.acquire() as permit:
+                yield root_wait + permit.wait_seconds
 
     async def _spawn_harness_process(
         self,
@@ -1319,8 +1611,7 @@ class HarnessProcessManager:
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
         """
-        Close the httpx client, terminate the subprocess, and
-        remove its socket file.
+        Close the client and release its in-process or subprocess backend.
 
         Teardown is best-effort and ordered so the process kill — the
         step that actually reclaims the OS resource — always runs even
@@ -1340,25 +1631,27 @@ class HarnessProcessManager:
             # A broken transport must not skip the subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
         finally:
-            if entry.process.returncode is None:
+            if entry.shutdown is not None:
                 try:
-                    entry.process.send_signal(signal.SIGTERM)
-                    await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                    await entry.shutdown()
                 except Exception:
-                    # Graceful SIGTERM didn't complete — it timed out, or
-                    # send_signal/wait raised (e.g. the process vanished
-                    # mid-teardown). Force-kill best-effort; a process that
-                    # is already gone is already done.
-                    with contextlib.suppress(Exception):
-                        entry.process.kill()
-                        await entry.process.wait()
-            with contextlib.suppress(Exception):
-                close_subprocess_transport(entry.process)
-            # Best-effort socket cleanup. uvicorn's atexit usually
-            # handles this when SIGTERM lands cleanly, but a
-            # hard-killed runner won't. No-op for TCP endpoints.
-            with contextlib.suppress(Exception):
-                entry.endpoint.cleanup()
+                    _logger.exception("error shutting down in-process harness; continuing")
+            if entry.process is not None:
+                if entry.process.returncode is None:
+                    try:
+                        entry.process.send_signal(signal.SIGTERM)
+                        await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                    except Exception:
+                        # Graceful SIGTERM failed; force-kill best-effort.
+                        with contextlib.suppress(Exception):
+                            entry.process.kill()
+                            await entry.process.wait()
+                with contextlib.suppress(Exception):
+                    close_subprocess_transport(entry.process)
+            # In-process entries have no transport endpoint to clean up.
+            if entry.endpoint is not None:
+                with contextlib.suppress(Exception):
+                    entry.endpoint.cleanup()
 
     async def _idle_reaper_loop(self) -> None:
         """
@@ -1412,17 +1705,22 @@ class HarnessProcessManager:
             if self._idle_timeout_s <= 0:
                 continue
             now = time.monotonic()
-            cutoff = now - self._idle_timeout_s
-            stale: list[str] = []
+            stale: list[tuple[str, float]] = []
             # Snapshot under the lock; ``release`` runs outside so I/O can't block writers.
             async with self._registry_lock:
                 for conv_id, entry in self._entries.items():
+                    idle_timeout_s = self._idle_timeout_for(conv_id)
+                    if idle_timeout_s <= 0:
+                        continue
+                    cutoff = now - idle_timeout_s
                     if entry.last_used_at > cutoff:
                         continue
                     if conv_id in self._in_flight_response_ids:
                         continue
-                    stale.append(conv_id)
-            for conv_id in stale:
+                    if self._is_session_busy(conv_id):
+                        continue
+                    stale.append((conv_id, cutoff))
+            for conv_id, cutoff in stale:
                 _logger.info(
                     "reaping idle harness subprocess for conversation %s",
                     conv_id,

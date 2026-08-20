@@ -89,6 +89,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -132,7 +134,11 @@ _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTE
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
 
-def _parse_truthy(env_var: str, default: bool) -> bool:
+def _parse_truthy(
+    env_var: str,
+    default: bool,
+    env: Mapping[str, str] | None = None,
+) -> bool:
     """
     Parse a boolean-style env var the same way the claude-sdk
     wrap does.
@@ -146,13 +152,14 @@ def _parse_truthy(env_var: str, default: bool) -> bool:
         (case-insensitive); ``False`` for any other non-empty
         value; *default* when unset or empty.
     """
-    raw = os.environ.get(env_var, "").strip().lower()
+    source = os.environ if env is None else env
+    raw = source.get(env_var, "").strip().lower()
     if not raw:
         return default
     return raw in _TRUTHY_STRINGS
 
 
-def _resolve_os_env() -> OSEnvSpec:
+def _resolve_os_env(env: Mapping[str, str] | None = None) -> OSEnvSpec:
     """
     Resolve the inner-executor :class:`OSEnvSpec` from env config.
 
@@ -166,7 +173,8 @@ def _resolve_os_env() -> OSEnvSpec:
     :returns: An :class:`OSEnvSpec` to hand to
         :class:`CodexExecutor`.
     """
-    raw = os.environ.get(_ENV_OS_ENV, "").strip()
+    source = os.environ if env is None else env
+    raw = source.get(_ENV_OS_ENV, "").strip()
     if raw:
         try:
             payload = json.loads(raw)
@@ -199,7 +207,7 @@ def _resolve_os_env() -> OSEnvSpec:
     )
 
 
-def _resolve_retry_policy() -> RetryPolicy:
+def _resolve_retry_policy(env: Mapping[str, str] | None = None) -> RetryPolicy:
     """
     Resolve the inner-executor :class:`RetryPolicy` from env config.
 
@@ -215,7 +223,8 @@ def _resolve_retry_policy() -> RetryPolicy:
     :returns: A :class:`RetryPolicy` to hand to
         :class:`CodexExecutor`.
     """
-    raw = os.environ.get(_ENV_RETRY_POLICY, "").strip()
+    source = os.environ if env is None else env
+    raw = source.get(_ENV_RETRY_POLICY, "").strip()
     if not raw:
         return RetryPolicy()
     try:
@@ -229,7 +238,7 @@ def _resolve_retry_policy() -> RetryPolicy:
         return RetryPolicy()
 
 
-def _resolve_skills_filter() -> str | list[str]:
+def _resolve_skills_filter(env: Mapping[str, str] | None = None) -> str | list[str]:
     """
     Resolve the inner-executor ``skills_filter`` from env config.
 
@@ -241,7 +250,8 @@ def _resolve_skills_filter() -> str | list[str]:
 
     :returns: ``"all"``, ``"none"``, or a list of skill names.
     """
-    raw = os.environ.get(_ENV_SKILLS_FILTER, "").strip()
+    source = os.environ if env is None else env
+    raw = source.get(_ENV_SKILLS_FILTER, "").strip()
     if not raw:
         return "all"
     try:
@@ -265,7 +275,7 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
-def _build_codex_executor() -> Executor:
+def _build_codex_executor(env: Mapping[str, str] | None = None) -> Executor:
     """
     Construct a :class:`CodexExecutor` from env-var config.
 
@@ -283,39 +293,48 @@ def _build_codex_executor() -> Executor:
         credentials are missing — the inner executor's
         constructor fails loud.
     """
-    bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
+    source = os.environ if env is None else env
+    bundle_dir_raw = source.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
-    agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
+    agent_name_raw = source.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return CodexExecutor(
-        cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
-        os_env=_resolve_os_env(),
-        model=os.environ.get(_ENV_MODEL),
-        codex_path=resolve_harness_path("codex"),
-        gateway=_parse_truthy(_ENV_GATEWAY, default=False),
-        databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
-        model_provider_override=os.environ.get(_ENV_MODEL_PROVIDER) or None,
-        gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
+        cwd=source.get(_ENV_CWD) or source.get("OMNIGENT_RUNNER_WORKSPACE") or None,
+        os_env=_resolve_os_env(source),
+        model=source.get(_ENV_MODEL),
+        codex_path=resolve_harness_path("codex", env=source),
+        gateway=_parse_truthy(_ENV_GATEWAY, default=False, env=source),
+        databricks_profile=source.get(_ENV_DATABRICKS_PROFILE),
+        model_provider_override=source.get(_ENV_MODEL_PROVIDER) or None,
+        gateway_host=source.get(_ENV_GATEWAY_HOST) or None,
         # Default ``True`` mirrors the inner CodexExecutor's
         # constructor default, which mirrors Codex's own
         # default. An operator who set the env var to ``"0"``
         # wants the search disabled.
-        enable_web_search=_parse_truthy(_ENV_ENABLE_WEB_SEARCH, default=True),
+        enable_web_search=_parse_truthy(_ENV_ENABLE_WEB_SEARCH, default=True, env=source),
         # Default ``False`` mirrors the inner executor's default
         # (native tools enabled).
-        disable_native_tools=_parse_truthy(_ENV_DISABLE_NATIVE_TOOLS, default=False),
-        base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
-        gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
-        gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
-        or None,
-        retry_policy=_resolve_retry_policy(),
+        disable_native_tools=_parse_truthy(
+            _ENV_DISABLE_NATIVE_TOOLS,
+            default=False,
+            env=source,
+        ),
+        base_url_override=source.get(_ENV_GATEWAY_BASE_URL) or None,
+        gateway_auth_command=source.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
+        gateway_auth_refresh_interval_ms=source.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS) or None,
+        retry_policy=_resolve_retry_policy(source),
         bundle_dir=bundle_dir,
         agent_name=agent_name,
-        skills_filter=_resolve_skills_filter(),
+        skills_filter=_resolve_skills_filter(source),
+        source_env=source,
     )
 
 
-def create_app() -> FastAPI:
+def create_app(
+    *,
+    env: Mapping[str, str] | None = None,
+    session_key: str | None = None,
+) -> FastAPI:
     """
     Build the codex harness's FastAPI app.
 
@@ -330,5 +349,12 @@ def create_app() -> FastAPI:
         :class:`CodexExecutor` is constructed lazily on the
         first turn.
     """
-    adapter = ExecutorAdapter(executor_factory=_build_codex_executor)
+    if env is None:
+        executor_factory = _build_codex_executor
+    else:
+        executor_factory = partial(_build_codex_executor, dict(env))
+    adapter = ExecutorAdapter(
+        executor_factory=executor_factory,
+        session_key=session_key,
+    )
     return adapter.build()

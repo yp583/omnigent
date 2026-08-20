@@ -272,6 +272,62 @@ def test_build_report_shape() -> None:
     assert "list_sessions" in _d(report["journeys"])
 
 
+def test_resource_usage_summarizes_whole_tree_samples() -> None:
+    env = BenchEnvironment()
+    env._resource_tree_samples = [
+        {
+            "complete": True,
+            "cpu_percent": None,
+            "total": {
+                "pss_bytes": 100,
+                "rss_bytes": 200,
+                "uss_bytes": 80,
+                "pss_anon_bytes": 90,
+                "pss_file_bytes": 10,
+                "pss_shmem_bytes": 0,
+                "swap_bytes": 0,
+                "process_count": 2,
+                "thread_count": 4,
+                "fd_count": 8,
+            },
+        },
+        {
+            "complete": False,
+            "cpu_percent": 50.0,
+            "total": {
+                "pss_bytes": 120,
+                "rss_bytes": 240,
+                "uss_bytes": 90,
+                "pss_anon_bytes": 108,
+                "pss_file_bytes": 12,
+                "pss_shmem_bytes": 0,
+                "swap_bytes": 0,
+                "process_count": 3,
+                "thread_count": 6,
+                "fd_count": None,
+            },
+        },
+    ]
+
+    usage = env.resource_usage
+    assert usage["sampler"] == "linux-procfs"
+    assert _d(usage["rss_bytes"])["mean"] == 220
+    assert _d(usage["cpu_pct"])["mean"] == 50.0
+    tree = _d(usage["process_tree"])
+    assert tree["complete_samples"] == 1
+    summary = _d(tree["summary"])
+    assert _d(summary["pss_bytes"])["mean"] == 110
+    # A missing FD count is omitted from that metric's series, not treated as zero.
+    assert _d(summary["fd_count"])["samples"] == 1
+
+
+def test_host_resource_environment_can_disable_extra_boot_runner() -> None:
+    env = BenchEnvironment(with_host=True, with_boot_runner=False)
+    assert env.with_runner
+    assert env.with_host
+    assert not env.with_boot_runner
+
+
 # ── per-journey iteration cap (no server) ────────────────────
 
 

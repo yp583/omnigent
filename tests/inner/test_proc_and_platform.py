@@ -428,6 +428,21 @@ def test_resolve_cli_binary_no_env_var(monkeypatch):
     assert _platform.resolve_cli_binary("tool") == "/usr/bin/tool"
 
 
+def test_resolve_cli_binary_uses_explicit_environment_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An in-process session resolves against its own PATH snapshot."""
+    session_bin = tmp_path / "session-bin"
+    session_bin.mkdir()
+    tool = session_bin / "tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", "/ambient/path")
+
+    assert _platform.resolve_cli_binary("tool", env={"PATH": str(session_bin)}) == str(tool)
+
+
 def test_cli_fallback_dirs_includes_nvm_version_bins(monkeypatch, tmp_path):
     """nvm keeps global bins under ~/.nvm/versions/node/<ver>/bin; the ladder
     must include those (newest first) since that's the reported nvm case.

@@ -102,7 +102,11 @@ def _harness_path_env_var(canonical: str) -> str:
     return f"OMNIGENT_{base.upper().replace('-', '_')}_PATH"
 
 
-def resolve_harness_path(canonical: str) -> str | None:
+def resolve_harness_path(
+    canonical: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
     """Resolve a harness binary-path override from env, warning on legacy use.
 
     Precedence: the canonical ``OMNIGENT_<base>_PATH`` env var, then the
@@ -117,10 +121,12 @@ def resolve_harness_path(canonical: str) -> str | None:
     which adds the ``--command`` flag and config layers on top of this env read.
 
     :param canonical: A harness id (e.g. ``"codex"`` or ``"pi-native"``).
+    :param env: Environment to inspect. Defaults to :data:`os.environ`.
     :returns: The override path/name, or ``None`` when neither env var is set.
     """
+    env_source = os.environ if env is None else env
     canonical_env = _harness_path_env_var(canonical)
-    value = os.environ.get(canonical_env, "").strip()
+    value = env_source.get(canonical_env, "").strip()
     if value:
         return value
     base = _HARNESS_BINARY_BASE.get(canonical) or canonical.removesuffix("-native")
@@ -131,7 +137,7 @@ def resolve_harness_path(canonical: str) -> str | None:
     # ``HARNESS_CURSOR_PATH`` would invent a new knob under a deprecated name.
     if legacy_env not in _LEGACY_PATH_VARS:
         return None
-    legacy = os.environ.get(legacy_env, "").strip()
+    legacy = env_source.get(legacy_env, "").strip()
     if legacy:
         _warn_legacy_path(legacy_env, canonical_env)
         return legacy

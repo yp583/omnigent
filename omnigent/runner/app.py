@@ -131,6 +131,7 @@ from omnigent.runner.native import (
 from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+from omnigent.runner.resource_diagnostics import build_runner_resource_diagnostics
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
@@ -400,6 +401,44 @@ _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 # the Databricks Apps ingress) can drop the long-lived HTTP connection.
 # Matches the AP-side ``_SESSION_STREAM_HEARTBEAT_INTERVAL_S``.
 _SESSION_STREAM_HEARTBEAT_S = 15.0
+# The AP relay normally drains this queue continuously. Operators may bound the
+# backlog, but the compatibility-safe default is unbounded: failing a valid
+# turn on overflow changes harness behavior. A bounded default should wait for
+# durable spill/replay support.
+_SESSION_EVENT_QUEUE_MAX_ITEMS_ENV = "OMNIGENT_SESSION_EVENT_QUEUE_MAX_ITEMS"
+_DEFAULT_SESSION_EVENT_QUEUE_MAX_ITEMS = 0
+_HARNESS_CACHE_HIBERNATION_ENV = "OMNIGENT_HARNESS_CACHE_HIBERNATION"
+
+
+def _resolve_session_event_queue_max_items() -> int:
+    """Resolve the optional per-session event backlog limit."""
+    raw = os.environ.get(_SESSION_EVENT_QUEUE_MAX_ITEMS_ENV)
+    if raw is None:
+        return _DEFAULT_SESSION_EVENT_QUEUE_MAX_ITEMS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        _logger.warning(
+            "%s=%r is invalid; using default %d",
+            _SESSION_EVENT_QUEUE_MAX_ITEMS_ENV,
+            raw,
+            _DEFAULT_SESSION_EVENT_QUEUE_MAX_ITEMS,
+        )
+        return _DEFAULT_SESSION_EVENT_QUEUE_MAX_ITEMS
+    return value
+
+
+def _harness_cache_hibernation_enabled() -> bool:
+    """Return whether idle worker reaping may evict rehydratable caches."""
+    return os.environ.get(_HARNESS_CACHE_HIBERNATION_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
@@ -659,6 +698,8 @@ class _SessionSnapshot:
         ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
         work entry for a child the server did not record a ``sub_agent_name``
         for. ``None`` when unbound / the fetch failed.
+    :param root_session_id: Root of the agent tree. Equals the top-level
+        session id for descendants and is ``None`` on legacy snapshots.
     """
 
     ok: bool
@@ -669,6 +710,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    root_session_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1958,6 +2000,8 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+    session_event_queue_max_items = _resolve_session_event_queue_max_items()
+    harness_cache_hibernation_enabled = _harness_cache_hibernation_enabled()
 
     from omnigent.runtime import telemetry
 
@@ -2103,6 +2147,34 @@ def create_runner_app(
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
+    _hibernated_sessions: set[str] = set()
+    _event_queue_overflowed: set[str] = set()
+
+    def _session_has_live_harness_work(session_id: str) -> bool:
+        if session_id in _active_turns or _session_message_buffers.get(session_id):
+            return True
+        return any(
+            key[0] == session_id and not task.done() for key, task in _session_init_tasks.items()
+        )
+
+    def _hibernate_session_caches(session_id: str) -> None:
+        """Release rehydratable, high-cardinality caches after worker reap."""
+        if not harness_cache_hibernation_enabled or _session_has_live_harness_work(session_id):
+            return
+        _session_histories.pop(session_id, None)
+        _session_tool_schemas.pop(session_id, None)
+        _session_mcp_spec_hash.pop(session_id, None)
+        _session_skills_cache.pop(session_id, None)
+        _session_spec_cache.pop(session_id, None)
+        _hibernated_sessions.add(session_id)
+
+    set_resource_hooks = getattr(process_manager, "set_resource_hooks", None)
+    if callable(set_resource_hooks):
+        set_resource_hooks(
+            is_busy=_session_has_live_harness_work,
+            on_idle_reap=_hibernate_session_caches,
+        )
+    app.state.hibernate_session_caches = _hibernate_session_caches
 
     def _has_active_work() -> bool:
         if _active_turns:
@@ -2125,22 +2197,62 @@ def create_runner_app(
 
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):
+            while not queue.empty():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
             queue.put_nowait(None)
 
     app.state.drain_session_streams = _drain_session_streams
 
-    def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
-        event_body = cast(_JsonObject, event)
+    def _session_event_queue(session_id: str) -> asyncio.Queue[_JsonObject | None]:
         queue = _session_event_queues.get(session_id)
         if queue is None:
-            queue = asyncio.Queue()
+            queue = asyncio.Queue(maxsize=session_event_queue_max_items)
             _session_event_queues[session_id] = queue
-        queue.put_nowait(event_body)
+        return queue
+
+    def _enqueue_session_event(session_id: str, event: _JsonObject) -> bool:
+        if session_id in _event_queue_overflowed:
+            return False
+        queue = _session_event_queue(session_id)
+        try:
+            queue.put_nowait(event)
+            return True
+        except asyncio.QueueFull:
+            while not queue.empty():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            failure: _JsonObject = {
+                "type": "session.status",
+                "status": "failed",
+                "error": {
+                    "code": "runner_event_queue_overflow",
+                    "message": (
+                        "Runner event relay fell behind; the turn was failed to bound memory."
+                    ),
+                },
+            }
+            queue.put_nowait(failure)
+            _event_queue_overflowed.add(session_id)
+            _native_pane_status[session_id] = "failed"
+            _logger.error(
+                "session event queue overflow: session=%s max_items=%d",
+                session_id,
+                session_event_queue_max_items,
+            )
+            return False
+
+    def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
+        event_body = cast(_JsonObject, event)
+        if not _enqueue_session_event(session_id, event_body):
+            return
         if event_body.get("type") == "session.status":
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
                 _native_pane_status[session_id] = _status_value
         _fan_out_child_delta_to_parent(session_id, event_body)
+
+    app.state.publish_event = _publish_event
 
     def _child_preview_from_status(
         session_id: str,
@@ -2475,6 +2587,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            root_session_id: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -2496,6 +2609,9 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    raw_root = body.get("root_session_id")
+                    if isinstance(raw_root, str) and raw_root:
+                        root_session_id = raw_root
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -2507,6 +2623,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                root_session_id=root_session_id,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 _session_snapshot_cache[session_id] = snapshot
@@ -2552,6 +2669,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            root_session_id=snapshot.root_session_id,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -2684,6 +2802,60 @@ def create_runner_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    def _runner_resource_diagnostics() -> dict[str, object]:
+        root_ids: dict[str, str | None] = {}
+        parent_ids: dict[str, str | None] = {}
+        for session_id, snapshot in _session_snapshot_cache.items():
+            root_ids[session_id] = snapshot.root_session_id
+            parent_ids[session_id] = snapshot.parent_session_id
+        for session_id, (_, envelope) in _session_init_envelopes.items():
+            root_ids[session_id] = envelope.snapshot.root_session_id
+            parent_ids[session_id] = envelope.snapshot.parent_session_id
+
+        # Legacy peers omit root_session_id. Following the cached parent chain
+        # still attributes their descendants to the correct top-level owner.
+        for session_id in set(root_ids) | set(parent_ids):
+            if root_ids.get(session_id):
+                continue
+            current = session_id
+            seen: set[str] = set()
+            while current not in seen:
+                seen.add(current)
+                parent = parent_ids.get(current)
+                if not parent:
+                    break
+                explicit_root = root_ids.get(parent)
+                current = explicit_root or parent
+                if explicit_root:
+                    break
+            root_ids[session_id] = current
+
+        process_snapshot: Mapping[str, object] | None = None
+        process_diagnostics = getattr(process_manager, "resource_diagnostics", None)
+        if callable(process_diagnostics):
+            raw_snapshot = process_diagnostics()
+            if isinstance(raw_snapshot, Mapping):
+                process_snapshot = cast(Mapping[str, object], raw_snapshot)
+        return build_runner_resource_diagnostics(
+            histories=cast(Mapping[str, object], _session_histories),
+            event_queues=cast(Mapping[str, object], _session_event_queues),
+            inboxes=cast(Mapping[str, object], _session_inboxes),
+            message_buffers=cast(Mapping[str, object], _session_message_buffers),
+            async_tasks=cast(Mapping[str, object], _session_async_tasks),
+            timers=cast(Mapping[str, object], _session_timers),
+            active_turns=cast(Mapping[str, object], _active_turns),
+            root_session_ids=root_ids,
+            process_manager=process_snapshot,
+            hibernated_sessions=_hibernated_sessions,
+        )
+
+    app.state.resource_diagnostics = _runner_resource_diagnostics
+
+    @app.get("/v1/diagnostics/resources")
+    async def runner_resource_diagnostics() -> dict[str, object]:
+        """Return bounded per-root cache, queue, task, and worker ownership."""
+        return _runner_resource_diagnostics()
 
     @app.post(
         "/v1/sessions/{conversation_id}/background-title",
@@ -2823,6 +2995,27 @@ def create_runner_app(
                 },
             )
 
+        register_session_tree = getattr(process_manager, "register_session_tree", None)
+        if callable(register_session_tree):
+            envelope_snapshot = (
+                init_context.envelope.snapshot if init_context.envelope is not None else None
+            )
+            raw_parent = body.get("parent_session_id")
+            parent_session_id = (
+                envelope_snapshot.parent_session_id
+                if envelope_snapshot is not None
+                else raw_parent
+                if isinstance(raw_parent, str)
+                else None
+            )
+            register_session_tree(
+                session_id,
+                root_session_id=(
+                    envelope_snapshot.root_session_id if envelope_snapshot is not None else None
+                ),
+                parent_session_id=parent_session_id,
+            )
+
         # Stamp the session's Smart Routing class before anything reads it: the
         # spawn env is rebuilt on every harness respawn, long after this
         # envelope is gone, and on the codex family the class decides whether
@@ -2911,6 +3104,7 @@ def create_runner_app(
                 harness_name,
                 env=spawn_env,
             )
+            _hibernated_sessions.discard(session_id)
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
@@ -2923,7 +3117,9 @@ def create_runner_app(
         _session_start_cache.setdefault(session_id, time.time())
         _session_agent_ids[session_id] = agent_id
         if session_id not in _session_event_queues:
-            _session_event_queues[session_id] = asyncio.Queue()
+            _session_event_queues[session_id] = asyncio.Queue(
+                maxsize=session_event_queue_max_items
+            )
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
         if session_id not in _session_async_tasks:
@@ -3333,10 +3529,7 @@ def create_runner_app(
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
         async def _event_generator() -> AsyncIterator[bytes]:
-            queue = _session_event_queues.get(session_id)
-            if queue is None:
-                queue = asyncio.Queue()
-                _session_event_queues[session_id] = queue
+            queue = _session_event_queue(session_id)
             heartbeat_frame = b'data: {"type": "session.heartbeat"}\n\n'
             yield heartbeat_frame
             while True:
@@ -3353,7 +3546,7 @@ def create_runner_app(
                 try:
                     yield frame.encode("utf-8")
                 except (GeneratorExit, asyncio.CancelledError):
-                    queue.put_nowait(event)
+                    _enqueue_session_event(session_id, event)
                     return
             yield b"data: [DONE]\n\n"
 
@@ -3460,12 +3653,18 @@ def create_runner_app(
 
         queue = _session_event_queues.get(session_id)
         if queue is not None:
+            while not queue.empty():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
             queue.put_nowait(None)
 
         await resource_registry.cleanup_session(session_id)
 
         if process_manager is not None:
             await process_manager.release(session_id)
+            forget_session_tree = getattr(process_manager, "forget_session_tree", None)
+            if callable(forget_session_tree):
+                forget_session_tree(session_id)
 
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -3503,7 +3702,9 @@ def create_runner_app(
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
+        _event_queue_overflowed.discard(session_id)
         _session_inboxes.pop(session_id, None)
+        _hibernated_sessions.discard(session_id)
         _subagent_wake_pending.discard(session_id)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
@@ -4971,6 +5172,7 @@ def create_runner_app(
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
         a replacement turn that ran and finished during a teardown await.
         """
+        _event_queue_overflowed.discard(conv_id)
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
 
@@ -6146,6 +6348,7 @@ def create_runner_app(
 
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
+            _hibernated_sessions.discard(conv_id)
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,

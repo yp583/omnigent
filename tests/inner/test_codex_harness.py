@@ -142,6 +142,36 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.sandbox.type == "none"
 
 
+def test_executor_factory_uses_explicit_session_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-process adapters never read another session's ambient config."""
+    monkeypatch.setenv("HARNESS_CODEX_MODEL", "ambient-model")
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/ambient/codex")
+    session_env = {
+        "HOME": "/session/home",
+        "PATH": "/session/bin",
+        "HARNESS_CODEX_MODEL": "session-model",
+        "HARNESS_CODEX_CWD": "/session/workspace",
+        "OMNIGENT_CODEX_PATH": "/session/codex",
+    }
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        _fake_init,
+    ):
+        codex_harness._build_codex_executor(session_env)
+
+    assert captured["model"] == "session-model"
+    assert captured["cwd"] == "/session/workspace"
+    assert captured["codex_path"] == "/session/codex"
+    assert captured["source_env"] is session_env
+
+
 def test_executor_factory_cwd_falls_back_to_runner_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

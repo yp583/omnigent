@@ -52,9 +52,14 @@ class ClaudeNativeExecutor(Executor):
         reads :data:`BRIDGE_DIR_ENV_VAR` from the harness spawn env.
     """
 
-    def __init__(self, bridge_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        bridge_dir: Path | None = None,
+        *,
+        request_session_id: str | None = None,
+    ) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
-        self._request_session_id = _request_session_id_from_env()
+        self._request_session_id = request_session_id or _request_session_id_from_env()
         # Serializes every write to the shared tmux pane. ``run_turn``
         # (the initiating message) and ``enqueue_session_message``
         # (mid-turn steering) run as concurrent tasks against this one

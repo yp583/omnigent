@@ -27,6 +27,7 @@ import json
 import os
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -39,6 +40,7 @@ from typing import IO, NamedTuple
 import httpx
 import yaml
 
+from dev.benchmarks.resources.procfs import ProcessRoot, ProcfsSampler, cpu_percent_between
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import (
@@ -161,6 +163,10 @@ class BenchEnvironment:
         the boot runner still serves the warm journeys, while the daemon lets
         the cold-start and cold-restart journeys use host-bound sessions that
         fire ``host.launch_runner`` and launch their own fresh runners.
+    :param with_boot_runner: Whether to start the shared benchmark boot runner.
+        ``None`` preserves the normal behavior (start one whenever runner mode
+        is enabled). The resource-scaling suite passes ``False`` with a host so
+        N hosted sessions produce exactly N runners rather than N+1.
     :param database_uri: SQLAlchemy URI the server boots against. ``None``
         (default) uses a fresh throwaway SQLite file in the temp dir — the
         empty-DB path. Pass a pre-seeded URI (e.g. a seeded SQLite file, or a
@@ -182,6 +188,7 @@ class BenchEnvironment:
         *,
         with_runner: bool = False,
         with_host: bool = False,
+        with_boot_runner: bool | None = None,
         database_uri: str | None = None,
         harness: str = _DEFAULT_HARNESS,
         model: str = _DEFAULT_MODEL,
@@ -192,6 +199,9 @@ class BenchEnvironment:
         # journey create host-bound sessions that launch their own runners.
         self.with_host = with_host
         self.with_runner = with_runner or with_host
+        self.with_boot_runner = self.with_runner if with_boot_runner is None else with_boot_runner
+        if self.with_boot_runner and not self.with_runner:
+            raise ValueError("with_boot_runner=True requires runner or host mode")
         self.database_uri = database_uri
         self.harness = harness
         self.model = model
@@ -214,6 +224,7 @@ class BenchEnvironment:
         self._log_handles: list[IO[bytes]] = []
         self._agent_cache: dict[str, str] = {}
         self._resource_samples: list[dict[str, float]] = []
+        self._resource_tree_samples: list[dict[str, object]] = []
         self._sampler_stop: threading.Event = threading.Event()
         self._sampler_thread: threading.Thread | None = None
 
@@ -286,7 +297,7 @@ class BenchEnvironment:
         self._runner_base_env = base_env
 
         self._server_proc = self._spawn_server(port, base_env, binding_token, artifact_dir)
-        if self.with_runner:
+        if self.with_boot_runner:
             self._runner_proc = self._spawn_runner(base_env, binding_token)
         self._wait_ready()
         # The host daemon is ADDITIVE — the boot runner above still serves the
@@ -321,12 +332,30 @@ class BenchEnvironment:
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _sample_resources(self, interval: float = 1.0) -> None:
-        """Sample the server process's CPU and RSS memory at *interval*-second intervals.
+        """Sample the whole Omnigent process tree at ``interval`` seconds.
 
-        Runs in a daemon thread; exits when ``_sampler_stop`` is set or the
-        process terminates. The first ``cpu_percent`` call always returns 0.0
-        (psutil baseline) — we discard it so only real measurements accumulate.
+        Linux uses procfs PSS/USS/RSS and stable process identities. Other
+        platforms retain the legacy server-only psutil sample so the latency
+        benchmark remains usable, but only Linux process-tree samples are valid
+        for resource gates.
         """
+        if sys.platform.startswith("linux") and Path("/proc").is_dir():
+            sampler = ProcfsSampler()
+            previous = None
+            while not self._sampler_stop.is_set():
+                roots = self._resource_roots()
+                if not roots:
+                    break
+                snapshot = sampler.snapshot(roots)
+                payload = snapshot.to_dict()
+                payload["cpu_percent"] = (
+                    cpu_percent_between(previous, snapshot) if previous is not None else None
+                )
+                self._resource_tree_samples.append(payload)
+                previous = snapshot
+                self._sampler_stop.wait(timeout=interval)
+            return
+
         try:
             import psutil
         except ImportError:
@@ -347,34 +376,112 @@ class BenchEnvironment:
                 break
             self._sampler_stop.wait(timeout=interval)
 
+    def _resource_roots(self) -> list[ProcessRoot]:
+        """Return live Omnigent roots, excluding mock benchmark infrastructure."""
+        roots: list[ProcessRoot] = []
+        for role, proc in (
+            ("server", self._server_proc),
+            ("boot-runner", self._runner_proc),
+            ("host", self._host_proc),
+        ):
+            if proc is not None and proc.poll() is None:
+                roots.append(
+                    ProcessRoot(
+                        pid=proc.pid,
+                        role=role,
+                        # Benchmark children retain a live parent. Avoid pulling
+                        # unrelated shell siblings into a root which inherited
+                        # the benchmark process group.
+                        include_process_group=False,
+                    )
+                )
+        return roots
+
+    @property
+    def resource_tree_samples(self) -> list[dict[str, object]]:
+        """Return a stable copy of raw Linux process-tree samples so far."""
+        return list(self._resource_tree_samples)
+
+    @staticmethod
+    def _resource_summary(values: list[int | float]) -> dict[str, int | float]:
+        """Summarize one raw resource series."""
+        if not values:
+            return {}
+        return {
+            "mean": statistics.mean(values),
+            "min": min(values),
+            "max": max(values),
+            "samples": len(values),
+        }
+
     @property
     def resource_usage(self) -> dict[str, object]:
-        """Summarise sampled CPU% and RSS across the benchmark run.
+        """Summarise sampled resources across the benchmark run.
 
-        :returns: A dict with ``cpu_pct`` and ``rss_bytes`` sub-dicts each
-            containing ``mean``, ``min``, ``max``, ``samples``. Empty dicts
-            when no samples were collected (psutil unavailable or server never
-            started).
+        The top-level ``cpu_pct`` and ``rss_bytes`` keys remain for report
+        compatibility. On Linux they now represent the complete Omnigent tree,
+        and ``process_tree`` carries raw attributed samples plus PSS/USS and
+        process/thread/FD summaries.
         """
+        if self._resource_tree_samples:
+            metric_names = (
+                "pss_bytes",
+                "rss_bytes",
+                "uss_bytes",
+                "pss_anon_bytes",
+                "pss_file_bytes",
+                "pss_shmem_bytes",
+                "swap_bytes",
+                "process_count",
+                "thread_count",
+                "fd_count",
+            )
+            summaries: dict[str, object] = {}
+            for metric_name in metric_names:
+                values = [
+                    value
+                    for sample in self._resource_tree_samples
+                    if isinstance(sample.get("total"), dict)
+                    and isinstance(
+                        value := sample["total"].get(metric_name),  # type: ignore[union-attr]
+                        (int, float),
+                    )
+                ]
+                summaries[metric_name] = self._resource_summary(values)
+            cpu = [
+                value
+                for sample in self._resource_tree_samples
+                if isinstance(value := sample.get("cpu_percent"), (int, float))
+            ]
+            summaries["cpu_percent"] = self._resource_summary(cpu)
+            return {
+                "sampler": "linux-procfs",
+                "cpu_pct": summaries["cpu_percent"],
+                "rss_bytes": summaries["rss_bytes"],
+                "process_tree": {
+                    "complete_samples": sum(
+                        sample.get("complete") is True for sample in self._resource_tree_samples
+                    ),
+                    "samples": self._resource_tree_samples,
+                    "summary": summaries,
+                },
+            }
+
         if not self._resource_samples:
-            return {"cpu_pct": {}, "rss_bytes": {}}
+            return {
+                "sampler": "unavailable",
+                "cpu_pct": {},
+                "rss_bytes": {},
+                "process_tree": {},
+            }
         cpu = [s["cpu_pct"] for s in self._resource_samples]
         rss = [s["rss_bytes"] for s in self._resource_samples]
-        import statistics as _stats
 
         return {
-            "cpu_pct": {
-                "mean": _stats.mean(cpu),
-                "min": min(cpu),
-                "max": max(cpu),
-                "samples": len(cpu),
-            },
-            "rss_bytes": {
-                "mean": _stats.mean(rss),
-                "min": min(rss),
-                "max": max(rss),
-                "samples": len(rss),
-            },
+            "sampler": "psutil-server-only",
+            "cpu_pct": self._resource_summary(cpu),
+            "rss_bytes": self._resource_summary(rss),
+            "process_tree": {},
         }
 
     async def server_request_snapshot(self) -> ServerRequestSnapshot:
@@ -586,7 +693,7 @@ class BenchEnvironment:
 
     def _runner_ready(self) -> bool:
         """Whether the boot runner reports online (always ``True`` server-only)."""
-        if not self.with_runner:
+        if not self.with_boot_runner:
             return True
         status = httpx.get(f"{self.base_url}/v1/runners/{self.runner_id}/status", timeout=2)
         return status.status_code == 200 and status.json().get("online") is True
@@ -781,6 +888,8 @@ class BenchEnvironment:
 
     async def create_bound_session(self, agent_id: str) -> str:
         """Create a session for *agent_id* and bind it to the boot runner."""
+        if not self.with_boot_runner:
+            raise RuntimeError("create_bound_session requires with_boot_runner=True")
         return await self.create_session_bound_to(agent_id, self.runner_id)
 
     async def create_session_bound_to(self, agent_id: str, runner_id: str) -> str:
@@ -826,6 +935,20 @@ class BenchEnvironment:
                 return
             await asyncio.sleep(_POLL_INTERVAL_S)
         raise RuntimeError(f"runner did not stop within {timeout}s (session {session_id})")
+
+    async def wait_session_runner_online(
+        self, session_id: str, *, timeout: float = _HEALTH_TIMEOUT_S
+    ) -> None:
+        """Wait until a host-backed session's runner reports online."""
+        assert self.client is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snap = await self.client.get(f"/v1/sessions/{session_id}")
+            snap.raise_for_status()
+            if snap.json().get("runner_online") is True:
+                return
+            await asyncio.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(f"runner did not come online within {timeout}s (session {session_id})")
 
     async def write_runner_file(self, session_id: str, relative_path: str, content: str) -> None:
         """Write a file into the runner's default environment over HTTP.

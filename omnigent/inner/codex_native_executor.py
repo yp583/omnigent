@@ -53,9 +53,14 @@ class CodexNativeExecutor(Executor):
         reads :data:`CODEX_NATIVE_BRIDGE_DIR_ENV_VAR`.
     """
 
-    def __init__(self, bridge_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        bridge_dir: Path | None = None,
+        *,
+        request_session_id: str | None = None,
+    ) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
-        self._request_session_id = _request_session_id_from_env()
+        self._request_session_id = request_session_id or _request_session_id_from_env()
         # Serializes injection into the shared native Codex thread.
         # ``run_turn`` (initiating message) and ``enqueue_session_message``
         # (mid-turn steering) run concurrently against this one cached

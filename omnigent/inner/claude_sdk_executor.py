@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
@@ -51,6 +51,7 @@ from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
@@ -81,6 +82,12 @@ from .sandbox import (
     with_additional_read_roots,
     with_additional_write_files,
     with_additional_write_roots,
+)
+from .startup_admission import (
+    StartupAdmission,
+    StartupPermit,
+    resolve_startup_capacity,
+    scoped_admission_namespace,
 )
 
 logger = logging.getLogger(__name__)
@@ -368,7 +375,87 @@ class _ClaudeSDK(Protocol):
 
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
+_CONNECT_TIMEOUT_ENV = "OMNIGENT_CLAUDE_CONNECT_TIMEOUT_S"
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+_STARTUP_CONCURRENCY_ENV = "OMNIGENT_CLAUDE_STARTUP_CONCURRENCY"
+_DEFAULT_STARTUP_CONCURRENCY = 4
+_STRICT_MCP_CONFIG_ENV = "OMNIGENT_CLAUDE_STRICT_MCP_CONFIG"
+_STARTUP_ADMISSION = StartupAdmission(
+    "claude-sdk",
+    resolve_startup_capacity(_STARTUP_CONCURRENCY_ENV, _DEFAULT_STARTUP_CONCURRENCY),
+)
+_ROOT_STARTUP_ADMISSIONS: dict[str, StartupAdmission] = {}
+
+
+def _connect_timeout_seconds() -> float:
+    """Resolve the active Claude SDK handshake timeout."""
+    raw = os.environ.get(_CONNECT_TIMEOUT_ENV)
+    if raw is None:
+        return _CONNECT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if value <= 0:
+        logger.warning(
+            "%s=%r is invalid; using default %.0fs",
+            _CONNECT_TIMEOUT_ENV,
+            raw,
+            _CONNECT_TIMEOUT_SECONDS,
+        )
+        return _CONNECT_TIMEOUT_SECONDS
+    return value
+
+
+def _strict_mcp_config_enabled() -> bool:
+    """Whether managed Claude sessions ignore ambient MCP configuration."""
+    return os.environ.get(_STRICT_MCP_CONFIG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _strict_mcp_config_options() -> dict[str, bool]:
+    """Return SDK kwargs only when strict MCP isolation is enabled.
+
+    Omitting the field preserves compatibility with older supported SDKs that
+    predate ``strict_mcp_config``. Operators opting in must provide an SDK that
+    supports the capability; its constructor then fails explicitly otherwise.
+    """
+    if _strict_mcp_config_enabled():
+        return {"strict_mcp_config": True}
+    return {}
+
+
+def _root_startup_admission() -> StartupAdmission | None:
+    """Resolve the root lane lazily after a zygote has installed its env."""
+    root = os.environ.get(RUNNER_ID_ENV_VAR, "").strip()
+    if not root or _STARTUP_ADMISSION.capacity == 0:
+        return None
+    admission = _ROOT_STARTUP_ADMISSIONS.get(root)
+    if admission is None:
+        admission = StartupAdmission(scoped_admission_namespace("claude-root", root), 1)
+        _ROOT_STARTUP_ADMISSIONS[root] = admission
+    return admission
+
+
+@asynccontextmanager
+async def _admit_claude_startup() -> AsyncIterator[tuple[StartupPermit, float]]:
+    """Admit one cold start per root, then against the machine-wide budget."""
+    root_wait_seconds = 0.0
+    root_admission = _root_startup_admission()
+    if root_admission is None:
+        async with _STARTUP_ADMISSION.acquire() as permit:
+            yield permit, root_wait_seconds
+        return
+    async with root_admission.acquire() as root_permit:
+        root_wait_seconds = root_permit.wait_seconds
+        async with _STARTUP_ADMISSION.acquire() as permit:
+            yield permit, root_wait_seconds
+
+
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -1669,57 +1756,72 @@ class ClaudeSDKExecutor(Executor):
                     original_stderr(line)
 
             options.stderr = _tee_stderr
-            client = sdk.ClaudeSDKClient(options)
-            try:
-                # CLAUDECODE must be absent (not just empty) in the child
-                # env — otherwise the claude cli reports a nested-session
-                # error. The SDK merges ``os.environ`` with ``options.env``,
-                # so we unset in ``os.environ`` for the spawn window.
-                #
-                # ANTHROPIC_API_KEY is also stripped so the CLI uses its
-                # subscription auth rather than a developer API key that
-                # would charge separately. Safe even in Databricks mode:
-                # ``options.settings`` explicitly sets apiKeyHelper and
-                # ``options.env`` sets the Databricks base URL, so the
-                # Claude CLI does not need an inherited Anthropic key.
-                with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
-                    await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError as exc:
-                await self._force_close_client(client)
-                tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
-                detail = tail or "(no CLI stderr captured)"
-                logger.warning(
-                    "Claude SDK connect timed out after %ds; CLI stderr tail:\n%s",
-                    int(_CONNECT_TIMEOUT_SECONDS),
-                    detail,
-                )
-                raise TimeoutError(
-                    f"Claude SDK client connect timed out after "
-                    f"{int(_CONNECT_TIMEOUT_SECONDS)}s. CLI stderr tail:\n{detail}"
-                ) from exc
-            except Exception as exc:
-                # The CLI may exit immediately (e.g. ``unknown option``) before
-                # the SDK's async stderr reader has flushed all output.  A brief
-                # yield lets pending reader callbacks deliver remaining lines so
-                # the error message is useful rather than just "Command failed
-                # with exit code 1; Check stderr output for details".
-                await asyncio.sleep(0.1)
-                await self._force_close_client(client)
-                tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
-                detail = tail or "(no CLI stderr captured)"
-                logger.error(
-                    "Claude SDK connect failed: %s\nCLI stderr tail:\n%s",
-                    exc,
-                    detail,
-                )
-                raise RuntimeError(
-                    f"Claude SDK connect failed: {exc}\nCLI stderr:\n{detail}"
-                ) from exc
-            finally:
-                # Restore on both paths so post-connect stderr flows
-                # directly to the original callback and ``connect_stderr``
-                # can be GC'd instead of growing for the session lifetime.
-                options.stderr = original_stderr
+            async with _admit_claude_startup() as (permit, root_wait_seconds):
+                queued_seconds = root_wait_seconds + permit.wait_seconds
+                connect_timeout_seconds = _connect_timeout_seconds()
+                if queued_seconds >= 1.0:
+                    logger.info(
+                        "Claude SDK startup admitted after %.1fs "
+                        "(root_wait=%.1fs, slot=%s, cross_process=%s)",
+                        queued_seconds,
+                        root_wait_seconds,
+                        permit.slot,
+                        permit.cross_process,
+                    )
+                client = sdk.ClaudeSDKClient(options)
+                try:
+                    # CLAUDECODE must be absent (not just empty) in the child
+                    # env — otherwise the claude cli reports a nested-session
+                    # error. The SDK merges ``os.environ`` with ``options.env``,
+                    # so we unset in ``os.environ`` for the spawn window.
+                    #
+                    # ANTHROPIC_API_KEY is also stripped so the CLI uses its
+                    # subscription auth rather than a developer API key that
+                    # would charge separately. Safe even in Databricks mode:
+                    # ``options.settings`` explicitly sets apiKeyHelper and
+                    # ``options.env`` sets the Databricks base URL, so the
+                    # Claude CLI does not need an inherited Anthropic key.
+                    with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
+                        await asyncio.wait_for(client.connect(), timeout=connect_timeout_seconds)
+                except asyncio.TimeoutError as exc:
+                    await self._force_close_client(client)
+                    tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
+                    detail = tail or "(no CLI stderr captured)"
+                    logger.warning(
+                        "Claude SDK connect timed out after %ds active connect "
+                        "(queued %.1fs); CLI stderr tail:\n%s",
+                        int(connect_timeout_seconds),
+                        queued_seconds,
+                        detail,
+                    )
+                    raise TimeoutError(
+                        f"Claude SDK client connect timed out after "
+                        f"{int(connect_timeout_seconds)}s active connect "
+                        f"(queued {queued_seconds:.1f}s). CLI stderr tail:\n{detail}"
+                    ) from exc
+                except Exception as exc:
+                    # The CLI may exit immediately (e.g. ``unknown option``) before
+                    # the SDK's async stderr reader has flushed all output. A brief
+                    # yield lets pending reader callbacks deliver remaining lines.
+                    await asyncio.sleep(0.1)
+                    await self._force_close_client(client)
+                    tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
+                    detail = tail or "(no CLI stderr captured)"
+                    logger.error(
+                        "Claude SDK connect failed after %.1fs queued: %s\nCLI stderr tail:\n%s",
+                        queued_seconds,
+                        exc,
+                        detail,
+                    )
+                    raise RuntimeError(
+                        f"Claude SDK connect failed after {queued_seconds:.1f}s queued: "
+                        f"{exc}\nCLI stderr:\n{detail}"
+                    ) from exc
+                finally:
+                    # Restore on both paths so post-connect stderr flows
+                    # directly to the original callback and ``connect_stderr``
+                    # can be GC'd instead of growing for the session lifetime.
+                    options.stderr = original_stderr
             current_task: asyncio.Task[None] | None = cast(
                 "asyncio.Task[None] | None", asyncio.current_task()
             )
@@ -2371,6 +2473,10 @@ class ClaudeSDKExecutor(Executor):
             "extra_args": {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
+        # MCP isolation suppresses ambient user/account MCP servers. Omit the
+        # SDK field entirely unless selected so old SDKs and default Claude
+        # behavior remain valid.
+        options_kwargs.update(_strict_mcp_config_options())
         # Only forward ``setting_sources`` when explicitly set.
         # ``None`` lets the SDK apply its default
         # (``["user", "project"]`` when ``skills`` is non-None).
@@ -2988,7 +3094,7 @@ class ClaudeSDKExecutor(Executor):
                         "summary instead of the harness's real compacted state.",
                         claude_session_id,
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001 - third-party transcript recovery is best-effort
                 # WARNING, not DEBUG: a swallowed read here silently degrades
                 # EVERY later resume of this conversation. The runner persists a
                 # compaction item with no ``compacted_messages``, so resume

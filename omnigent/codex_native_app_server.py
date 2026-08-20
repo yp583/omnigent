@@ -59,6 +59,7 @@ from omnigent.inner.codex_executor import (
     materialize_codex_provider_config,
     write_codex_hooks_file,
 )
+from omnigent.inner.codex_startup_admission import admit_codex_startup
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
@@ -997,50 +998,46 @@ class CodexNativeAppServer:
             config_overrides=self.config_overrides,
         )
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
-        self.process_owner_lock = acquire_codex_native_process_owner_lock()
+        # Hooks are written before spawn; readiness and trust finish before
+        # callers may dispatch a turn. Readiness failure is fatal, while a
+        # policy-trust failure degrades explicitly to no enforcement.
         try:
-            self.proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-                cwd=str(self.cwd),
-                executable=self.codex_path,
-                **_proc.spawn_kwargs(),
-            )
-        except BaseException:
-            if self.process_owner_lock is not None:
-                self.process_owner_lock.close()
-                self.process_owner_lock = None
-            raise
-        if self.process_owner_lock is not None:
-            register_codex_native_process(
-                pid=self.proc.pid,
-                pgid=_process_group_id(self.proc),
-                session_tag=self.process_registry_tag,
-                owner_lock_path=self.process_owner_lock.path,
-            )
-        self.recent_stderr = []
-        self.stderr_task = asyncio.create_task(
-            self._stderr_loop(),
-            name="codex-native-app-server-stderr",
-        )
-        # Ordering invariant: hooks.json is written before the spawn above,
-        # and the trust handshake must complete before the first turn — codex
-        # resolves trust when it dispatches a hook, so trust landing after the
-        # spawn is fine, but a turn started before it runs unhooked. The
-        # handshake cannot precede the spawn (``hooks/list`` is an app-server
-        # RPC), so callers must not launch the TUI or dispatch a turn until
-        # ``start()`` returns.
-        # Readiness failure (the app-server never came up) is fatal and
-        # tears down the subprocess so it is not orphaned. Policy-hook
-        # trust, by contrast, is best-effort: a trust failure degrades the
-        # session to "no enforcement" with a surfaced reason rather than
-        # blocking session creation (fail-open). ``BaseException`` on the
-        # outer guard so a cancellation mid-trust still tears down.
-        try:
-            await self._wait_until_ready()
+            async with admit_codex_startup() as queued_seconds:
+                self.process_owner_lock = acquire_codex_native_process_owner_lock()
+                try:
+                    self.proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=proc_env,
+                        cwd=str(self.cwd),
+                        executable=self.codex_path,
+                        **_proc.spawn_kwargs(),
+                    )
+                except BaseException:
+                    if self.process_owner_lock is not None:
+                        self.process_owner_lock.close()
+                        self.process_owner_lock = None
+                    raise
+                if self.process_owner_lock is not None:
+                    register_codex_native_process(
+                        pid=self.proc.pid,
+                        pgid=_process_group_id(self.proc),
+                        session_tag=self.process_registry_tag,
+                        owner_lock_path=self.process_owner_lock.path,
+                    )
+                self.recent_stderr = []
+                self.stderr_task = asyncio.create_task(
+                    self._stderr_loop(),
+                    name="codex-native-app-server-stderr",
+                )
+                await self._wait_until_ready()
+            if queued_seconds >= 1.0:
+                _logger.info(
+                    "Codex native app-server startup admitted after %.1fs",
+                    queued_seconds,
+                )
             if self.policy_hook_disabled_reason is None:
                 try:
                     await self._trust_policy_hooks()
