@@ -52,6 +52,7 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
 from omnigent.server.schemas import SessionGitOptions
+from omnigent.server.session_affinity import serialized_session_affinity_mutation
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -714,8 +715,7 @@ def create_hosts_router(
         models = result.get("models")
         return {"models": models if isinstance(models, list) else []}
 
-    @router.post("/hosts/{host_id}/runners")
-    async def launch_runner(
+    async def _launch_runner_locked(
         request: Request,
         host_id: str,
         body: LaunchRunnerRequest,
@@ -754,6 +754,11 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        if target.conv.host_id is not None and target.conv.host_id != host_id:
+            raise HTTPException(
+                status_code=400,
+                detail="session is already bound to a different host",
+            )
 
         # W6: validate the requested workspace against the agent's
         # os_env.cwd sandbox boundary BEFORE binding — the same check
@@ -875,57 +880,61 @@ def create_hosts_router(
                     exc_info=True,
                 )
 
-        async def _rollback_failed_launch() -> None:
+        async def _rollback_failed_launch(expected_runner_id: str) -> None:
             """
             Undo a failed launch *after* the runner was atomically bound.
 
             Fully unbinds the session — NULLs ``runner_id`` plus the
             ``host_id`` / ``workspace`` / ``git_branch`` persisted by the
-            ``set_host_id`` call below — and rolls back any worktree
+            atomic host-runner bind below — and rolls back any worktree
             created for this launch. Clearing the binding (not just
             ``runner_id``) keeps the DB consistent with the host's actual
             state: the worktree is gone, so the row must not keep pointing
             at it, and a retry that omits a worktree starts from a clean
             slate rather than inheriting a stale ``git_branch`` (which
             ``set_host_id`` cannot clear). ``POST /hosts/{id}/runners`` only
-            binds a previously-unbound clone (the fork-resume picker), so a
-            full unbind restores the true pre-call state. Used only on the
+            binds a runner-unbound session, so a full unbind restores the
+            retryable pre-launch state. Used only on the
             post-bind failure paths; the lost-CAS path must NOT clear the
             binding because it belongs to the concurrent winner, not us.
+            Worktree removal runs only after this launch wins the clear CAS.
             """
-            await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+            cleared = await asyncio.to_thread(
+                conversation_store.clear_host_binding_if_matches,
+                body.session_id,
+                expected_runner_id,
+                host_id,
+            )
+            if not cleared:
+                _logger.info(
+                    "Skipping stale failed-launch rollback for session %s; binding changed",
+                    body.session_id,
+                )
+                return
             await _rollback_worktree()
 
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
 
-        # Atomic bind (UPDATE ... WHERE runner_id IS NULL): only one
-        # concurrent launch can bind an unbound session; a second (or an
-        # already-bound session) gets False. Closes the TOCTOU.
+        # Bind every routing field in one conditional UPDATE. Publishing
+        # runner_id before host_id lets a concurrent PATCH steal the session
+        # during that intermediate state.
+        bound_git_branch = git_branch if git_branch is not None else target.conv.git_branch
         bound = await asyncio.to_thread(
-            conversation_store.set_runner_id,
+            conversation_store.bind_runner_to_host_if_unbound,
             body.session_id,
-            runner_id,
+            expected_host_id=target.conv.host_id,
+            runner_id=runner_id,
+            host_id=host_id,
+            workspace=workspace,
+            git_branch=bound_git_branch,
         )
         if not bound:
             await _rollback_worktree()
             raise HTTPException(
                 status_code=400,
-                detail="session already has a runner bound",
+                detail="session binding changed or already has a runner bound",
             )
-        # Persist the validated, canonical workspace (the worktree path
-        # when a worktree was created) alongside host_id, plus git_branch
-        # when branching, so the conversation row satisfies
-        # ck_conversations_workspace_required_for_host. ``workspace`` is the
-        # realpath returned by validate_workspace (W6), or body.workspace
-        # verbatim only in non-production wiring without an agent cache.
-        await asyncio.to_thread(
-            conversation_store.set_host_id,
-            body.session_id,
-            host_id,
-            workspace,
-            git_branch,
-        )
 
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
@@ -951,7 +960,7 @@ def create_hosts_router(
             host_registry.send_text(conn, launch_frame)
         except ConnectionError:
             conn.pending_launches.pop(request_id, None)
-            await _rollback_failed_launch()
+            await _rollback_failed_launch(runner_id)
             raise HTTPException(
                 status_code=409,
                 detail="host connection was replaced",
@@ -964,14 +973,14 @@ def create_hosts_router(
             )
         except asyncio.TimeoutError:
             conn.pending_launches.pop(request_id, None)
-            await _rollback_failed_launch()
+            await _rollback_failed_launch(runner_id)
             raise HTTPException(
                 status_code=504,
                 detail="host did not respond to launch request",
             ) from None
 
         if result.get("status") == "failed":
-            await _rollback_failed_launch()
+            await _rollback_failed_launch(runner_id)
             if result.get("error_code") == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action
@@ -990,6 +999,16 @@ def create_hosts_router(
             "runner_id": runner_id,
             "status": "launching",
         }
+
+    @router.post("/hosts/{host_id}/runners")
+    async def launch_runner(
+        request: Request,
+        host_id: str,
+        body: LaunchRunnerRequest,
+    ) -> dict[str, Any]:
+        """Serialize host bind, launch, and any failed-launch cleanup."""
+        async with serialized_session_affinity_mutation(body.session_id):
+            return await _launch_runner_locked(request, host_id, body)
 
     @router.get("/hosts/{host_id}/filesystem")
     async def list_host_filesystem_root(

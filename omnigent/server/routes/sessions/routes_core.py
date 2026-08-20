@@ -173,6 +173,7 @@ from omnigent.server.schemas import (
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
+from omnigent.server.session_affinity import serialized_session_affinity_mutation
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
 )
@@ -431,6 +432,9 @@ def register_core_routes(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    expected_runner_id=resp.runner_id,
+                    expected_host_id=resp.host_id,
+                    expected_workspace=resp.workspace,
                     provider=body.sandbox_provider,
                     agent_store=agent_store,
                     agent_id=conv.agent_id if conv is not None else None,
@@ -1471,25 +1475,19 @@ def register_core_routes(
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
-    @router.patch(
-        "/sessions/{session_id}",
-        response_model=None,
-        responses={200: {"model": SessionResponse}},
-    )
-    async def update_session(
+    async def _update_session_locked(
         request: Request,
         session_id: str,
         body: UpdateSessionRequest,
     ) -> SessionResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
-        provided, this is the mutable affinity primitive for the Alpha
-        runner-state pivot: create-bind, resume-bind, and recover-bind
-        all send the currently registered runner id, and the server
-        atomically replaces ``conversations.runner_id`` with that
-        value using last-write-wins semantics. Title, labels, and
-        reasoning-effort updates remain supported for existing
-        sessions clients.
+        provided for a hostless session, this is the mutable affinity
+        primitive for create-bind, resume-bind, and recover-bind. A
+        host-bound session's non-empty affinity is server-issued: PATCH
+        may reaffirm its current runner or clear a stale binding, but
+        cannot attach a different runner. Title, labels, and reasoning
+        effort updates remain supported for existing sessions clients.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier,
@@ -1500,7 +1498,8 @@ def register_core_routes(
             fields, and transcripts are served by
             ``GET /sessions/{id}/items``.
         :raises OmnigentError: 400 if the runner is not
-            registered; 404 if no session exists.
+            registered; 404 if no session exists; 409 if a host-bound
+            session is pointed at a different runner.
         """
         user_id = _get_user_id(request, auth_provider)
         # This PATCH gates at the least level the request actually needs, in
@@ -1543,6 +1542,24 @@ def register_core_routes(
                     f"Only the session owner can attach a runner to session {session_id!r}. "
                     f"To fork this session instead, run: omnigent run --fork {session_id}",
                     code=ErrorCode.FORBIDDEN,
+                )
+        conv_for_runner_binding: Conversation | None = None
+        if body.runner_id is not None:
+            conv_for_runner_binding = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                session_id,
+            )
+            if conv_for_runner_binding is None:
+                raise _session_not_found()
+            if (
+                conv_for_runner_binding.host_id is not None
+                and body.runner_id != ""
+                and body.runner_id != conv_for_runner_binding.runner_id
+            ):
+                raise OmnigentError(
+                    "runner affinity for a host-bound session is managed by the server; "
+                    "relaunch it through its bound host",
+                    code=ErrorCode.CONFLICT,
                 )
         if body.labels:
             _reject_server_reserved_label_seed(body.labels)
@@ -1686,22 +1703,72 @@ def register_core_routes(
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
             if body.runner_id == "":
-                try:
-                    await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
-                except ConversationNotFoundError as exc:
-                    raise _session_not_found() from exc
+                if conv_for_runner_binding is None:  # pragma: no cover - guarded above
+                    raise _session_not_found()
+                cleared = await asyncio.to_thread(
+                    conversation_store.clear_runner_id_if_matches,
+                    session_id,
+                    conv_for_runner_binding.runner_id,
+                    conv_for_runner_binding.host_id,
+                )
+                if not cleared:
+                    current_binding = await asyncio.to_thread(
+                        conversation_store.get_conversation,
+                        session_id,
+                    )
+                    if current_binding is None:
+                        raise _session_not_found()
+                    raise OmnigentError(
+                        "runner affinity changed while clearing; retry against the current "
+                        "binding",
+                        code=ErrorCode.CONFLICT,
+                    )
             else:
                 from omnigent.server.routes import sessions as _sf
 
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
                 )
-                try:
-                    await asyncio.to_thread(
-                        conversation_store.replace_runner_id, session_id, runner_id
+                if conv_for_runner_binding is None:  # pragma: no cover - guarded above
+                    raise _session_not_found()
+                if conv_for_runner_binding.host_id is None:
+                    replaced = await asyncio.to_thread(
+                        conversation_store.replace_runner_id_if_hostless,
+                        session_id,
+                        conv_for_runner_binding.runner_id,
+                        runner_id,
                     )
-                except ConversationNotFoundError as exc:
-                    raise _session_not_found() from exc
+                    if not replaced:
+                        current_binding = await asyncio.to_thread(
+                            conversation_store.get_conversation,
+                            session_id,
+                        )
+                        if current_binding is None:
+                            raise _session_not_found()
+                        raise OmnigentError(
+                            "runner affinity changed while attaching; retry against the "
+                            "current binding",
+                            code=ErrorCode.CONFLICT,
+                        )
+                else:
+                    # Host relaunches rotate the token-bound runner id inside
+                    # the server. Re-read so an idempotent PATCH racing that
+                    # rotation cannot restore the superseded binding.
+                    current_binding = await asyncio.to_thread(
+                        conversation_store.get_conversation,
+                        session_id,
+                    )
+                    if current_binding is None:
+                        raise _session_not_found()
+                    if (
+                        current_binding.runner_id != runner_id
+                        or current_binding.host_id != conv_for_runner_binding.host_id
+                    ):
+                        raise OmnigentError(
+                            "runner affinity for a host-bound session changed; retry against "
+                            "the current server-issued runner",
+                            code=ErrorCode.CONFLICT,
+                        )
                 _runner_client = await _get_runner_client(
                     session_id,
                     runner_router,
@@ -1975,6 +2042,22 @@ def register_core_routes(
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
         )
+
+    @router.patch(
+        "/sessions/{session_id}",
+        response_model=None,
+        responses={200: {"model": SessionResponse}},
+    )
+    async def update_session(
+        request: Request,
+        session_id: str,
+        body: UpdateSessionRequest,
+    ) -> SessionResponse:
+        """Update a session, serializing only runner-affinity mutations."""
+        if body.runner_id is None:
+            return await _update_session_locked(request, session_id, body)
+        async with serialized_session_affinity_mutation(session_id):
+            return await _update_session_locked(request, session_id, body)
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
 

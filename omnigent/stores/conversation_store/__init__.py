@@ -1190,8 +1190,7 @@ class ConversationStore(ABC):
         Implemented as ``UPDATE ... WHERE id = :id AND runner_id IS NULL``
         so concurrent binders race safely: exactly one transitions the
         row from NULL → ``runner_id`` and gets ``True``; others (or an
-        already-bound / missing row) get ``False``. Closes the TOCTOU on
-        host-launch binding (see ``resolve_host_launch``).
+        already-bound / missing row) get ``False``.
 
         :param conversation_id: Conversation to pin, e.g.
             ``"conv_abc123"``.
@@ -1199,6 +1198,64 @@ class ConversationStore(ABC):
             ``"runner_abc123"``.
         :returns: ``True`` if this call won the bind (NULL → runner_id);
             ``False`` if already bound or the row doesn't exist.
+        """
+        ...
+
+    @abstractmethod
+    def bind_runner_to_host_if_unbound(
+        self,
+        conversation_id: str,
+        *,
+        expected_host_id: str | None,
+        runner_id: str,
+        host_id: str,
+        workspace: str,
+        git_branch: str | None,
+    ) -> bool:
+        """
+        Atomically bind an unbound runner and its complete host location.
+
+        The row must still have ``runner_id=NULL`` and the host observed by
+        the caller. Setting runner, host, workspace, and branch together keeps
+        readers from observing a token-bound runner without its host affinity.
+
+        :param conversation_id: Session/conversation identifier.
+        :param expected_host_id: Host binding observed before the write.
+        :param runner_id: Server-issued runner identifier.
+        :param host_id: Host that will launch the runner.
+        :param workspace: Canonical workspace on that host.
+        :param git_branch: Worktree branch, or ``None`` when absent.
+        :returns: ``True`` when the observed unbound row was updated;
+            ``False`` when the row is missing or either binding changed.
+        """
+        ...
+
+    @abstractmethod
+    def bind_managed_host_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        expected_runner_id: str | None,
+        expected_host_id: str | None,
+        expected_workspace: str | None,
+        host_id: str,
+        workspace: str,
+    ) -> bool:
+        """
+        Bind a managed host while the session affinity still matches.
+
+        Managed provisioning happens in the background. Its eventual bind
+        must not overwrite a runner or host selected while provisioning was
+        in flight.
+
+        :param conversation_id: Session/conversation identifier.
+        :param expected_runner_id: Runner observed when provisioning began.
+        :param expected_host_id: Host observed when provisioning began.
+        :param expected_workspace: Workspace observed when provisioning began.
+        :param host_id: Provisioned managed host identifier.
+        :param workspace: Canonical workspace in the managed sandbox.
+        :returns: ``True`` when the exact observed affinity was updated;
+            ``False`` when the row is missing or either binding changed.
         """
         ...
 
@@ -1281,6 +1338,71 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def replace_runner_id_if_hostless(
+        self,
+        conversation_id: str,
+        expected_runner_id: str | None,
+        runner_id: str,
+    ) -> bool:
+        """
+        Replace a conversation's runner only while it has no host binding.
+
+        Public PATCH binding uses this conditional write so a concurrent
+        server-issued host launch cannot be overwritten after the route's
+        initial read.
+
+        :param conversation_id: Session/conversation identifier.
+        :param expected_runner_id: Runner id observed before the write.
+        :param runner_id: Registered runner identifier to bind.
+        :returns: ``True`` when the hostless row was updated; ``False``
+            when the row is missing or either binding changed.
+        """
+        ...
+
+    @abstractmethod
+    def replace_runner_id_if_matches(
+        self,
+        conversation_id: str,
+        expected_runner_id: str | None,
+        expected_host_id: str | None,
+        expected_workspace: str | None,
+        runner_id: str,
+    ) -> bool:
+        """
+        Replace a runner while its complete observed affinity still matches.
+
+        Host relaunch uses this conditional write so a launch from one
+        replica cannot overwrite a concurrent PATCH or host bind on another.
+
+        :param conversation_id: Session/conversation identifier.
+        :param expected_runner_id: Runner observed before the write.
+        :param expected_host_id: Host observed before the write.
+        :param expected_workspace: Workspace the launch frame will use.
+        :param runner_id: Server-issued runner identifier to bind.
+        :returns: ``True`` when the exact observed affinity was updated;
+            ``False`` when the row is missing or either binding changed.
+        """
+        ...
+
+    @abstractmethod
+    def clear_runner_id_if_matches(
+        self,
+        conversation_id: str,
+        expected_runner_id: str | None,
+        expected_host_id: str | None,
+    ) -> bool:
+        """
+        Clear a runner only while its observed runner and host still match.
+
+        :param conversation_id: Session/conversation identifier.
+        :param expected_runner_id: Runner id observed before the clear.
+        :param expected_host_id: Host id observed before the clear.
+        :returns: ``True`` when the matching row was cleared; ``False``
+            when the row is missing or either binding changed.
+        """
+        ...
+
+    @abstractmethod
     def clear_runner_id(self, conversation_id: str) -> Conversation:
         """
         Null out ``conversations.runner_id``.
@@ -1322,6 +1444,27 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
+    def clear_host_binding_if_matches(
+        self,
+        conversation_id: str,
+        expected_runner_id: str,
+        expected_host_id: str,
+    ) -> bool:
+        """
+        Clear a full host binding only while the launching owner matches.
+
+        Failed host-launch rollback uses this CAS before removing its
+        worktree, so a timed-out launch cannot erase a newer binding.
+
+        :param conversation_id: Session/conversation identifier.
+        :param expected_runner_id: Runner id issued by the failed launch.
+        :param expected_host_id: Host targeted by the failed launch.
+        :returns: ``True`` when the matching binding was cleared;
+            ``False`` when the row is missing or ownership changed.
         """
         ...
 

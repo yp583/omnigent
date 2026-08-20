@@ -31,6 +31,35 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
+class _RemoteTerminalServerClient(NullServerClient):
+    """Record remote terminal reports and optionally reject them transiently."""
+
+    def __init__(self, *, failures_before_success: int = 0) -> None:
+        self.failures_before_success = failures_before_success
+        self.available = True
+        self.status_posts: list[dict[str, Any]] = []
+        self.success_seen = asyncio.Event()
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response | NullServerClient._Response:
+        body = kwargs.get("json")
+        if not (
+            url.endswith("/events")
+            and isinstance(body, dict)
+            and body.get("type") == "external_session_status"
+        ):
+            return await super().post(url, **kwargs)
+        self.status_posts.append(body)
+        request = httpx.Request("POST", f"http://server{url}")
+        if not self.available or len(self.status_posts) <= self.failures_before_success:
+            return httpx.Response(
+                503,
+                request=request,
+                json={"error": {"code": "RUNNER_UNAVAILABLE"}},
+            )
+        self.success_seen.set()
+        return httpx.Response(204, request=request)
+
+
 @pytest.mark.asyncio
 async def test_interrupt_inserts_cancellation_items_in_history() -> None:
     """Interrupting a turn with dangling function_calls inserts synthetic outputs.
@@ -966,6 +995,275 @@ async def test_external_status_for_untracked_session_does_not_wake() -> None:
     # would mean the orchestrator could wake (and loop on) its own turn-end.
     assert server_client.wake_posts == []
     assert not server_client.wake_seen.is_set()
+
+
+@pytest.mark.asyncio
+async def test_external_status_only_does_not_recover_remote_parent_work() -> None:
+    """A child-runner status copy updates lifecycle without claiming delivery."""
+    from omnigent.runner import app as runner_app
+
+    child_id = "45732281d92648269c6a216c906d0a6b"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "REMOTE_DONE"},
+                "_subagent_status_only": True,
+            },
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert runner_app.get_subagent_work(child_id) is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_subagent_without_local_work_reports_terminal_status_to_server() -> None:
+    """A remotely hosted SDK child reports completion to the parent owner."""
+
+    class _RecordingServerClient(NullServerClient):
+        def __init__(self) -> None:
+            self.status_posts: list[dict[str, Any]] = []
+            self.status_seen = asyncio.Event()
+
+        async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            body = kwargs.get("json")
+            if (
+                url.endswith("/events")
+                and isinstance(body, dict)
+                and body.get("type") == "external_session_status"
+            ):
+                self.status_posts.append(body)
+                self.status_seen.set()
+            return await super().post(url, **kwargs)
+
+    child_id = "54d6d55dceaf49d0ad22001a01707708"
+    server_client = _RecordingServerClient()
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_remote"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_remote"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+            )
+        ),
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": child_id,
+                "agent_id": "26d33ea10ea94b958e954c869089c40f",
+                "sub_agent_name": "worker",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        turn_resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}],
+            },
+        )
+        assert turn_resp.status_code == 202, turn_resp.text
+        await asyncio.wait_for(server_client.status_seen.wait(), timeout=5.0)
+        await client.delete(f"/v1/sessions/{child_id}")
+
+    assert server_client.status_posts == [
+        {
+            "type": "external_session_status",
+            "data": {"status": "idle", "output": ""},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remote_sdk_terminal_report_survives_delayed_parent_availability(
+    _no_wake_backoff: list[float],
+) -> None:
+    """A parent reconnect beyond the old three-attempt window still lands."""
+    child_id = "8bf8c73bfac14bf4ad3926003dc3f237"
+    server_client = _RemoteTerminalServerClient(failures_before_success=5)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+            )
+        ),
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": child_id,
+                "agent_id": "475ed6e8e4ee4272a9c74240b22a262b",
+                "sub_agent_name": "worker",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        app.state.on_proxy_stream_end(child_id)
+        await asyncio.wait_for(server_client.success_seen.wait(), timeout=5.0)
+        await client.delete(f"/v1/sessions/{child_id}")
+
+    assert len(server_client.status_posts) == 6
+    assert len(_no_wake_backoff) == 5
+    assert child_id not in app.state.pending_remote_subagent_terminals
+
+
+@pytest.mark.asyncio
+async def test_remote_sdk_terminal_report_retries_after_budget_without_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    _no_wake_backoff: list[float],
+) -> None:
+    """An exhausted report keeps retrying while the child stays connected."""
+    from omnigent.runner import app as runner_app
+
+    child_id = "7e6cd78e181b4453b01fd17fd788bed8"
+    server_client = _RemoteTerminalServerClient()
+    server_client.available = False
+    replay_waiting = asyncio.Event()
+    resume_replay = asyncio.Event()
+
+    async def _hold_replay(seconds: float) -> None:
+        assert seconds == runner_app._REMOTE_SUBAGENT_TERMINAL_REPLAY_DELAY_S
+        replay_waiting.set()
+        await resume_replay.wait()
+
+    monkeypatch.setattr(runner_app, "_remote_subagent_terminal_replay_sleep", _hold_replay)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+            )
+        ),
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": child_id,
+                "agent_id": "72ea8cad431d409db97bb82e87a17862",
+                "sub_agent_name": "worker",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        app.state.on_proxy_stream_end(
+            child_id,
+            error={"message": "remote harness crashed"},
+        )
+        await asyncio.wait_for(replay_waiting.wait(), timeout=5.0)
+
+        assert len(server_client.status_posts) == (
+            runner_app._REMOTE_SUBAGENT_TERMINAL_MAX_ATTEMPTS
+        )
+        assert app.state.pending_remote_subagent_terminals[child_id] == (
+            "failed",
+            "Error: sub-agent turn failed: remote harness crashed",
+        )
+        assert app.state.has_active_work() is True
+
+        server_client.available = True
+        resume_replay.set()
+        await asyncio.wait_for(server_client.success_seen.wait(), timeout=5.0)
+        assert child_id not in app.state.pending_remote_subagent_terminals
+        assert app.state.has_active_work() is False
+        await client.delete(f"/v1/sessions/{child_id}")
+
+    assert len(server_client.status_posts) == (
+        runner_app._REMOTE_SUBAGENT_TERMINAL_MAX_ATTEMPTS + 1
+    )
+    assert len(_no_wake_backoff) == runner_app._REMOTE_SUBAGENT_TERMINAL_MAX_ATTEMPTS - 1
+    assert child_id not in app.state.pending_remote_subagent_terminals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_path", "expected_status", "expected_output"),
+    [
+        ("completed", "idle", ""),
+        ("crashed", "failed", "Error: sub-agent turn failed: process exited"),
+        ("interrupted", "failed", "[System: sub-agent interrupted]"),
+        (
+            "desynced",
+            "failed",
+            "Error: sub-agent turn failed: runner turn-context desync.",
+        ),
+    ],
+)
+async def test_remote_sdk_terminal_paths_report_to_dispatching_parent(
+    terminal_path: str,
+    expected_status: str,
+    expected_output: str,
+) -> None:
+    """Every SDK terminal path reports instead of waking only local state."""
+    child_id = uuid.uuid4().hex
+    server_client = _RemoteTerminalServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+            )
+        ),
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": child_id,
+                "agent_id": uuid.uuid4().hex,
+                "sub_agent_name": "worker",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        if terminal_path == "interrupted":
+            app.state.interrupted_sessions.add(child_id)
+        elif terminal_path == "desynced":
+            app.state.interrupted_sessions.add(child_id)
+            app.state.desynced_sessions.add(child_id)
+        app.state.on_proxy_stream_end(
+            child_id,
+            error={"message": "process exited"} if terminal_path == "crashed" else None,
+        )
+        await asyncio.wait_for(server_client.success_seen.wait(), timeout=5.0)
+        await client.delete(f"/v1/sessions/{child_id}")
+
+    assert server_client.status_posts == [
+        {
+            "type": "external_session_status",
+            "data": {"status": expected_status, "output": expected_output},
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -2577,6 +2577,217 @@ def test_replace_runner_id_allows_internal_non_session_conversation(
     assert fetched.runner_id == "runner-uuid-1"
 
 
+def test_bind_runner_to_host_if_unbound_sets_complete_affinity_atomically(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """A host launch publishes runner and location as one store operation."""
+    host_id = "2b722f5bed6a4f55bb8a2ec77da65d9e"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation()
+
+    assert (
+        conversation_store.bind_runner_to_host_if_unbound(
+            conv.id,
+            expected_host_id=None,
+            runner_id="runner_token_atomic",
+            host_id=host_id,
+            workspace="/tmp/atomic-workspace",
+            git_branch="atomic/branch",
+        )
+        is True
+    )
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.runner_id == "runner_token_atomic"
+    assert fetched.host_id == host_id
+    assert fetched.workspace == "/tmp/atomic-workspace"
+    assert fetched.git_branch == "atomic/branch"
+
+
+def test_bind_runner_to_existing_host_requires_observed_unbound_state(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Same-host reconnect works, while a stale expected host loses its CAS."""
+    host_id = "7774f2cb86794ca2b58e731361de0bee"
+    other_host_id = "1376b2ea36f74c1da8b6205eef78e31c"
+    _register_host(db_uri, host_id)
+    _register_host(db_uri, other_host_id)
+    conv = conversation_store.create_conversation()
+    conversation_store.set_host_id(
+        conv.id,
+        host_id,
+        workspace="/tmp/existing-workspace",
+        git_branch="existing/branch",
+    )
+
+    assert (
+        conversation_store.bind_runner_to_host_if_unbound(
+            conv.id,
+            expected_host_id=other_host_id,
+            runner_id="runner_stale",
+            host_id=other_host_id,
+            workspace="/tmp/other-workspace",
+            git_branch=None,
+        )
+        is False
+    )
+    assert (
+        conversation_store.bind_runner_to_host_if_unbound(
+            conv.id,
+            expected_host_id=host_id,
+            runner_id="runner_token_reconnect",
+            host_id=host_id,
+            workspace="/tmp/existing-workspace",
+            git_branch="existing/branch",
+        )
+        is True
+    )
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.runner_id == "runner_token_reconnect"
+    assert fetched.host_id == host_id
+    assert fetched.git_branch == "existing/branch"
+
+
+def test_managed_host_bind_requires_complete_observed_affinity(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """A stale background provision cannot overwrite a newer runner binding."""
+    host_id = "fcb4a0ef3d9e4a4d96a1d1abf0f41b7b"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation()
+    conversation_store.replace_runner_id(conv.id, "runner_patch_winner")
+
+    assert (
+        conversation_store.bind_managed_host_if_matches(
+            conv.id,
+            expected_runner_id=None,
+            expected_host_id=None,
+            expected_workspace=None,
+            host_id=host_id,
+            workspace="/tmp/managed-workspace",
+        )
+        is False
+    )
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.runner_id == "runner_patch_winner"
+    assert fetched.host_id is None
+
+
+def test_host_runner_replace_requires_complete_observed_affinity(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """A host relaunch CAS cannot overwrite a runner rotated by another owner."""
+    host_id = "b8396e979f254df2985fce1b2ec6c781"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation(runner_id="runner_observed")
+    conversation_store.set_host_id(conv.id, host_id, workspace="/tmp/host-workspace")
+    conversation_store.replace_runner_id(conv.id, "runner_concurrent")
+
+    assert (
+        conversation_store.replace_runner_id_if_matches(
+            conv.id,
+            "runner_observed",
+            host_id,
+            "/tmp/host-workspace",
+            "runner_stale_launch",
+        )
+        is False
+    )
+    assert (
+        conversation_store.replace_runner_id_if_matches(
+            conv.id,
+            "runner_concurrent",
+            host_id,
+            "/tmp/stale-workspace",
+            "runner_stale_workspace_launch",
+        )
+        is False
+    )
+    assert (
+        conversation_store.replace_runner_id_if_matches(
+            conv.id,
+            "runner_concurrent",
+            host_id,
+            "/tmp/host-workspace",
+            "runner_current_launch",
+        )
+        is True
+    )
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.runner_id == "runner_current_launch"
+    assert fetched.host_id == host_id
+
+
+def test_patch_runner_cas_preserves_concurrent_runner_rotation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Conditional PATCH writes cannot overwrite a pre-host-id rotation."""
+    conv = conversation_store.create_conversation(runner_id="runner_initial")
+
+    assert (
+        conversation_store.replace_runner_id_if_hostless(
+            conv.id,
+            "runner_initial",
+            "runner_hostless",
+        )
+        is True
+    )
+    conversation_store.replace_runner_id(conv.id, "runner_server_rotated")
+
+    assert (
+        conversation_store.replace_runner_id_if_hostless(
+            conv.id,
+            "runner_hostless",
+            "runner_patch",
+        )
+        is False
+    )
+    assert (
+        conversation_store.clear_runner_id_if_matches(
+            conv.id,
+            "runner_hostless",
+            None,
+        )
+        is False
+    )
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.runner_id == "runner_server_rotated"
+    assert fetched.host_id is None
+
+
+def test_clear_runner_cas_requires_observed_host_and_runner(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """A stale clear cannot erase a runner rotated after its observed read."""
+    host_id = "a45bd57de47947e8a1906539e5a45abf"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation(runner_id="runner_observed")
+    conversation_store.set_host_id(conv.id, host_id, workspace="/tmp/affinity-workspace")
+    conversation_store.replace_runner_id(conv.id, "runner_fresh")
+
+    assert (
+        conversation_store.clear_runner_id_if_matches(
+            conv.id,
+            "runner_observed",
+            host_id,
+        )
+        is False
+    )
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.runner_id == "runner_fresh"
+    assert fetched.host_id == host_id
+
+
 def test_list_conversations_by_runner_id_filters(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -2868,6 +3079,71 @@ def test_clear_host_binding_missing_conversation_raises(
 
     with pytest.raises(ConversationNotFoundError):
         conversation_store.clear_host_binding("ad563e906854634c49e1a6fd2fbb31d4")
+
+
+def test_clear_host_binding_cas_preserves_newer_owner_and_labels(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale failed-launch rollback cannot clear a newer binding."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_module
+
+    host_id = "cb296574102744c6a04486f95d9f4fe1"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"preserved": "yes"})
+    assert (
+        conversation_store.bind_runner_to_host_if_unbound(
+            conv.id,
+            expected_host_id=None,
+            runner_id="runner_failed_launch",
+            host_id=host_id,
+            workspace="/tmp/failed-launch-worktree",
+            git_branch="failed/branch",
+        )
+        is True
+    )
+    before_rotation = conversation_store.get_conversation(conv.id)
+    assert before_rotation is not None
+    conversation_store.replace_runner_id(conv.id, "runner_new_owner")
+    before_stale_clear = conversation_store.get_conversation(conv.id)
+    assert before_stale_clear is not None
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: before_stale_clear.updated_at + 100)
+    assert (
+        conversation_store.clear_host_binding_if_matches(
+            conv.id,
+            "runner_failed_launch",
+            host_id,
+        )
+        is False
+    )
+    preserved = conversation_store.get_conversation(conv.id)
+    assert preserved is not None
+    assert preserved.runner_id == "runner_new_owner"
+    assert preserved.host_id == host_id
+    assert preserved.workspace == "/tmp/failed-launch-worktree"
+    assert preserved.git_branch == "failed/branch"
+    assert preserved.labels["preserved"] == "yes"
+    assert preserved.updated_at == before_stale_clear.updated_at
+
+    assert (
+        conversation_store.clear_host_binding_if_matches(
+            conv.id,
+            "runner_new_owner",
+            host_id,
+        )
+        is True
+    )
+    cleared = conversation_store.get_conversation(conv.id)
+    assert cleared is not None
+    assert cleared.runner_id is None
+    assert cleared.host_id is None
+    assert cleared.workspace is None
+    assert cleared.git_branch is None
+    assert cleared.labels["preserved"] == "yes"
+    assert cleared.updated_at == before_stale_clear.updated_at + 100
 
 
 def test_create_session_with_agent_records_workspace(

@@ -2895,6 +2895,108 @@ class SqlAlchemyConversationStore(ConversationStore):
             result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
 
+    def bind_runner_to_host_if_unbound(
+        self,
+        conversation_id: str,
+        *,
+        expected_host_id: str | None,
+        runner_id: str,
+        host_id: str,
+        workspace: str,
+        git_branch: str | None,
+    ) -> bool:
+        """Atomically bind a runner together with its complete host location."""
+        from sqlalchemy import update
+
+        host_clause = (
+            SqlConversationMetadata.host_id.is_(None)
+            if expected_host_id is None
+            else SqlConversationMetadata.host_id == expected_host_id
+        )
+        with self._session("bind_runner_to_host_if_unbound") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id.is_(None),
+                        host_clause,
+                    )
+                    .values(
+                        runner_id=runner_id,
+                        host_id=host_id,
+                        workspace=workspace,
+                        git_branch=git_branch,
+                    )
+                ),
+            )
+            bound = result.rowcount == 1
+        if bound:
+            with self._conv_session("bind_runner_to_host_if_unbound") as session:
+                row = session.get(
+                    SqlConversation,
+                    (current_workspace_id(), conversation_id),
+                )
+                if row is not None:
+                    row.updated_at = now_epoch()
+        return bound
+
+    def bind_managed_host_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        expected_runner_id: str | None,
+        expected_host_id: str | None,
+        expected_workspace: str | None,
+        host_id: str,
+        workspace: str,
+    ) -> bool:
+        """Bind a managed host only while the observed affinity still matches."""
+        from sqlalchemy import update
+
+        runner_clause = (
+            SqlConversationMetadata.runner_id.is_(None)
+            if expected_runner_id is None
+            else SqlConversationMetadata.runner_id == expected_runner_id
+        )
+        host_clause = (
+            SqlConversationMetadata.host_id.is_(None)
+            if expected_host_id is None
+            else SqlConversationMetadata.host_id == expected_host_id
+        )
+        workspace_clause = (
+            SqlConversationMetadata.workspace.is_(None)
+            if expected_workspace is None
+            else SqlConversationMetadata.workspace == expected_workspace
+        )
+        with self._session("bind_managed_host_if_matches") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        runner_clause,
+                        host_clause,
+                        workspace_clause,
+                    )
+                    .values(host_id=host_id, workspace=workspace)
+                ),
+            )
+            bound = result.rowcount == 1
+        if bound:
+            with self._conv_session("bind_managed_host_if_matches") as session:
+                row = session.get(
+                    SqlConversation,
+                    (current_workspace_id(), conversation_id),
+                )
+                if row is not None:
+                    row.updated_at = now_epoch()
+        return bound
+
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         """
         Stamp ``runner_last_seen`` for sessions bound to live runners.
@@ -3018,6 +3120,141 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    def replace_runner_id_if_hostless(
+        self,
+        conversation_id: str,
+        expected_runner_id: str | None,
+        runner_id: str,
+    ) -> bool:
+        """Replace a runner only while its observed hostless binding remains."""
+        from sqlalchemy import update
+
+        runner_clause = (
+            SqlConversationMetadata.runner_id.is_(None)
+            if expected_runner_id is None
+            else SqlConversationMetadata.runner_id == expected_runner_id
+        )
+        with self._session("replace_runner_id_if_hostless") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.host_id.is_(None),
+                        runner_clause,
+                    )
+                    .values(runner_id=runner_id)
+                ),
+            )
+            replaced = result.rowcount == 1
+        if replaced:
+            with self._conv_session("replace_runner_id_if_hostless") as session:
+                row = session.get(
+                    SqlConversation,
+                    (current_workspace_id(), conversation_id),
+                )
+                if row is not None:
+                    row.updated_at = now_epoch()
+        return replaced
+
+    def replace_runner_id_if_matches(
+        self,
+        conversation_id: str,
+        expected_runner_id: str | None,
+        expected_host_id: str | None,
+        expected_workspace: str | None,
+        runner_id: str,
+    ) -> bool:
+        """Replace a runner only while its observed affinity still matches."""
+        from sqlalchemy import update
+
+        runner_clause = (
+            SqlConversationMetadata.runner_id.is_(None)
+            if expected_runner_id is None
+            else SqlConversationMetadata.runner_id == expected_runner_id
+        )
+        host_clause = (
+            SqlConversationMetadata.host_id.is_(None)
+            if expected_host_id is None
+            else SqlConversationMetadata.host_id == expected_host_id
+        )
+        workspace_clause = (
+            SqlConversationMetadata.workspace.is_(None)
+            if expected_workspace is None
+            else SqlConversationMetadata.workspace == expected_workspace
+        )
+        with self._session("replace_runner_id_if_matches") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        runner_clause,
+                        host_clause,
+                        workspace_clause,
+                    )
+                    .values(runner_id=runner_id)
+                ),
+            )
+            replaced = result.rowcount == 1
+        if replaced:
+            with self._conv_session("replace_runner_id_if_matches") as session:
+                row = session.get(
+                    SqlConversation,
+                    (current_workspace_id(), conversation_id),
+                )
+                if row is not None:
+                    row.updated_at = now_epoch()
+        return replaced
+
+    def clear_runner_id_if_matches(
+        self,
+        conversation_id: str,
+        expected_runner_id: str | None,
+        expected_host_id: str | None,
+    ) -> bool:
+        """Clear a runner only if its observed runner and host still match."""
+        from sqlalchemy import update
+
+        runner_clause = (
+            SqlConversationMetadata.runner_id.is_(None)
+            if expected_runner_id is None
+            else SqlConversationMetadata.runner_id == expected_runner_id
+        )
+        host_clause = (
+            SqlConversationMetadata.host_id.is_(None)
+            if expected_host_id is None
+            else SqlConversationMetadata.host_id == expected_host_id
+        )
+        with self._session("clear_runner_id_if_matches") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        runner_clause,
+                        host_clause,
+                    )
+                    .values(runner_id=None)
+                ),
+            )
+            cleared = result.rowcount == 1
+        if cleared:
+            with self._conv_session("clear_runner_id_if_matches") as session:
+                row = session.get(
+                    SqlConversation,
+                    (current_workspace_id(), conversation_id),
+                )
+                if row is not None:
+                    row.updated_at = now_epoch()
+        return cleared
+
     def clear_runner_id(self, conversation_id: str) -> Conversation:
         """
         Null out ``conversations.runner_id``. Atomic last-write-wins.
@@ -3079,6 +3316,45 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
+
+    def clear_host_binding_if_matches(
+        self,
+        conversation_id: str,
+        expected_runner_id: str,
+        expected_host_id: str,
+    ) -> bool:
+        """Clear a full host binding only if the launching owner still matches."""
+        from sqlalchemy import update
+
+        with self._session("clear_failed_host_launch_binding") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id == expected_runner_id,
+                        SqlConversationMetadata.host_id == expected_host_id,
+                    )
+                    .values(
+                        runner_id=None,
+                        host_id=None,
+                        workspace=None,
+                        git_branch=None,
+                    )
+                ),
+            )
+            cleared = result.rowcount == 1
+        if cleared:
+            with self._conv_session("clear_failed_host_launch_binding") as session:
+                row = session.get(
+                    SqlConversation,
+                    (current_workspace_id(), conversation_id),
+                )
+                if row is not None:
+                    row.updated_at = now_epoch()
+        return cleared
 
     def list_conversations_by_runner_id(
         self,

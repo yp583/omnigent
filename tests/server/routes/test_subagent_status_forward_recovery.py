@@ -9,6 +9,7 @@ the parent never receives the child result.
 
 from __future__ import annotations
 
+import asyncio
 import types
 from typing import Any
 
@@ -20,7 +21,7 @@ from omnigent.server.routes.sessions import (
     _recover_subagent_status_forward_via_parent,
     _RunnerForwardResult,
 )
-from omnigent.stores.conversation_store import ConversationNotFoundError
+from omnigent.server.session_affinity import serialized_session_affinity_mutation
 
 
 def _conv(
@@ -29,36 +30,69 @@ def _conv(
     runner_id: str | None,
     parent_id: str | None = None,
     root_id: str | None = None,
+    host_id: str | None = None,
 ) -> Any:
     """Build a minimal conversation stand-in with the fields the helper reads."""
     return types.SimpleNamespace(
         id=conv_id,
         runner_id=runner_id,
+        host_id=host_id,
         parent_conversation_id=parent_id,
         root_conversation_id=root_id or conv_id,
     )
 
 
 class _FakeStore:
-    """Records ``replace_runner_id`` calls and serves a fixed parent."""
+    """Records conditional runner heals and serves one child and parent."""
 
-    def __init__(self, parent: Any | None, *, raise_on_rebind: bool = False) -> None:
+    def __init__(self, child: Any, parent: Any | None, *, lose_rebind: bool = False) -> None:
+        self._child = child
         self._parent = parent
-        self._raise_on_rebind = raise_on_rebind
+        self._lose_rebind = lose_rebind
         self.rebinds: list[tuple[str, str]] = []
 
     def get_conversation(self, conversation_id: str) -> Any | None:
+        if self._child is not None and conversation_id == self._child.id:
+            return self._child
         if self._parent is not None and conversation_id == self._parent.id:
             return self._parent
         return None
 
-    def replace_runner_id(self, conversation_id: str, runner_id: str) -> Any:
-        if self._raise_on_rebind:
-            # Simulate the child row being deleted between post_event reading
-            # it and this heal (a mid-teardown race).
-            raise ConversationNotFoundError(conversation_id)
+    def replace_runner_id_if_hostless(
+        self,
+        conversation_id: str,
+        expected_runner_id: str | None,
+        runner_id: str,
+    ) -> bool:
+        if self._lose_rebind:
+            self._child = None
+            return False
+        if (
+            self._child is None
+            or conversation_id != self._child.id
+            or self._child.host_id is not None
+            or self._child.runner_id != expected_runner_id
+        ):
+            return False
         self.rebinds.append((conversation_id, runner_id))
-        return _conv(conversation_id, runner_id=runner_id)
+        self._child = _conv(
+            conversation_id,
+            runner_id=runner_id,
+            parent_id=self._child.parent_conversation_id,
+            root_id=self._child.root_conversation_id,
+        )
+        return True
+
+    def bind_cloud_host(self, host_id: str, runner_id: str) -> None:
+        """Model a cloud host bind that owns both host and runner affinity."""
+        assert self._child is not None
+        self._child = _conv(
+            self._child.id,
+            runner_id=runner_id,
+            parent_id=self._child.parent_conversation_id,
+            root_id=self._child.root_conversation_id,
+            host_id=host_id,
+        )
 
 
 @pytest.fixture
@@ -102,7 +136,7 @@ async def test_recover_rebinds_to_parent_runner_and_redelivers(
     """
     child = _conv("conv_child", runner_id="runner_old", parent_id="conv_parent")
     parent = _conv("conv_parent", runner_id="runner_new")
-    store = _FakeStore(parent)
+    store = _FakeStore(child, parent)
 
     result = await _recover_subagent_status_forward_via_parent(
         child,
@@ -120,6 +154,51 @@ async def test_recover_rebinds_to_parent_runner_and_redelivers(
     assert _patch_forward_and_wait["waited_for"] == ["conv_parent"]
 
 
+async def test_heal_serializes_cloud_host_bind_during_ancestor_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cloud host bind waits for healing and remains the final affinity owner."""
+    child = _conv("conv_child", runner_id="runner_old", parent_id="conv_parent")
+    store = _FakeStore(child, _conv("conv_parent", runner_id="runner_parent"))
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    live_client = object()
+
+    async def _blocked_wait(*_args: Any, **_kwargs: Any) -> object:
+        wait_started.set()
+        await release_wait.wait()
+        return live_client
+
+    monkeypatch.setattr(sessions_mod, "_wait_for_runner_client", _blocked_wait)
+    heal_task = asyncio.create_task(
+        sessions_mod._heal_subagent_runner_binding_via_parent(
+            child,
+            runner_router=None,
+            tunnel_registry=object(),
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+    )
+    await asyncio.wait_for(wait_started.wait(), timeout=1.0)
+
+    async def _cloud_bind() -> None:
+        async with serialized_session_affinity_mutation(child.id):
+            store.bind_cloud_host("host_cloud", "runner_cloud")
+
+    bind_task = asyncio.create_task(_cloud_bind())
+    await asyncio.sleep(0)
+    bind_waited_for_heal = not bind_task.done()
+    release_wait.set()
+    healed = await heal_task
+    await bind_task
+
+    final = store.get_conversation(child.id)
+    assert bind_waited_for_heal
+    assert healed is live_client
+    assert final is not None
+    assert final.host_id == "host_cloud"
+    assert final.runner_id == "runner_cloud"
+
+
 async def test_recover_gives_up_when_parent_runner_never_connects(
     _patch_forward_and_wait: dict[str, Any],
 ) -> None:
@@ -131,7 +210,7 @@ async def test_recover_gives_up_when_parent_runner_never_connects(
     """
     _patch_forward_and_wait["wait_returns"] = None  # tunnel never comes up
     child = _conv("conv_child", runner_id="runner_old", parent_id="conv_parent")
-    store = _FakeStore(_conv("conv_parent", runner_id="runner_new"))
+    store = _FakeStore(child, _conv("conv_parent", runner_id="runner_new"))
 
     result = await _recover_subagent_status_forward_via_parent(
         child,
@@ -156,7 +235,7 @@ async def test_recover_no_parent_returns_none(
     root points at itself — neither has a distinct parent runner to heal to.
     """
     child = _conv("conv_orphan", runner_id="runner_old", parent_id=None, root_id="conv_orphan")
-    store = _FakeStore(None)
+    store = _FakeStore(child, None)
 
     result = await _recover_subagent_status_forward_via_parent(
         child,
@@ -182,7 +261,7 @@ async def test_recover_same_runner_skips_rebind_but_retries(
     but should still re-forward after waiting out the reconnect gap.
     """
     child = _conv("conv_child", runner_id="runner_same", parent_id="conv_parent")
-    store = _FakeStore(_conv("conv_parent", runner_id="runner_same"))
+    store = _FakeStore(child, _conv("conv_parent", runner_id="runner_same"))
 
     result = await _recover_subagent_status_forward_via_parent(
         child,
@@ -210,7 +289,11 @@ async def test_recover_deleted_child_race_degrades_to_none(
     500. (Polly review note on PR #1446.)
     """
     child = _conv("conv_child", runner_id="runner_old", parent_id="conv_parent")
-    store = _FakeStore(_conv("conv_parent", runner_id="runner_new"), raise_on_rebind=True)
+    store = _FakeStore(
+        child,
+        _conv("conv_parent", runner_id="runner_new"),
+        lose_rebind=True,
+    )
 
     result = await _recover_subagent_status_forward_via_parent(
         child,
@@ -236,7 +319,7 @@ async def test_recover_falls_back_to_root_when_no_direct_parent(
     nesting) still belongs to a root conversation whose runner is the live one.
     """
     child = _conv("conv_child", runner_id="runner_old", parent_id=None, root_id="conv_root")
-    store = _FakeStore(_conv("conv_root", runner_id="runner_new"))
+    store = _FakeStore(child, _conv("conv_root", runner_id="runner_new"))
 
     result = await _recover_subagent_status_forward_via_parent(
         child,
@@ -275,7 +358,17 @@ async def test_recover_real_body_retry_resolves_healed_runner() -> None:
         def get_conversation(self, conversation_id: str) -> Any | None:
             return convs.get(conversation_id)
 
-        def replace_runner_id(self, conversation_id: str, runner_id: str) -> Any:
+        def replace_runner_id_if_hostless(
+            self,
+            conversation_id: str,
+            expected_runner_id: str | None,
+            runner_id: str,
+        ) -> bool:
+            if (
+                convs[conversation_id].host_id is not None
+                or convs[conversation_id].runner_id != expected_runner_id
+            ):
+                return False
             rebinds.append((conversation_id, runner_id))
             prev = convs[conversation_id]
             convs[conversation_id] = _conv(
@@ -284,7 +377,7 @@ async def test_recover_real_body_retry_resolves_healed_runner() -> None:
                 parent_id=prev.parent_conversation_id,
                 root_id=prev.root_conversation_id,
             )
-            return convs[conversation_id]
+            return True
 
     posted: list[str] = []
 

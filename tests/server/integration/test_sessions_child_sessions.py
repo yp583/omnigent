@@ -1906,6 +1906,142 @@ async def test_subagent_message_heals_stale_runner_binding_via_parent(
     assert healed_for == [child["id"]], "heal was not invoked for the stale child"
 
 
+async def test_host_bound_subagent_message_never_reroutes_via_parent(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned child recovers on its host even after an old parent-heal misbind."""
+    child_payload = await _create_native_child(client, name="msg-host-affinity")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.get_conversation(child_payload["id"])
+    assert child is not None
+    assert child.parent_conversation_id is not None
+
+    host_id = "84cc31df826644e98d72ee849e1a37fa"
+    workspace = "/home/ubuntu/omnigent-worktrees/impl-task-1"
+    local_parent_runner = "runner_local_parent"
+    remote_child_runner = "runner_remote_child"
+    store.set_host_id(child.id, host_id, workspace=workspace)
+    store.set_host_id(
+        child.parent_conversation_id,
+        host_id,
+        workspace="/home/ubuntu/omnigent-parent",
+    )
+    store.replace_runner_id(child.parent_conversation_id, local_parent_runner)
+    store.replace_runner_id(child.id, local_parent_runner)
+    child = store.get_conversation(child.id)
+    assert child is not None
+
+    # The central repair helper must fail closed for every host-bound child,
+    # before it waits for or mutates an ancestor runner binding.
+    healed = await sessions_module._heal_subagent_runner_binding_via_parent(
+        child,
+        None,
+        None,
+        store,
+    )
+    assert healed is None
+    assert store.get_conversation(child.id).runner_id == local_parent_runner  # type: ignore[union-attr]
+
+    remote_requests: list[str] = []
+
+    def _remote_handler(request: httpx.Request) -> httpx.Response:
+        remote_requests.append(request.url.path)
+        return httpx.Response(204)
+
+    remote_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_remote_handler),
+        base_url="http://remote-runner",
+    )
+    launched: list[tuple[str, str | None]] = []
+
+    class _TargetHostRegistry:
+        def get(self, requested_host_id: str) -> object | None:
+            return object() if requested_host_id == host_id else None
+
+    async def _launch_on_persisted_host(
+        launch_conv: Any,
+        launch_store: SqlAlchemyConversationStore,
+        *_args: Any,
+    ) -> Any:
+        launched.append((launch_conv.host_id, launch_conv.workspace))
+        launch_store.replace_runner_id(launch_conv.id, remote_child_runner)
+        return sessions_module._HostLaunchAttempt(runner_id=remote_child_runner)
+
+    async def _wait_for_remote(*_args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        return remote_runner if kwargs.get("runner_id") == remote_child_runner else None
+
+    async def _unexpected_parent_heal(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("host-bound child must never heal onto its parent runner")
+
+    async def _unexpected_existing_runner(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("foreign ancestor runner must not be resolved or used")
+
+    async def _unexpected_connect_grace(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("a known foreign ancestor binding must skip its connect grace")
+
+    async def _session_initialized(*args: Any, **_kwargs: Any) -> bool:
+        assert args[2] is remote_runner
+        return True
+
+    async def _relay_ready(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _no_managed_wake(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(app.state, "host_registry", _TargetHostRegistry())
+    monkeypatch.setattr(routes_events_module, "_launch_runner_on_host", _launch_on_persisted_host)
+    monkeypatch.setattr(routes_events_module, "_wait_for_runner_client", _wait_for_remote)
+    monkeypatch.setattr(
+        routes_events_module,
+        "_wait_for_host_bound_runner_client",
+        _unexpected_connect_grace,
+    )
+    monkeypatch.setattr(
+        routes_events_module,
+        "_heal_subagent_runner_binding_via_parent",
+        _unexpected_parent_heal,
+    )
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _unexpected_existing_runner)
+    monkeypatch.setattr(
+        routes_events_module,
+        "_ensure_runner_session_initialized",
+        _session_initialized,
+    )
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_relay_ready", _relay_ready)
+    monkeypatch.setattr(
+        routes_events_module,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _no_managed_wake,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue remotely"}],
+                },
+            },
+        )
+    finally:
+        await remote_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    assert launched == [(host_id, workspace)]
+    rebound = store.get_conversation(child.id)
+    assert rebound is not None
+    assert rebound.host_id == host_id
+    assert rebound.workspace == workspace
+    assert rebound.runner_id == remote_child_runner
+    assert remote_requests == [f"/v1/sessions/{child.id}/events"]
+
+
 async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

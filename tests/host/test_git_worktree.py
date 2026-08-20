@@ -142,6 +142,28 @@ def git_repo(tmp_path: Path) -> Iterator[Path]:
     yield repo
 
 
+def _remote_clone(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create an upstream worktree, its bare remote, and a stale-capable clone."""
+    upstream = (tmp_path / "upstream").resolve()
+    remote = (tmp_path / "remote.git").resolve()
+    clone = (tmp_path / "clone").resolve()
+    upstream.mkdir()
+    _git(upstream, "init", "-q", "-b", "main")
+    (upstream / "README.md").write_text("initial")
+    _git(upstream, "add", ".")
+    _git(upstream, "commit", "-q", "-m", "initial")
+    _git(upstream, "checkout", "-q", "-b", "dev")
+    (upstream / "dev.txt").write_text("old")
+    _git(upstream, "add", ".")
+    _git(upstream, "commit", "-q", "-m", "old dev")
+
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    _git(upstream, "remote", "add", "origin", str(remote))
+    _git(upstream, "push", "-q", "origin", "main", "dev")
+    _git(tmp_path, "clone", "-q", str(remote), str(clone))
+    return upstream, remote, clone
+
+
 def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     """A new worktree lands at ``<repo>-worktrees/<branch>`` with the branch checked out."""
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/login")
@@ -213,8 +235,114 @@ def test_create_worktree_from_base_branch(git_repo: Path) -> None:
     assert _rev_parse(Path(created.worktree_path)) != _rev_parse(git_repo, "main")
 
 
+@pytest.mark.parametrize("base_branch", ["origin/dev", "refs/remotes/origin/dev"])
+def test_create_worktree_refreshes_stale_remote_tracking_base(
+    tmp_path: Path, base_branch: str
+) -> None:
+    """An exact remote-tracking base is refreshed before the branch is created."""
+    upstream, _, clone = _remote_clone(tmp_path)
+    stale_tip = _rev_parse(clone, "origin/dev")
+
+    (upstream / "dev.txt").write_text("new")
+    _git(upstream, "add", ".")
+    _git(upstream, "commit", "-q", "-m", "new dev")
+    _git(upstream, "push", "-q", "origin", "dev")
+    current_tip = _rev_parse(upstream, "dev")
+    assert stale_tip != current_tip
+
+    created = create_worktree(
+        repo_path=str(clone), branch_name="from-current-dev", base_branch=base_branch
+    )
+
+    assert _rev_parse(Path(created.worktree_path)) == current_tip
+    assert _rev_parse(clone, "origin/dev") == current_tip
+
+
+def test_create_worktree_honors_custom_remote_fetch_mapping(tmp_path: Path) -> None:
+    """A custom tracking namespace refreshes from its configured remote source."""
+    upstream, _, clone = _remote_clone(tmp_path)
+    _git(upstream, "push", "-q", "origin", "dev:refs/pull/123/head")
+    _git(clone, "config", "--add", "remote.origin.fetch", "^refs/heads/pr/*")
+    _git(
+        clone,
+        "config",
+        "--add",
+        "remote.origin.fetch",
+        "+refs/pull/*/head:refs/remotes/origin/pr/*",
+    )
+    _git(clone, "fetch", "-q", "origin")
+    stale_tip = _rev_parse(clone, "origin/pr/123")
+
+    (upstream / "dev.txt").write_text("custom-new")
+    _git(upstream, "add", ".")
+    _git(upstream, "commit", "-q", "-m", "custom new")
+    _git(upstream, "push", "-q", "origin", "dev:refs/pull/123/head")
+    current_tip = _rev_parse(upstream, "dev")
+    assert stale_tip != current_tip
+
+    created = create_worktree(
+        repo_path=str(clone), branch_name="from-current-pr", base_branch="origin/pr/123"
+    )
+
+    assert _rev_parse(Path(created.worktree_path)) == current_tip
+    assert _rev_parse(clone, "origin/pr/123") == current_tip
+
+
+def test_create_worktree_honors_negative_remote_fetch_mapping(tmp_path: Path) -> None:
+    """A remote branch excluded by configured policy is not fetched or used stale."""
+    _, _, clone = _remote_clone(tmp_path)
+    _git(clone, "config", "--add", "remote.origin.fetch", "^refs/heads/dev")
+
+    with pytest.raises(WorktreeError, match="is excluded or not covered"):
+        create_worktree(
+            repo_path=str(clone), branch_name="must-not-bypass-policy", base_branch="origin/dev"
+        )
+
+    assert _worktree_count(clone) == 1
+    assert not _branch_exists(clone, "must-not-bypass-policy")
+
+
+def test_create_worktree_fails_closed_when_remote_base_refresh_fails(tmp_path: Path) -> None:
+    """A deleted remote base cannot fall back to its stale local tracking ref."""
+    upstream, _, clone = _remote_clone(tmp_path)
+    assert _rev_parse(clone, "origin/dev")
+    _git(upstream, "push", "-q", "origin", "--delete", "dev")
+
+    with pytest.raises(WorktreeError, match="failed to refresh remote base branch"):
+        create_worktree(
+            repo_path=str(clone), branch_name="must-not-use-stale-dev", base_branch="origin/dev"
+        )
+
+    assert _worktree_count(clone) == 1
+    assert not _branch_exists(clone, "must-not-use-stale-dev")
+
+
+def test_create_worktree_fails_closed_for_tracking_ref_without_remote(git_repo: Path) -> None:
+    """A cached tracking ref cannot be used after its configured remote is removed."""
+    _git(git_repo, "update-ref", "refs/remotes/removed/dev", "HEAD")
+
+    with pytest.raises(WorktreeError, match="its remote is not configured"):
+        create_worktree(
+            repo_path=str(git_repo), branch_name="must-not-use-orphan", base_branch="removed/dev"
+        )
+
+    assert _worktree_count(git_repo) == 1
+    assert not _branch_exists(git_repo, "must-not-use-orphan")
+
+
+def test_create_worktree_preserves_remote_shaped_local_branch(git_repo: Path) -> None:
+    """A local branch named like ``origin/dev`` remains a local exact base."""
+    _git(git_repo, "branch", "origin/dev")
+
+    created = create_worktree(
+        repo_path=str(git_repo), branch_name="from-local", base_branch="origin/dev"
+    )
+
+    assert _rev_parse(Path(created.worktree_path)) == _rev_parse(git_repo, "refs/heads/origin/dev")
+
+
 def test_create_worktree_unknown_base_branch_fails(git_repo: Path) -> None:
-    """An unresolvable base ref fails loud (after the best-effort fetch)."""
+    """An unresolvable local base ref fails loud."""
     with pytest.raises(WorktreeError) as exc:
         create_worktree(repo_path=str(git_repo), branch_name="x", base_branch="nope-not-a-branch")
     # Proves _ensure_base_resolvable rejects rather than silently

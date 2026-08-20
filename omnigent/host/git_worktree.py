@@ -294,41 +294,236 @@ def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
     )
 
 
-def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
-    """Make ``base_branch`` resolvable, fetching once if needed.
+def _remote_tracking_branch(repo_root: str, base_branch: str) -> tuple[str, str] | None:
+    """Return the configured remote and full ref for an exact remote ref.
 
-    If the base ref doesn't resolve locally (e.g. a remote-tracking
-    branch not yet fetched), attempt a single ``git fetch`` and
-    re-check. A fetch failure (offline) is not fatal on its own — the
-    subsequent re-check produces the user-facing error.
+    Existing refs are classified by their canonical symbolic name so a
+    local branch named ``origin/main`` is not mistaken for the remote-
+    tracking ref with the same short name. Missing refs are matched only
+    against configured remote names, allowing a newly-created remote branch
+    to be fetched before it exists locally.
+
+    :param repo_root: Absolute repo work-tree root, e.g.
+        ``"/Users/alice/myrepo"``.
+    :param base_branch: Base ref the user requested, e.g. ``"origin/main"``.
+    :returns: ``(remote, full_ref)`` for an exact remote-tracking branch, or
+        ``None`` for a local ref, object ID, or revision expression.
+    :raises WorktreeError: If an existing remote-tracking ref names a remote
+        that is no longer configured and therefore cannot be refreshed.
+    """
+    symbolic = _run_git(
+        [
+            "rev-parse",
+            "--symbolic-full-name",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            base_branch,
+        ],
+        cwd=repo_root,
+    )
+    if symbolic.returncode == 0:
+        full_ref = symbolic.stdout.strip()
+        if not full_ref.startswith("refs/remotes/"):
+            return None
+        # ``origin/HEAD`` is normally a symbolic alias for the default remote
+        # branch. Refresh the branch it targets, not a nonexistent branch
+        # literally named ``HEAD``.
+        symbolic_target = _run_git(["symbolic-ref", "--quiet", full_ref], cwd=repo_root)
+        if symbolic_target.returncode == 0:
+            full_ref = symbolic_target.stdout.strip()
+        remote_ref = full_ref.removeprefix("refs/remotes/")
+        existing_remote_ref = True
+    elif base_branch.startswith("refs/remotes/"):
+        full_ref = base_branch
+        remote_ref = base_branch.removeprefix("refs/remotes/")
+        existing_remote_ref = False
+    else:
+        full_ref = f"refs/remotes/{base_branch}"
+        remote_ref = base_branch
+        existing_remote_ref = False
+
+    remotes = _run_git(["remote"], cwd=repo_root)
+    if remotes.returncode != 0:
+        if existing_remote_ref:
+            raise WorktreeError(
+                f"cannot refresh remote base branch {base_branch!r}: "
+                "configured remotes could not be read"
+            )
+        return None
+    # Longest first supports configured remote names that contain a slash.
+    for remote in sorted(remotes.stdout.splitlines(), key=len, reverse=True):
+        prefix = f"{remote}/"
+        if not remote_ref.startswith(prefix):
+            continue
+        valid = _run_git(["check-ref-format", full_ref], cwd=repo_root)
+        if valid.returncode == 0:
+            return remote, full_ref
+    if existing_remote_ref:
+        raise WorktreeError(
+            f"cannot refresh remote base branch {base_branch!r}: its remote is not configured"
+        )
+    return None
+
+
+def _refspec_capture(pattern: str, ref: str) -> str | None:
+    """Return the wildcard capture when ``pattern`` matches ``ref``.
+
+    :param pattern: Full ref or single-wildcard refspec side.
+    :param ref: Full ref to match.
+    :returns: The wildcard capture (an empty string for an exact match), or
+        ``None`` when the pattern does not match or is malformed.
+    """
+    if "*" not in pattern:
+        return "" if pattern == ref else None
+    if pattern.count("*") != 1:
+        return None
+    prefix, suffix = pattern.split("*", 1)
+    if not ref.startswith(prefix) or not ref.endswith(suffix):
+        return None
+    capture_end = len(ref) - len(suffix) if suffix else len(ref)
+    if capture_end < len(prefix):
+        return None
+    return ref[len(prefix) : capture_end]
+
+
+def _configured_fetch_refspec(
+    repo_root: str,
+    *,
+    remote: str,
+    remote_ref: str,
+    base_branch: str,
+) -> str:
+    """Derive a targeted refspec from a remote's configured fetch mappings.
+
+    Positive exact or single-wildcard mappings are considered, and negative
+    source refspecs are honored. This avoids assuming every tracking ref maps
+    to ``refs/heads/<same-name>`` or overriding the repository owner's force
+    policy.
+
+    :param repo_root: Absolute repo work-tree root.
+    :param remote: Configured remote name, e.g. ``"origin"``.
+    :param remote_ref: Canonical destination, e.g.
+        ``"refs/remotes/origin/main"``.
+    :param base_branch: Original user-facing base for error messages.
+    :returns: A targeted configured refspec, including ``+`` only when the
+        matching configured mapping permits force updates.
+    :raises WorktreeError: If configuration cannot map the tracking ref to one
+        unambiguous, non-excluded remote source.
+    """
+    configured = _run_git(["config", "--get-all", f"remote.{remote}.fetch"], cwd=repo_root)
+    if configured.returncode not in {0, 1}:
+        raise WorktreeError(
+            f"cannot refresh remote base branch {base_branch!r}: "
+            f"fetch configuration for remote {remote!r} could not be read"
+        )
+
+    candidates: list[tuple[bool, str]] = []
+    negative_patterns: list[str] = []
+    for raw in configured.stdout.splitlines():
+        spec = raw.strip()
+        if spec.startswith("^"):
+            negative_patterns.append(spec[1:])
+            continue
+        force = spec.startswith("+")
+        if force:
+            spec = spec[1:]
+        if ":" not in spec:
+            continue
+        source_pattern, destination_pattern = spec.split(":", 1)
+        capture = _refspec_capture(destination_pattern, remote_ref)
+        if capture is None:
+            continue
+        if source_pattern.count("*") != destination_pattern.count("*"):
+            continue
+        source = source_pattern.replace("*", capture)
+        candidates.append((force, source))
+
+    allowed = {
+        candidate
+        for candidate in candidates
+        if not any(
+            _refspec_capture(pattern, candidate[1]) is not None for pattern in negative_patterns
+        )
+    }
+    if len(allowed) != 1:
+        detail = "is excluded or not covered" if not allowed else "has ambiguous mappings"
+        raise WorktreeError(
+            f"cannot refresh remote base branch {base_branch!r}: "
+            f"{remote_ref} {detail} in remote {remote!r} fetch configuration"
+        )
+    force, source = allowed.pop()
+    prefix = "+" if force else ""
+    return f"{prefix}{source}:{remote_ref}"
+
+
+def _ensure_base_resolvable(repo_root: str, base_branch: str) -> str:
+    """Refresh a remote base when needed and resolve it to an immutable object ID.
+
+    Exact configured remote-tracking refs such as ``origin/main`` are
+    refreshed with a targeted fetch before resolution. Refresh failure is
+    fatal so worktree creation never silently uses a stale cached remote ref.
+    Locally resolvable branches, tags, object IDs, and revision expressions do
+    not fetch. An unresolved non-remote revision retains the legacy single
+    best-effort fetch before it is rejected.
 
     :param repo_root: Absolute repo work-tree root, e.g.
         ``"/Users/alice/myrepo"``.
     :param base_branch: Base ref the user requested, e.g. ``"main"``
         or ``"origin/main"``.
-    :raises WorktreeError: If the base ref cannot be resolved even
-        after a fetch attempt.
+    :returns: The immutable object ID selected for worktree creation.
+    :raises WorktreeError: If a remote-tracking ref cannot be refreshed or
+        the requested base ref cannot be resolved.
     """
+    remote_branch = _remote_tracking_branch(repo_root, base_branch)
+    if remote_branch is not None:
+        remote, remote_ref = remote_branch
+        refspec = _configured_fetch_refspec(
+            repo_root,
+            remote=remote,
+            remote_ref=remote_ref,
+            base_branch=base_branch,
+        )
+        fetched = _run_git(
+            [
+                "fetch",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                "--",
+                remote,
+                refspec,
+            ],
+            cwd=repo_root,
+        )
+        if fetched.returncode != 0:
+            raise WorktreeError(
+                f"failed to refresh remote base branch {base_branch!r} "
+                f"(git fetch exit {fetched.returncode})"
+            )
+        base_to_resolve = remote_ref
+    else:
+        base_to_resolve = base_branch
+
     # --end-of-options forces git to treat the user-supplied base_branch as a
     # rev, never an option, so a value like "--exec-path" can't inject a git
     # flag (argv-only, no shell). Note: a bare "--" would not work here — git
     # rev-parse treats args after "--" as pathspecs, not revs.
-    if (
-        _run_git(
-            ["rev-parse", "--verify", "--quiet", "--end-of-options", base_branch], cwd=repo_root
-        ).returncode
-        == 0
-    ):
-        return
-    # Best-effort fetch from the default remote, then re-verify.
-    _run_git(["fetch"], cwd=repo_root)
-    if (
-        _run_git(
-            ["rev-parse", "--verify", "--quiet", "--end-of-options", base_branch], cwd=repo_root
-        ).returncode
-        != 0
-    ):
+    commit_ref = f"{base_to_resolve}^{{commit}}"
+    resolved = _run_git(
+        ["rev-parse", "--verify", "--quiet", "--end-of-options", commit_ref], cwd=repo_root
+    )
+    if resolved.returncode != 0 and remote_branch is None:
+        # Preserve the prior compatibility behavior for an unresolved tag or
+        # other revision that a normal fetch can make available. The fetch is
+        # best-effort; the re-check below owns the user-facing error.
+        _run_git(["fetch", "--no-recurse-submodules", "--no-write-fetch-head"], cwd=repo_root)
+        resolved = _run_git(
+            ["rev-parse", "--verify", "--quiet", "--end-of-options", commit_ref], cwd=repo_root
+        )
+    if resolved.returncode != 0:
         raise WorktreeError(f"base branch does not exist: {base_branch}")
+    return resolved.stdout.strip()
 
 
 @dataclass
@@ -355,8 +550,8 @@ def create_worktree(
     """Create a git worktree with a new branch checked out.
 
     Resolves the repo root, picks a collision-free sibling directory,
-    and runs ``git worktree add -b`` (fetching once if ``base_branch``
-    isn't locally resolvable).
+    and runs ``git worktree add -b``. Exact remote-tracking base refs are
+    refreshed first; other base revisions resolve from local state.
 
     :param repo_path: Absolute path inside the source repo — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
@@ -384,16 +579,15 @@ def create_worktree(
         raise WorktreeError(
             f"a branch named {branch_name!r} already exists; choose a different branch name"
         )
-    if base_branch is not None:
-        _ensure_base_resolvable(repo_root, base_branch)
+    resolved_base = (
+        _ensure_base_resolvable(repo_root, base_branch) if base_branch is not None else None
+    )
     worktree_path = _resolve_worktree_path(repo_root, branch_name)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
-    if base_branch is not None:
-        # --end-of-options: treat base_branch as a rev, never a git flag, so a
-        # user-supplied value starting with '-' can't inject an option.
-        add_args += ["--end-of-options", base_branch]
+    if resolved_base is not None:
+        add_args += ["--end-of-options", resolved_base]
     result = _run_git(add_args, cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)

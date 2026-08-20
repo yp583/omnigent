@@ -641,7 +641,10 @@ is unchanged.
     the server creates a worktree for a new branch on the host and
     starts the runner in it. Shape: `{branch_name: string,
     base_branch?: string | null}`. `branch_name` is validated against
-    git ref-format rules. See `designs/SESSION_GIT_WORKTREE.md`.
+    git ref-format rules. An exact configured remote-tracking base such as
+    `origin/main` is refreshed before creation; refresh failure fails the
+    request rather than using a stale cached ref. Local branches, tags, and
+    commit IDs resolve locally. See `designs/SESSION_GIT_WORKTREE.md`.
 
   terminal_launch_args (array of strings or null)
     Optional pass-through CLI args for a native terminal wrapper
@@ -779,7 +782,11 @@ Request body:
 
   runner_id (string, optional)
     Runner id that is already registered with the server's tunnel
-    registry. Empty strings fail with 400.
+    registry. For hostless sessions, a non-empty value replaces the
+    current runner; an empty string clears it. Host-bound sessions keep
+    server-issued affinity: PATCH may reaffirm the current runner or
+    clear a stale binding, but a different non-empty runner returns 409.
+    Launch and relaunch through the bound host to mint a replacement.
 
   title (string or null, optional)
     Session title update. `null` leaves the title unchanged.
@@ -834,12 +841,13 @@ Request body:
 is used on a non-Codex-native session; or `external_session_id` would
 overwrite a different existing value
 404 Not Found - no session with that id
+409 Conflict - a host-bound session was pointed at a different runner
 
-This is the mutable affinity primitive for Alpha. The same endpoint
-serves create-bind, resume-bind, and recover-bind: the client starts a
-runner, waits for registration, then PATCHes the session to the new
-runner id. The write replaces any previous value in
-`conversations.runner_id`; no history table is maintained.
+For hostless sessions this is the mutable affinity primitive: the client
+starts a runner, waits for registration, then PATCHes the session to the
+new runner id. Host-bound replacement is server-managed so a client
+cannot redirect the session away from its selected host; the host launch
+and message-driven relaunch paths mint token-bound runner ids directly.
 
 ### Codex-specific APIs
 

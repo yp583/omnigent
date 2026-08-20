@@ -1221,7 +1221,9 @@ class SessionGitOptions(BaseModel):
         git ref-format rules; invalid names fail with ``invalid_input``.
     :param base_branch: Optional base ref to branch from, e.g.
         ``"main"`` or ``"origin/main"``. ``None`` branches from the
-        source repository's current ``HEAD``. Create mode only —
+        source repository's current ``HEAD``. Exact configured remote-
+        tracking refs are refreshed before creation and fail rather than use
+        a stale cached ref when refresh is unavailable. Create mode only —
         invalid with ``existing_worktree``.
     :param existing_worktree: When ``True``, bind to the pre-existing
         worktree at ``workspace`` instead of creating one (see above).
@@ -1948,16 +1950,19 @@ class UpdateSessionRequest(BaseModel):
     """
     Request body for ``PATCH /v1/sessions/{id}``.
 
-    The Alpha runner-state pivot makes this endpoint the mutable
-    session affinity primitive when ``runner_id`` is provided. The
-    server validates that the runner is online, then replaces
-    ``conversations.runner_id``. Existing session metadata updates
-    remain supported for clients that update title, labels, or
-    reasoning effort through the sessions API.
+    For a hostless session, this endpoint is the mutable affinity
+    primitive when ``runner_id`` is provided: the server validates that
+    the runner is online, then replaces ``conversations.runner_id``. A
+    host-bound session may reaffirm its current runner or clear a stale
+    binding, but only the server's host launch paths may issue a new
+    non-empty binding. Existing session metadata updates remain
+    supported for clients that update title, labels, or reasoning effort
+    through the sessions API.
 
     :param runner_id: Identifier of a registered runner, e.g.
-        ``"runner_abc123"``. ``None`` leaves runner binding
-        unchanged.
+        ``"runner_abc123"``. ``None`` leaves runner binding unchanged;
+        ``""`` clears it. A host-bound session rejects a different
+        non-empty value because its runner affinity is server-issued.
     :param title: New title, e.g. ``"debugging auth flow"``.
         ``None`` leaves unchanged.
     :param labels: Guardrails labels to upsert. Merges with existing

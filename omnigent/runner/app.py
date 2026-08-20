@@ -390,6 +390,12 @@ _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 _WAKE_POST_MAX_ATTEMPTS = 3
 _WAKE_POST_RETRY_BASE_DELAY_S = 0.5
 _WAKE_POST_RETRY_MAX_DELAY_S = 4.0
+# Remote SDK completion must outlast deploy and host-wake reconnect windows.
+# Immediate 503 responses get about seven minutes of capped backoff.
+_REMOTE_SUBAGENT_TERMINAL_MAX_ATTEMPTS = 20
+_REMOTE_SUBAGENT_TERMINAL_RETRY_BASE_DELAY_S = 0.5
+_REMOTE_SUBAGENT_TERMINAL_RETRY_MAX_DELAY_S = 30.0
+_REMOTE_SUBAGENT_TERMINAL_REPLAY_DELAY_S = 30.0
 # 4xx statuses that are transient and worth retrying (mirrors the forwarder's
 # classification): everything else in 4xx is a permanent client-side rejection.
 _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
@@ -1457,6 +1463,11 @@ async def _wake_retry_sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+async def _remote_subagent_terminal_replay_sleep(seconds: float) -> None:
+    """Wait before replaying an exhausted remote terminal report."""
+    await asyncio.sleep(seconds)
+
+
 def _wake_post_is_retryable(exc: httpx.HTTPError) -> bool:
     """
     Return whether a failed wake POST should be retried.
@@ -2096,6 +2107,9 @@ def create_runner_app(
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
     _subagent_wake_pending: set[str] = set()
+    _pending_remote_subagent_terminals: dict[str, tuple[str, str | None]] = {}
+    _remote_subagent_terminal_tasks: dict[str, asyncio.Task[None]] = {}
+    app.state.pending_remote_subagent_terminals = _pending_remote_subagent_terminals
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
@@ -2106,6 +2120,8 @@ def create_runner_app(
 
     def _has_active_work() -> bool:
         if _active_turns:
+            return True
+        if _pending_remote_subagent_terminals:
             return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
@@ -2436,7 +2452,7 @@ def create_runner_app(
                 "error": error,
             },
         )
-        _mark_subagent_terminal_and_wake(
+        _mark_subagent_terminal_or_report(
             event.session_id,
             status="failed",
             output=error["message"],
@@ -3511,6 +3527,9 @@ def create_runner_app(
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
+        _pending_remote_subagent_terminals.pop(session_id, None)
+        if _report_task := _remote_subagent_terminal_tasks.pop(session_id, None):
+            _report_task.cancel()
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
@@ -5053,25 +5072,25 @@ def create_runner_app(
                 # interrupt — and it publishes a terminal desync ``failed``. Report
                 # the sub-agent FAILED so the parent wake/result matches that
                 # ``failed``, rather than a contradictory ``cancelled``.
-                _mark_subagent_terminal_and_wake(
+                _mark_subagent_terminal_or_report(
                     conv_id,
                     status="failed",
                     output="Error: sub-agent turn failed: runner turn-context desync.",
                 )
             else:
-                _mark_subagent_terminal_and_wake(
+                _mark_subagent_terminal_or_report(
                     conv_id,
                     status="cancelled",
                     output="[System: sub-agent interrupted]",
                 )
         elif error is not None:
-            _mark_subagent_terminal_and_wake(
+            _mark_subagent_terminal_or_report(
                 conv_id,
                 status="failed",
                 output=f"Error: sub-agent turn failed: {error.get('message', 'unknown')}",
             )
         elif not _is_native_harness(conv_id) and not has_buffered:
-            _mark_subagent_terminal_and_wake(
+            _mark_subagent_terminal_or_report(
                 conv_id,
                 status="completed",
                 output=_extract_last_assistant_text(conv_id),
@@ -5118,13 +5137,13 @@ def create_runner_app(
             # its sub-agent must be reported FAILED, not a contradictory
             # `cancelled`, for the parent wake/result.
             if conv_id in _desynced_sessions:
-                _mark_subagent_terminal_and_wake(
+                _mark_subagent_terminal_or_report(
                     conv_id,
                     status="failed",
                     output="Error: sub-agent turn failed: runner turn-context desync.",
                 )
             else:
-                _mark_subagent_terminal_and_wake(
+                _mark_subagent_terminal_or_report(
                     conv_id,
                     status="cancelled",
                     output="[System: sub-agent interrupted]",
@@ -5464,11 +5483,133 @@ def create_runner_app(
             _schedule_subagent_wake(ack.entry)
         return ack
 
+    async def _report_untracked_subagent_terminal(
+        child_session_id: str,
+    ) -> None:
+        """Deliver one queued SDK terminal edge to the dispatching runner."""
+        attempt = 0
+        while attempt < _REMOTE_SUBAGENT_TERMINAL_MAX_ATTEMPTS:
+            report = _pending_remote_subagent_terminals.get(child_session_id)
+            if report is None:
+                return
+            status, output = report
+            data: _JsonObject = {"status": "idle" if status == "completed" else "failed"}
+            if output is not None:
+                data["output"] = output
+            attempt += 1
+            try:
+                response = await server_client.post(
+                    f"/v1/sessions/{child_session_id}/events",
+                    json={"type": "external_session_status", "data": data},
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+                if _pending_remote_subagent_terminals.get(child_session_id) == report:
+                    _pending_remote_subagent_terminals.pop(child_session_id, None)
+                    return
+                # A newer terminal observation arrived while this POST was in
+                # flight. Send the latest value with a fresh retry budget.
+                attempt = 0
+                continue
+            except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
+                if not retryable:
+                    if _pending_remote_subagent_terminals.get(child_session_id) == report:
+                        _pending_remote_subagent_terminals.pop(child_session_id, None)
+                    _logger.warning(
+                        "Remote sub-agent terminal delivery was permanently rejected for "
+                        "child=%s status=%s",
+                        child_session_id,
+                        status,
+                        exc_info=True,
+                    )
+                    return
+                if attempt >= _REMOTE_SUBAGENT_TERMINAL_MAX_ATTEMPTS:
+                    _logger.warning(
+                        "Remote sub-agent terminal delivery remains pending for child=%s "
+                        "status=%s after %d attempt(s); retrying in %.1fs",
+                        child_session_id,
+                        status,
+                        _REMOTE_SUBAGENT_TERMINAL_MAX_ATTEMPTS,
+                        _REMOTE_SUBAGENT_TERMINAL_REPLAY_DELAY_S,
+                        exc_info=True,
+                    )
+                    await _remote_subagent_terminal_replay_sleep(
+                        _REMOTE_SUBAGENT_TERMINAL_REPLAY_DELAY_S
+                    )
+                    attempt = 0
+                    continue
+                await _wake_retry_sleep(
+                    min(
+                        _REMOTE_SUBAGENT_TERMINAL_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
+                        _REMOTE_SUBAGENT_TERMINAL_RETRY_MAX_DELAY_S,
+                    )
+                )
+
+    def _schedule_pending_remote_subagent_terminal(child_session_id: str) -> None:
+        current = _remote_subagent_terminal_tasks.get(child_session_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            _report_untracked_subagent_terminal(child_session_id),
+            name=f"remote-subagent-terminal:{child_session_id}",
+        )
+        _remote_subagent_terminal_tasks[child_session_id] = task
+
+        def _forget_report_task(completed: asyncio.Task[None]) -> None:
+            if _remote_subagent_terminal_tasks.get(child_session_id) is completed:
+                _remote_subagent_terminal_tasks.pop(child_session_id, None)
+            _background_tasks.discard(completed)
+
+        task.add_done_callback(_forget_report_task)
+        _background_tasks.add(task)
+
+    def _replay_pending_remote_subagent_terminals() -> None:
+        """Replay reports retained after an exhausted reconnect window."""
+        for child_session_id in list(_pending_remote_subagent_terminals):
+            _schedule_pending_remote_subagent_terminal(child_session_id)
+
+    app.state.replay_pending_remote_subagent_terminals = _replay_pending_remote_subagent_terminals
+
+    def _schedule_untracked_subagent_terminal(
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        ack: _SubagentDeliveryAck,
+    ) -> None:
+        if (
+            ack.reason != _SUBAGENT_DELIVERY_UNTRACKED
+            or child_session_id not in _session_sub_agent_names
+        ):
+            return
+        _pending_remote_subagent_terminals[child_session_id] = (status, output)
+        _schedule_pending_remote_subagent_terminal(child_session_id)
+
+    def _mark_subagent_terminal_or_report(
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+    ) -> _SubagentDeliveryAck:
+        ack = _mark_subagent_terminal_and_wake(
+            child_session_id,
+            status=status,
+            output=output,
+        )
+        _schedule_untracked_subagent_terminal(
+            child_session_id,
+            status=status,
+            output=output,
+            ack=ack,
+        )
+        return ack
+
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,
         resource_registry=resource_registry,
         publish_event=_publish_event,
-        mark_subagent_terminal_and_wake=_mark_subagent_terminal_and_wake,
+        mark_subagent_terminal_and_wake=_mark_subagent_terminal_or_report,
         session_sub_agent_names=_session_sub_agent_names,
         codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
@@ -6818,25 +6959,27 @@ def create_runner_app(
             status = data.get("status") if isinstance(data, dict) else None
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
+            status_only = body.get("_subagent_status_only") is True
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
                 resource_registry.note_external_session_status(conversation_id, status)
-                _fan_out_child_delta_to_parent(
-                    conversation_id,
-                    {"type": "session.status", "status": status},
-                    latest_assistant_text=output,
-                    allow_history_preview_fallback=False,
-                )
-            if status in ("idle", "failed"):
+                if not status_only:
+                    _fan_out_child_delta_to_parent(
+                        conversation_id,
+                        {"type": "session.status", "status": status},
+                        latest_assistant_text=output,
+                        allow_history_preview_fallback=False,
+                    )
+            if not status_only and status in ("idle", "failed"):
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
-            if status == "idle":
+            if not status_only and status == "idle":
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="completed",
                     output=output if output is not None else "",
                 )
-            elif status == "failed":
+            elif not status_only and status == "failed":
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="failed",
@@ -9338,6 +9481,7 @@ def create_runner_app(
                 resource_registry.resync_session_statuses()
             except Exception:  # noqa: BLE001 — best-effort; never block catch-up.
                 _logger.warning("Session status resync failed after reconnect", exc_info=True)
+        _replay_pending_remote_subagent_terminals()
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue

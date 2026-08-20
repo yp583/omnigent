@@ -198,13 +198,14 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
+from omnigent.server.session_affinity import serialized_session_affinity_mutation
 from omnigent.session_lifecycle import (
     is_session_closed,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
-from omnigent.stores.host_store import host_is_live
+from omnigent.stores.host_store import Host, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -225,6 +226,52 @@ def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _retry_recovery_locks[session_id] = lock
     return lock
+
+
+async def _host_bound_subagent_shares_ancestor_runner(
+    conv: Any,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Detect a pinned child previously rebound to any ancestor's runner."""
+    if conv.kind != "sub_agent" or conv.host_id is None or conv.runner_id is None:
+        return False
+
+    ancestor_ids: list[str] = []
+    if conv.parent_conversation_id and conv.parent_conversation_id != conv.id:
+        ancestor_ids.append(conv.parent_conversation_id)
+    if (
+        conv.root_conversation_id
+        and conv.root_conversation_id != conv.id
+        and conv.root_conversation_id not in ancestor_ids
+    ):
+        ancestor_ids.append(conv.root_conversation_id)
+
+    for ancestor_id in ancestor_ids:
+        ancestor = await asyncio.to_thread(
+            conversation_store.get_conversation,
+            ancestor_id,
+        )
+        if ancestor is not None and ancestor.runner_id == conv.runner_id:
+            _logger.warning(
+                "Refusing runner %s for host-bound session %s: it is also bound "
+                "to ancestor %s, but pinned children require a distinct runner",
+                conv.runner_id,
+                conv.id,
+                ancestor.id,
+            )
+            return True
+    return False
+
+
+async def _affinity_safe_runner_client(
+    session_id: str,
+    conv: Any,
+    runner_router: RunnerRouter | None,
+) -> httpx.AsyncClient | None:
+    """Resolve a runner without falling back locally for a pinned session."""
+    if conv.host_id is not None and runner_router is None:
+        return None
+    return await _get_runner_client(session_id, runner_router)
 
 
 def _evict_retry_recovery_task(
@@ -1066,11 +1113,45 @@ def register_events_routes(
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
             )
-            runner_result = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                forward_body,
-            )
+            delivery_route_session_id: str | None = None
+            if (
+                conv.kind == "sub_agent"
+                and conv.parent_conversation_id
+                and not _is_codex_native_subagent(conv)
+            ):
+                parent_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    conv.parent_conversation_id,
+                )
+                if (
+                    parent_conv is not None
+                    and parent_conv.runner_id is not None
+                    and conv.runner_id is not None
+                    and parent_conv.runner_id != conv.runner_id
+                ):
+                    delivery_route_session_id = parent_conv.id
+
+            if delivery_route_session_id is not None:
+                # The child runner owns native status synchronization, while
+                # the dispatching parent runner owns work and inbox delivery.
+                status_only_body = {**forward_body, "_subagent_status_only": True}
+                await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    status_only_body,
+                )
+                runner_result = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    forward_body,
+                    route_session_id=delivery_route_session_id,
+                )
+            else:
+                runner_result = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    forward_body,
+                )
             if (
                 conv.kind == "sub_agent"
                 and status in {"idle", "failed"}
@@ -1079,7 +1160,7 @@ def register_events_routes(
                 # Codex-internal children are tracked inside the same
                 # app-server thread tree; they have no runner inbox entry
                 # to forward terminal status to.
-                if runner_result is None:
+                if runner_result is None and delivery_route_session_id is None:
                     # The child's pinned runner_id is stale — its runner was
                     # relaunched under a new id and only the parent was
                     # rebound, so the child points at a dead runner forever and
@@ -1306,7 +1387,15 @@ def register_events_routes(
                 raise _session_not_found()
             conv = conv_after_wake
             _runner_needs_session_init = True
-        runner_client = await _get_runner_client(session_id, runner_router)
+        _ancestor_runner_collision = await _host_bound_subagent_shares_ancestor_runner(
+            conv,
+            conversation_store,
+        )
+        runner_client = (
+            None
+            if _ancestor_runner_collision
+            else await _affinity_safe_runner_client(session_id, conv, runner_router)
+        )
         # Managed-launch rendezvous: a ``host_type="managed"`` create
         # returns before the sandbox exists, so the first message (the
         # Web UI auto-sends the composer prompt right after navigate)
@@ -1328,7 +1417,15 @@ def register_events_routes(
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is None:
                     raise _session_not_found()
-                runner_client = await _get_runner_client(session_id, runner_router)
+                _ancestor_runner_collision = await _host_bound_subagent_shares_ancestor_runner(
+                    conv,
+                    conversation_store,
+                )
+                runner_client = (
+                    None
+                    if _ancestor_runner_collision
+                    else await _affinity_safe_runner_client(session_id, conv, runner_router)
+                )
         # Check for wrong-replica routing miss before attempting healing or dispatch.
         # The runner tunnel is registered on the same replica as its host; when the
         # tunnel is absent here but the host is live elsewhere, the key routed to
@@ -1352,7 +1449,7 @@ def register_events_routes(
                         "session runner is on another replica; retry",
                         code=ErrorCode.WRONG_REPLICA,
                     )
-        if runner_client is None and conv.kind == "sub_agent":
+        if runner_client is None and conv.kind == "sub_agent" and conv.host_id is None:
             # A sub-agent copies its parent's runner_id at creation and is
             # never repointed when the parent's runner is relaunched.  If the
             # runner is dead but the parent has a live replacement, repair the
@@ -1399,7 +1496,11 @@ def register_events_routes(
             # course, so the query only ever speeds up the cold path.
             from omnigent.server.routes import sessions as _sf
 
-            if conv.runner_id is not None and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0:
+            if (
+                not _ancestor_runner_collision
+                and conv.runner_id is not None
+                and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0
+            ):
                 _logger.info(
                     "Waiting up to %.1fs for host-bound runner %s to register "
                     "for session %s before relaunch",
@@ -1513,7 +1614,11 @@ def register_events_routes(
                         if conv_after_relaunch is None:
                             raise _session_not_found()
                         conv = conv_after_relaunch
-                        runner_client = await _get_runner_client(session_id, runner_router)
+                        runner_client = await _affinity_safe_runner_client(
+                            session_id,
+                            conv,
+                            runner_router,
+                        )
             else:
                 relaunched_runner_id = None
             if runner_client is None:
@@ -2013,28 +2118,61 @@ def register_events_routes(
             )
             for fid in deleted_file_ids:
                 await asyncio.to_thread(artifact_store.delete, fid)
-        # Opt-in git worktree cleanup: only when delete_branch=true and
-        # the session has a server-created worktree. Runs after runner
-        # teardown; best-effort (designs/SESSION_GIT_WORKTREE.md).
-        if (
-            delete_branch
-            and conv.git_branch is not None
-            and conv.workspace is not None
-            and conv.host_id is not None
-        ):
-            await _remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=conv.workspace,
-                branch=conv.git_branch,
-                delete_branch=True,
-                request=request,
-                reason="session-delete",
-            )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
-        deleted = await conversation_store.delete_conversation(session_id)
-        if not deleted:
-            raise _session_not_found()
+        host_store_for_managed = getattr(request.app.state, "host_store", None)
+        bound_managed_host: Host | None = None
+        async with serialized_session_affinity_mutation(session_id):
+            # Re-read after the lengthy runner/file teardown. A managed bind
+            # may have completed since the authorization read above.
+            refreshed = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                session_id,
+            )
+            if refreshed is None:
+                raise _session_not_found()
+            conv = refreshed
+
+            # Affinity-owned cleanup stays under the same lock as the final
+            # read and row deletion. This prevents a local bind/relaunch from
+            # changing the host or worktree while deletion transfers cleanup
+            # ownership.
+            if (
+                delete_branch
+                and conv.git_branch is not None
+                and conv.workspace is not None
+                and conv.host_id is not None
+            ):
+                await _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=True,
+                    request=request,
+                    reason="session-delete",
+                )
+            if conv.host_id is not None and host_store_for_managed is not None:
+                candidate = await asyncio.to_thread(
+                    host_store_for_managed.get_host,
+                    conv.host_id,
+                )
+                if candidate is not None and candidate.sandbox_id is not None:
+                    bound_managed_host = candidate
+
+            deleted = await conversation_store.delete_conversation(session_id)
+            if not deleted:
+                raise _session_not_found()
+            if bound_managed_host is not None and host_store_for_managed is not None:
+                from omnigent.server.managed_hosts import terminate_managed_host
+
+                await terminate_managed_host(
+                    bound_managed_host,
+                    host_store_for_managed,
+                    # Supplies the launcher for the provider-side
+                    # terminate; None (config removed since launch)
+                    # still deletes the row and revokes the token.
+                    getattr(request.app.state, "sandbox_config", None),
+                )
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted
@@ -2062,26 +2200,6 @@ def register_events_routes(
         managed_launches_for_delete = getattr(request.app.state, "managed_launches", None)
         if managed_launches_for_delete is not None:
             managed_launches_for_delete.finish(session_id)
-        # Managed-host cleanup: when the session's host is backed by a
-        # server-provisioned sandbox (host_type="managed"), terminate
-        # the sandbox and delete the host row — which also revokes its
-        # launch token. Best-effort by design — the provider's lifetime
-        # cap reaps stragglers. External (laptop) hosts have no
-        # sandbox_id and are never touched.
-        host_store_for_managed = getattr(request.app.state, "host_store", None)
-        if conv.host_id is not None and host_store_for_managed is not None:
-            bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
-            if bound_host is not None and bound_host.sandbox_id is not None:
-                from omnigent.server.managed_hosts import terminate_managed_host
-
-                await terminate_managed_host(
-                    bound_host,
-                    host_store_for_managed,
-                    # Supplies the launcher for the provider-side
-                    # terminate; None (config removed since launch)
-                    # still deletes the row and revokes the token.
-                    getattr(request.app.state, "sandbox_config", None),
-                )
         try:
             import hashlib as _hashlib
             import time as _time

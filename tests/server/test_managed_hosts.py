@@ -3312,7 +3312,13 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
             return super().get(agent_id)
 
     store = _RecordingStore({builtin.id: builtin})
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    conv = SimpleNamespace(
+        labels={},
+        runner_id="runner_1",
+        host_id="host_1",
+        workspace="/root/workspace",
+        agent_id=builtin.id,
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3364,7 +3370,13 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     monkeypatch.setattr(orchestration, "_run_managed_launch", _noop)
 
     tracker = ManagedLaunchTracker()
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    conv = SimpleNamespace(
+        labels={},
+        runner_id="runner_1",
+        host_id="host_1",
+        workspace="/root/workspace",
+        agent_id=builtin_agent_id("code-reviewer"),
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3397,7 +3409,13 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
 
     monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
 
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    conv = SimpleNamespace(
+        labels={},
+        runner_id="runner_1",
+        host_id="host_1",
+        workspace="/root/workspace",
+        agent_id=builtin_agent_id("code-reviewer"),
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3611,7 +3629,13 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         host_registry=None,
         tunnel_registry=None,
     )
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    conv = SimpleNamespace(
+        labels={},
+        runner_id="runner_1",
+        host_id="host_1",
+        workspace="/root/workspace",
+        agent_id=builtin.id,
+    )
 
     engaged = await asyncio.gather(
         *(

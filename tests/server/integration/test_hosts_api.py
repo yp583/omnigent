@@ -556,8 +556,11 @@ async def test_list_hosts_reports_offline_after_disconnect(
     assert get_resp.json()["status"] == "offline"
 
 
+@pytest.mark.parametrize("prebound_host", [False, True])
 async def test_launch_runner_happy_path(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    prebound_host: bool,
 ) -> None:
     """
     Verify the full launch flow: host receives launch frame, responds
@@ -570,6 +573,54 @@ async def test_launch_runner_happy_path(
     comm = await _connect_host(app, registry)
 
     conv = conv_store.create_conversation(agent_id=None)
+    if prebound_host:
+        conv_store.set_host_id(
+            conv.id,
+            _HOST_ID,
+            workspace="/tmp/test-workspace",
+        )
+    atomic_states: list[tuple[str | None, str | None]] = []
+    atomic_bind = conv_store.bind_runner_to_host_if_unbound
+
+    def _record_atomic_bind(
+        conversation_id: str,
+        *,
+        expected_host_id: str | None,
+        runner_id: str,
+        host_id: str,
+        workspace: str,
+        git_branch: str | None,
+    ) -> bool:
+        before = conv_store.get_conversation(conversation_id)
+        assert before is not None
+        atomic_states.append((before.runner_id, before.host_id))
+        result = atomic_bind(
+            conversation_id,
+            expected_host_id=expected_host_id,
+            runner_id=runner_id,
+            host_id=host_id,
+            workspace=workspace,
+            git_branch=git_branch,
+        )
+        after = conv_store.get_conversation(conversation_id)
+        assert after is not None
+        atomic_states.append((after.runner_id, after.host_id))
+        return result
+
+    def _legacy_runner_bind(_conversation_id: str, _runner_id: str) -> bool:
+        raise AssertionError("host launch must use the atomic host-runner bind")
+
+    def _legacy_host_bind(
+        _conversation_id: str,
+        _host_id: str,
+        _workspace: str | None = None,
+        _git_branch: str | None = None,
+    ) -> None:
+        raise AssertionError("host launch must use the atomic host-runner bind")
+
+    monkeypatch.setattr(conv_store, "bind_runner_to_host_if_unbound", _record_atomic_bind)
+    monkeypatch.setattr(conv_store, "set_runner_id", _legacy_runner_bind)
+    monkeypatch.setattr(conv_store, "set_host_id", _legacy_host_bind)
 
     async def _respond_to_launch() -> None:
         """Read the launch frame from the host's outbound queue and respond."""
@@ -585,6 +636,10 @@ async def test_launch_runner_happy_path(
                 continue
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
+                bound = conv_store.get_conversation(conv.id)
+                assert bound is not None
+                assert bound.runner_id is not None
+                assert bound.host_id == _HOST_ID
                 result = encode_host_frame(
                     HostLaunchRunnerResultFrame(
                         request_id=frame.request_id,
@@ -616,6 +671,11 @@ async def test_launch_runner_happy_path(
     assert data["status"] == "launching"
     # runner_id should be a deterministic hash of the binding token.
     assert data["runner_id"].startswith("runner_token_")
+    expected_initial_host = _HOST_ID if prebound_host else None
+    assert atomic_states == [
+        (None, expected_initial_host),
+        (data["runner_id"], _HOST_ID),
+    ]
 
     # Session row should have runner_id and host_id set.
     updated_conv = conv_store.get_conversation(conv.id)

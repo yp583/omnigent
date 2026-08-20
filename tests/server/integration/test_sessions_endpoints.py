@@ -3704,6 +3704,108 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     ]
 
 
+async def test_remote_subagent_status_delivers_via_parent_runner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote child's status syncs there but completes work on its parent runner."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+    parent = await _create_session(client, agent["id"])
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "sub_agent_name": "worker",
+            "title": "worker:remote",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    child = child_resp.json()
+
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(parent["id"], "runner_parent")
+    assert store.set_runner_id(child["id"], "runner_child")
+
+    child_posts: list[dict[str, Any]] = []
+    parent_posts: list[dict[str, Any]] = []
+
+    def _record(target: list[dict[str, Any]]) -> httpx.MockTransport:
+        def _handler(request: httpx.Request) -> httpx.Response:
+            target.append(
+                {
+                    "path": request.url.path,
+                    "body": json.loads(request.content),
+                }
+            )
+            return httpx.Response(204)
+
+        return httpx.MockTransport(_handler)
+
+    child_runner = httpx.AsyncClient(
+        transport=_record(child_posts),
+        base_url="http://child-runner",
+    )
+    parent_runner = httpx.AsyncClient(
+        transport=_record(parent_posts),
+        base_url="http://parent-runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        del runner_router
+        if session_id == child["id"]:
+            return child_runner
+        if session_id == parent["id"]:
+            return parent_runner
+        return None
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "REMOTE_DONE"},
+            },
+        )
+    finally:
+        await child_runner.aclose()
+        await parent_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert child_posts == [
+        {
+            "path": f"/v1/sessions/{child['id']}/events",
+            "body": {
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "REMOTE_DONE"},
+                "model_override": None,
+                "tools": None,
+                "created_by": None,
+                "_subagent_status_only": True,
+            },
+        }
+    ]
+    assert parent_posts == [
+        {
+            "path": f"/v1/sessions/{child['id']}/events",
+            "body": {
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "REMOTE_DONE"},
+                "model_override": None,
+                "tools": None,
+                "created_by": None,
+            },
+        }
+    ]
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

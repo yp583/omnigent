@@ -230,6 +230,7 @@ from omnigent.server.routes._sessions.helpers import (
     _latest_assistant_text_from_store,
     _latest_message_preview,
     _launch_runner_on_host,
+    _launch_runner_on_host_locked_impl,
     _load_agent_spec_for_session,
     _load_model_options,
     _load_model_options_from_host,
@@ -321,6 +322,7 @@ from omnigent.server.schemas import (
     SessionUsageEvent,
     SkillSummary,
 )
+from omnigent.server.session_affinity import serialized_session_affinity_mutation
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
@@ -2232,12 +2234,13 @@ async def _heal_subagent_runner_binding_via_parent(
     """
     Repair a sub-agent's stale ``runner_id`` and return its parent's live client.
 
-    A sub-agent child copies its parent's ``runner_id`` once at creation and is
-    never repointed when the parent's runner is later relaunched.  This walks up
-    the ancestor chain (immediate parent → root) to find the nearest live runner,
-    heals the child's DB row to point at that runner, and returns the live
-    ``httpx.AsyncClient`` so the caller can proceed as if the binding were always
-    current.
+    A hostless sub-agent child copies its parent's ``runner_id`` once at creation
+    and is never repointed when the parent's runner is later relaunched.  This
+    walks up the ancestor chain (immediate parent → root) to find the nearest
+    live runner, heals the child's DB row to point at that runner, and returns
+    the live ``httpx.AsyncClient`` so the caller can proceed as if the binding
+    were always current. Explicitly host-bound children own their runner affinity
+    and must recover through their persisted host instead.
 
     After healing, the caller must re-read the conversation row (the healed
     ``runner_id`` is now in the DB).  Whether session re-initialization is
@@ -2263,65 +2266,84 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
-    # Walk the ancestor chain (immediate parent first, then root) to find a
-    # live runner.  A single hop covers the common case; two hops cover nested
-    # sub-agents where the immediate parent's runner is also stale but the root
-    # is still healthy.
-    candidate_ids: list[str] = []
-    if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
-        candidate_ids.append(child_conv.parent_conversation_id)
-    if (
-        child_conv.root_conversation_id
-        and child_conv.root_conversation_id != child_conv.id
-        and child_conv.root_conversation_id not in candidate_ids
-    ):
-        candidate_ids.append(child_conv.root_conversation_id)
-    if not candidate_ids:
-        return None
-
-    live_runner_id: str | None = None
-    live_client: httpx.AsyncClient | None = None
-    for ancestor_id in candidate_ids:
-        ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
-        if ancestor is None or ancestor.runner_id is None:
-            continue
-        ancestor_runner_id = ancestor.runner_id
-        # Wait briefly for the ancestor's tunnel — covers the reconnect gap
-        # right after a relaunch.  When no registry is wired (in-process /
-        # tests) fall back to a best-effort direct resolve.
-        if tunnel_registry is not None:
-            client = await _wait_for_runner_client(
-                ancestor_id,
-                runner_router,
-                tunnel_registry,
-                runner_id=ancestor_runner_id,
-                timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
-            )
-        else:
-            client = await _get_runner_client(ancestor_id, runner_router)
-        if client is not None:
-            live_runner_id = ancestor_runner_id
-            live_client = client
-            break
-
-    if live_runner_id is None or live_client is None:
-        return None
-
-    if live_runner_id != child_conv.runner_id:
-        # Heal the divergence so this child's row matches the live runner: the
-        # next forward resolves directly and a future ``_on_runner_connect``
-        # (which rebinds by matching runner_id) can recover it.
-        try:
-            await asyncio.to_thread(
-                conversation_store.replace_runner_id, child_conv.id, live_runner_id
-            )
-        except ConversationNotFoundError:
-            # The child was deleted between reading it and this heal (e.g.
-            # removed mid-teardown).  Degrade gracefully rather than surfacing
-            # a benign race as an unhandled 500.
+    async with serialized_session_affinity_mutation(child_conv.id):
+        # The caller's conversation may predate a host bind that won before
+        # this lock. Re-read before any ancestor lookup or tunnel wait.
+        current = await asyncio.to_thread(
+            conversation_store.get_conversation,
+            child_conv.id,
+        )
+        if current is None or current.host_id is not None:
             return None
 
-    return live_client
+        # Walk the ancestor chain (immediate parent first, then root) to find a
+        # live runner. A single hop covers the common case; two hops cover
+        # nested sub-agents whose immediate parent's runner is also stale.
+        candidate_ids: list[str] = []
+        if current.parent_conversation_id and current.parent_conversation_id != current.id:
+            candidate_ids.append(current.parent_conversation_id)
+        if (
+            current.root_conversation_id
+            and current.root_conversation_id != current.id
+            and current.root_conversation_id not in candidate_ids
+        ):
+            candidate_ids.append(current.root_conversation_id)
+        if not candidate_ids:
+            return None
+
+        live_runner_id: str | None = None
+        live_client: httpx.AsyncClient | None = None
+        for ancestor_id in candidate_ids:
+            ancestor = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                ancestor_id,
+            )
+            if ancestor is None or ancestor.runner_id is None:
+                continue
+            ancestor_runner_id = ancestor.runner_id
+            # Wait briefly for the ancestor's tunnel — covers the reconnect
+            # gap after relaunch. The affinity lock prevents a same-process
+            # host bind from changing the child during this await.
+            if tunnel_registry is not None:
+                client = await _wait_for_runner_client(
+                    ancestor_id,
+                    runner_router,
+                    tunnel_registry,
+                    runner_id=ancestor_runner_id,
+                    timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
+                )
+            else:
+                client = await _get_runner_client(ancestor_id, runner_router)
+            if client is not None:
+                live_runner_id = ancestor_runner_id
+                live_client = client
+                break
+
+        if live_runner_id is None or live_client is None:
+            return None
+
+        if live_runner_id != current.runner_id:
+            # Cross-replica authority remains the conditional store write: a
+            # host bind that changed either runner or host wins this CAS.
+            replaced = await asyncio.to_thread(
+                conversation_store.replace_runner_id_if_hostless,
+                current.id,
+                current.runner_id,
+                live_runner_id,
+            )
+            if not replaced:
+                latest = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    current.id,
+                )
+                if (
+                    latest is None
+                    or latest.host_id is not None
+                    or latest.runner_id != live_runner_id
+                ):
+                    return None
+
+        return live_client
 
 
 async def _recover_subagent_status_forward_via_parent(
@@ -2642,6 +2664,9 @@ async def _run_managed_launch(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    expected_runner_id: str | None = None,
+    expected_host_id: str | None = None,
+    expected_workspace: str | None = None,
     relaunch_host: Host | None = None,
     provider: str | None = None,
     agent_store: AgentStore | None = None,
@@ -2691,6 +2716,9 @@ async def _run_managed_launch(
     :param tunnel_registry: Runner-tunnel registry used to await the
         launched runner's connection. ``None`` in minimal test
         wirings (the rendezvous then settles at frame-send).
+    :param expected_runner_id: Runner binding observed before provisioning.
+    :param expected_host_id: Host binding observed before provisioning.
+    :param expected_workspace: Workspace observed before provisioning.
     :param relaunch_host: Existing managed host row to relaunch a new
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
@@ -2743,6 +2771,9 @@ async def _run_managed_launch(
         host_store=host_store,
         host_registry=host_registry,
         tunnel_registry=tunnel_registry,
+        expected_runner_id=expected_runner_id,
+        expected_host_id=expected_host_id,
+        expected_workspace=expected_workspace,
     )
 
 
@@ -2756,6 +2787,9 @@ async def _bind_and_launch_managed_runner(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    expected_runner_id: str | None = None,
+    expected_host_id: str | None = None,
+    expected_workspace: str | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -2777,17 +2811,109 @@ async def _bind_and_launch_managed_runner(
     :param tunnel_registry: Runner-tunnel registry used to await the
         launched runner's connection. ``None`` in minimal test
         wirings (the rendezvous then settles at frame-send).
+    :param expected_runner_id: Runner binding observed before provisioning.
+    :param expected_host_id: Host binding observed before provisioning.
+    :param expected_workspace: Workspace observed before provisioning.
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
-    try:
-        conv = await asyncio.to_thread(
-            conversation_store.set_host_id,
+    deleted = False
+    affinity_error: str | None = None
+    managed_binding_claimed = False
+    observed_host_id: str | None = None
+    launch_attempt = None
+
+    async def _terminate_fresh_sandbox() -> None:
+        host = await asyncio.to_thread(host_store.get_host, managed.host_id)
+        if host is not None:
+            await terminate_managed_host(host, host_store, sandbox_config)
+
+    async with serialized_session_affinity_mutation(session_id):
+        current = await asyncio.to_thread(
+            conversation_store.get_conversation,
             session_id,
-            managed.host_id,
-            managed.workspace,
         )
-    except ConversationNotFoundError:
+        if current is None:
+            deleted = True
+        elif (
+            current.runner_id != expected_runner_id
+            or current.host_id != expected_host_id
+            or current.workspace != expected_workspace
+        ):
+            observed_host_id = current.host_id
+            affinity_error = "session affinity changed while its sandbox was provisioning"
+        else:
+            observed_host_id = current.host_id
+            bound = await asyncio.to_thread(
+                conversation_store.bind_managed_host_if_matches,
+                session_id,
+                expected_runner_id=expected_runner_id,
+                expected_host_id=expected_host_id,
+                expected_workspace=expected_workspace,
+                host_id=managed.host_id,
+                workspace=managed.workspace,
+            )
+            if not bound:
+                current = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    session_id,
+                )
+                if current is None:
+                    deleted = True
+                else:
+                    observed_host_id = current.host_id
+                    affinity_error = "session affinity changed while its sandbox was provisioning"
+            else:
+                managed_binding_claimed = True
+                conv = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    session_id,
+                )
+                if conv is None:
+                    deleted = True
+                elif (
+                    conv.runner_id != expected_runner_id
+                    or conv.host_id != managed.host_id
+                    or conv.workspace != managed.workspace
+                ):
+                    observed_host_id = conv.host_id
+                    affinity_error = "session affinity changed while launching its managed runner"
+                else:
+                    observed_host_id = conv.host_id
+                    # Keep the host bind and runner rotation under one
+                    # per-session mutation lock. The store CAS inside the
+                    # launch remains authoritative across replicas.
+                    _publish_sandbox_status(session_id, "connecting")
+                    if host_registry is not None:
+                        host_conn = host_registry.get(managed.host_id)
+                        if host_conn is not None:
+                            try:
+                                launch_attempt = await _launch_runner_on_host_locked_impl(
+                                    conv,
+                                    conversation_store,
+                                    host_registry,
+                                    host_conn,
+                                )
+                            except OmnigentError as exc:
+                                if exc.code != ErrorCode.CONFLICT:
+                                    raise
+                                affinity_error = exc.message
+        should_terminate_orphan = deleted or (
+            affinity_error is not None
+            and not managed_binding_claimed
+            and observed_host_id != managed.host_id
+        )
+        if should_terminate_orphan:
+            # Re-read while still holding the process-local mutation lock. A
+            # same-host winner owns the sandbox now and must keep it.
+            latest = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                session_id,
+            )
+            if latest is None or latest.host_id != managed.host_id:
+                await _terminate_fresh_sandbox()
+
+    if deleted:
         # The session was deleted while its sandbox provisioned. The
         # delete route couldn't see the host binding yet, so tear the
         # fresh sandbox down here (deleting the host row also revokes
@@ -2798,37 +2924,33 @@ async def _bind_and_launch_managed_runner(
             session_id,
             managed.host_id,
         )
-        host = await asyncio.to_thread(host_store.get_host, managed.host_id)
-        if host is not None:
-            await terminate_managed_host(host, host_store, sandbox_config)
         tracker.fail(session_id, "session was deleted while its sandbox was provisioning")
         _publish_sandbox_status(
             session_id, "failed", "session was deleted while its sandbox was provisioning"
         )
         return
-    # Host bound; what remains is launching the runner and waiting
-    # for its tunnel.
-    _publish_sandbox_status(session_id, "connecting")
-    runner_id: str | None = None
-    if host_registry is not None:
-        host_conn = host_registry.get(managed.host_id)
-        if host_conn is not None:
-            launch_attempt = await _launch_runner_on_host(
-                conv,
-                conversation_store,
-                host_registry,
-                host_conn,
-            )
-            if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
-                # The sandbox image should bake in the harness, but if the
-                # host refuses, fail the launch loudly (mirroring the
-                # delete-during-provisioning path) rather than waiting out
-                # the connect timeout for a runner that will never appear.
-                reason = launch_attempt.error or "harness not configured on the sandbox host"
-                tracker.fail(session_id, reason)
-                _publish_sandbox_status(session_id, "failed", reason)
-                return
-            runner_id = launch_attempt.runner_id
+    if affinity_error is not None:
+        _logger.info(
+            "Skipping stale managed bind or launch for session %s: %s",
+            session_id,
+            affinity_error,
+        )
+        tracker.fail(session_id, affinity_error)
+        _publish_sandbox_status(session_id, "failed", affinity_error)
+        return
+
+    runner_id = launch_attempt.runner_id if launch_attempt is not None else None
+    if (
+        launch_attempt is not None
+        and launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
+    ):
+        # The sandbox image should bake in the harness, but if the
+        # host refuses, fail the launch loudly rather than waiting out
+        # the connect timeout for a runner that will never appear.
+        reason = launch_attempt.error or "harness not configured on the sandbox host"
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
+        return
     if runner_id is not None and tunnel_registry is not None:
         connected = await _wait_for_managed_runner_tunnel(
             session_id,
@@ -3318,6 +3440,9 @@ def _kick_managed_relaunch(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            expected_runner_id=conv.runner_id,
+            expected_host_id=conv.host_id,
+            expected_workspace=conv.workspace,
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,

@@ -38,7 +38,7 @@ from omnigent.host.frames import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.host_registry import HostConnection
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -108,6 +108,8 @@ class _HostCapture:
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
     launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
+    launch_status: str = "launched"
+    worktree_events: list[tuple[str, str]] = field(default_factory=list)
 
 
 # register(*, create_status=, create_error=, launch_status=) -> _HostCapture
@@ -150,7 +152,7 @@ async def register_host(
             hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
             owner=RESERVED_USER_LOCAL,
         )
-        cap = _HostCapture()
+        cap = _HostCapture(launch_status=launch_status)
 
         async def _drain() -> None:
             """Answer stat/create/launch/remove frames; capture them."""
@@ -173,6 +175,7 @@ async def register_host(
                         )
                 elif isinstance(frame, HostCreateWorktreeFrame):
                     cap.create.append(frame)
+                    cap.worktree_events.append(("create", frame.branch_name))
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         if create_status == "ok":
@@ -200,15 +203,16 @@ async def register_host(
                     if fut is not None and not fut.done():
                         fut.set_result(
                             {
-                                "status": launch_status,
+                                "status": cap.launch_status,
                                 "runner_id": (
-                                    "runner_from_host" if launch_status == "launched" else None
+                                    "runner_from_host" if cap.launch_status == "launched" else None
                                 ),
-                                "error": None if launch_status == "launched" else "boom",
+                                "error": None if cap.launch_status == "launched" else "boom",
                             }
                         )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
+                    cap.worktree_events.append(("remove", frame.branch or frame.worktree_path))
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
@@ -443,3 +447,114 @@ async def test_launch_runner_retry_succeeds_after_failed_launch(
     assert conv is not None
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-y"
     assert conv.git_branch == "feature/y"
+
+
+async def test_failed_launch_rollback_preserves_newer_binding_and_worktree(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale launch failure cannot roll back a newer binding owner."""
+    cap = register_host(launch_status="failed")
+    session_id = await _bare_session(client, "wt-rollback-race-agent")
+    original = SqlAlchemyConversationStore.clear_host_binding_if_matches
+    raced = False
+
+    def _rotate_before_failed_launch_clear(
+        store: SqlAlchemyConversationStore,
+        conversation_id: str,
+        expected_runner_id: str,
+        expected_host_id: str,
+    ) -> bool:
+        nonlocal raced
+        if not raced:
+            raced = True
+            store.replace_runner_id(conversation_id, "runner_newer_owner")
+        return original(
+            store,
+            conversation_id,
+            expected_runner_id,
+            expected_host_id,
+        )
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "clear_host_binding_if_matches",
+        _rotate_before_failed_launch_clear,
+    )
+    response = await _launch(client, session_id, git={"branch_name": "feature/race"})
+
+    assert response.status_code == 502, response.text
+    assert raced is True
+    assert len(cap.create) == 1
+    assert cap.remove == [], "lost rollback CAS must not remove the newer owner's worktree"
+    final = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert final is not None
+    assert final.runner_id == "runner_newer_owner"
+    assert final.host_id == _HOST_ID
+    assert final.workspace == f"{_SOURCE_REPO}-worktrees/feature-race"
+    assert final.git_branch == "feature/race"
+
+
+async def test_replacement_bind_waits_for_failed_launch_worktree_cleanup(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement bind starts only after the old cleanup releases affinity."""
+    from omnigent.server.routes import _host_worktree as host_worktree_module
+
+    cap = register_host(launch_status="failed")
+    session_id = await _bare_session(client, "wt-cleanup-lock-agent")
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    original_remove = host_worktree_module.remove_worktree_on_host
+
+    async def _block_cleanup(
+        *,
+        host_registry: HostRegistry,
+        host_conn: HostConnection,
+        worktree_path: str,
+        branch: str | None,
+        delete_branch: bool,
+    ) -> None:
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        await original_remove(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            worktree_path=worktree_path,
+            branch=branch,
+            delete_branch=delete_branch,
+        )
+
+    monkeypatch.setattr(host_worktree_module, "remove_worktree_on_host", _block_cleanup)
+    first = asyncio.create_task(_launch(client, session_id, git={"branch_name": "feature/shared"}))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2.0)
+
+    cap.launch_status = "launched"
+    replacement = asyncio.create_task(
+        _launch(client, session_id, git={"branch_name": "feature/shared"})
+    )
+    await asyncio.sleep(0.05)
+    assert len(cap.create) == 1
+    assert replacement.done() is False
+
+    allow_cleanup.set()
+    first_response, replacement_response = await asyncio.gather(first, replacement)
+
+    assert first_response.status_code == 502, first_response.text
+    assert replacement_response.status_code == 200, replacement_response.text
+    assert cap.worktree_events == [
+        ("create", "feature/shared"),
+        ("remove", "feature/shared"),
+        ("create", "feature/shared"),
+    ]
+    final = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert final is not None
+    assert final.runner_id == replacement_response.json()["runner_id"]
+    assert final.host_id == _HOST_ID
+    assert final.workspace == f"{_SOURCE_REPO}-worktrees/feature-shared"
+    assert final.git_branch == "feature/shared"

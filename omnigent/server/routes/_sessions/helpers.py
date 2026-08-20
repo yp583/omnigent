@@ -261,6 +261,7 @@ from omnigent.server.schemas import (
     SkillSummary,
     ToolOutputDeltaEvent,
 )
+from omnigent.server.session_affinity import serialized_session_affinity_mutation
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
@@ -4453,6 +4454,34 @@ async def _launch_runner_on_host_impl(
     host_registry: HostRegistry,
     host_conn: HostConnection,
 ) -> _HostLaunchAttempt:
+    """Serialize one message-driven host runner relaunch."""
+    async with serialized_session_affinity_mutation(conv.id):
+        current = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if current is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        if (
+            current.runner_id != conv.runner_id
+            or current.host_id != conv.host_id
+            or current.workspace != conv.workspace
+        ):
+            raise OmnigentError(
+                "session affinity changed while waiting to relaunch; retry",
+                code=ErrorCode.CONFLICT,
+            )
+        return await _launch_runner_on_host_locked_impl(
+            current,
+            conversation_store,
+            host_registry,
+            host_conn,
+        )
+
+
+async def _launch_runner_on_host_locked_impl(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
 
@@ -4478,11 +4507,19 @@ async def _launch_runner_on_host_impl(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    await asyncio.to_thread(
-        conversation_store.replace_runner_id,
+    replaced = await asyncio.to_thread(
+        conversation_store.replace_runner_id_if_matches,
         conv.id,
+        conv.runner_id,
+        conv.host_id,
+        conv.workspace,
         new_runner_id,
     )
+    if not replaced:
+        raise OmnigentError(
+            "session affinity changed while launching a runner; retry",
+            code=ErrorCode.CONFLICT,
+        )
 
     # Pull workspace from the session row — populated and validated
     # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
@@ -5279,6 +5316,8 @@ async def _forward_session_change_to_runner_impl(
     runner_router: Any,
     event: dict[str, Any],
     timeout_s: float = 5.0,
+    *,
+    route_session_id: str | None = None,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -5321,6 +5360,9 @@ async def _forward_session_change_to_runner_impl(
     :param timeout_s: Request budget, e.g. ``5.0``. Callers whose event the
         runner answers by driving the TUI pass
         :data:`_TUI_INJECT_FORWARD_TIMEOUT_S`.
+    :param route_session_id: Optional session whose runner binding owns the
+        destination, while ``session_id`` remains the event target. Used when
+        a remotely hosted child reports status to its parent's runner.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -5328,7 +5370,7 @@ async def _forward_session_change_to_runner_impl(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(route_session_id or session_id, runner_router)
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
