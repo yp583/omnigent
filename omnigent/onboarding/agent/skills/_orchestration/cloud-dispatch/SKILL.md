@@ -1,137 +1,151 @@
 ---
 name: cloud-dispatch
-description: Dispatch durable, independent Codex or Claude Omnigent sessions to connected Coder boxes using isolated git worktrees.
+description: Dispatches one or more cloud coding sessions — Claude Code cloud sessions (claude --remote), Codex Cloud tasks (codex cloud exec), or durable sessions on the Coder boxes (ypbox1/ypbox2 over SSH, isolated worktree + tmux, claude or codex harness) — against a specified base branch, with an optional plan-mode toggle. Use this skill when the user wants to fan out tasks to the cloud, run a task remotely, offload work to a remote session, dispatch onto a coder box, or dispatch parallel cloud agents off a base branch. If the user has not named a vendor, ASK whether they want claude, codex, or coder. Trigger phrases include "fan out", "fanout", "cloud dispatch", "spawn cloud sessions", "run in the cloud", "remote session", "codex cloud", "dispatch to codex", "run on ypbox", "dispatch to the coder box".
 ---
 
-# Omnigent Cloud Dispatch
+# cloud-dispatch
 
-Use this skill when the user asks to run coding work in the cloud, on a Coder
-box, on another host, or as a multi-box fan-out. In Omnigent, **cloud
-dispatch means an independent, top-level Omnigent session on a connected Coder
-workspace**. It does not mean `claude --remote`, claude.ai Tasks, or a local
-background task. The dispatched session belongs in the main session list, not
-under the current chat's sub-agent rail.
+Dispatches cloud sessions for either vendor from one workflow:
 
-This workflow requires `sys_agent_list`, `sys_coder_hosts`, and
-`sys_session_create`. If any is unavailable, explain that the current session
-cannot perform Coder-backed cloud dispatch. Never silently fall back to local
-execution or another remote-dispatch service.
+| Vendor | Backend | Script |
+|--------|---------|--------|
+| `claude` | `claude --remote` → claude.ai Tasks | `scripts/dispatch-claude.sh` |
+| `codex` | `codex cloud exec` → chatgpt.com/codex | `scripts/dispatch-codex.sh` |
+| `coder` | SSH to ypbox1/ypbox2 → worktree + tmux, claude or codex harness | `scripts/dispatch-coder.sh` |
 
-## Required inputs
+All scripts share the same contract: plan mode via prompt prepend, task as
+one positional string. claude/codex additionally require cwd to be a git
+repo on the base branch with a GitHub origin; coder runs against the box's
+own `~/silico` checkout (local cwd/branch don't matter).
 
-Resolve these before creating a session:
+UI visibility: the claude harness runs with `--remote-control` (named after
+the dispatch slug, steerable at claude.ai/code — the session URL is printed
+in the box-side `dispatch.log`). The codex harness is headless-only: the
+ChatGPT app does NOT list `codex exec` threads from the boxes, so monitor
+codex dispatches via `dispatch.log` / tmux attach; pick the claude harness
+when the user wants a UI-steerable session.
 
-- One or more concrete coding tasks.
-- Provider family: exactly `codex` or `claude`. Refuse `pi` and any other
-  provider for this workflow.
-- An existing Omnigent agent for that provider.
-- An exact git base revision. Accept a branch, remote branch, tag, or commit
-  supplied or explicitly confirmed by the user. Never assume `main`.
-- The caller repository's `origin` URL when available. Read it without
-  modifying git state and send it as `repository_remote` so a similarly named
-  checkout cannot be selected. Never run `git remote get-url` without
-  redacting credentials first: it expands Git URL rewrites and can print an
-  embedded token into the transcript. Use a pipeline that strips HTTPS
-  userinfo before it reaches stdout, for example
-  `git config --get remote.origin.url | sed -E 's#^(https?://)[^/@]+@#\1#'`.
-- Optional Coder box selection. A box may be identified by exact `host_id`,
-  exact `coder_workspace_id` / `workspace_id`, or case-insensitive exact
-  `host_name` / `workspace_name`.
+## Inputs to gather
 
-User invocation authorizes dispatch. Ask only for a missing required input,
-an ambiguous agent or box, or a capacity override described below.
+Ask the user only for what is missing or ambiguous.
 
-## Resolve the agent
+1. **Vendor** — REQUIRED, `claude` or `codex`. **If the user did not name
+   one, ask which vendor they want before anything else.** Never default.
+2. **Base branch** — REQUIRED. Never default. The current local branch must
+   equal it (scripts enforce `HEAD == <base>`).
+3. **Task(s)** — REQUIRED. One or more natural-language task descriptions:
+   quoted strings, bulleted/numbered lists, or a referenced file (read it and
+   extract tasks).
+4. **Codex only — environment id** — REQUIRED for codex. Envs are created
+   per-repo at chatgpt.com/codex; browse with `codex cloud` (TUI). No local
+   default exists — ask if unknown.
+5. **Plan mode** — optional, default OFF. Turn ON for "plan", "planning
+   only", "don't edit", "dry run", "no code changes". Both scripts implement
+   it by prepending a plan-only instruction to the task prompt (for claude,
+   `--permission-mode plan` is incompatible with `--remote` and silently
+   falls back to local — never use it).
+6. **Codex only — attempts** — optional, default 1. `--attempts N` for
+   best-of-N.
+7. **Coder only — box and harness** — REQUIRED for coder: `--box ypbox1` or
+   `ypbox2` (ask if not stated), and `--harness claude` or `codex`.
 
-1. Call `sys_agent_list` before host discovery.
-2. Match the requested provider to these harness families:
-   - `codex`: `codex` or `codex-native`
-   - `claude`: `claude-sdk` or `claude-native`
-3. Prefer a built-in row whose `harness` proves the requested family. For a
-   session-bound row, use its `session_id` with `sys_agent_get` to verify the
-   harness before using its `agent_id`.
-4. Never infer provider family from the agent's display name alone. Never use
-   a local config because cross-host placement requires an existing
-   `agent_id`.
-5. If no accessible agent matches, report that clearly. If multiple match and
-   the user did not identify one, show the names, harnesses, and agent IDs and
-   ask which to use. Reject a chosen agent whose harness is Pi, unknown, or in
-   the other provider family.
+## Hard rules
 
-The selected harness is the `required_harness` passed to host discovery.
+- **Always confirm before dispatching.** Print vendor, base branch, plan
+  mode, (env id for codex), and the parsed task list, then ask to proceed —
+  even for N=1. Cloud sessions cost money and may open PRs.
+- **Verify the user is on the base branch locally.** If not, tell them to
+  `git checkout <base>` — never auto-checkout, auto-push, or auto-stash. The
+  scripts are read-only against local git state except `git fetch`.
+- **For N > 1, dispatch in parallel** in a SINGLE Bash call with `&` +
+  `wait`, one log file per task. Run exactly ONE `git fetch origin --prune`
+  before the fan-out (concurrent fetches race the repo's ref locks).
+- **Pass `timeout: 600000` (10 min)** to the Bash call — `claude --remote`
+  can take 1–3 min per task to provision.
+- Pass multi-line tasks via a file: `"$(cat task.txt)"` — no inline
+  multi-line quoting.
 
-## Discover and select a box
+## How to invoke
 
-Call `sys_coder_hosts` once per dispatch batch with:
+```bash
+# claude
+~/.claude/skills/cloud-dispatch/scripts/dispatch-claude.sh \
+  --branch <base> [--plan] "<task>"
 
-- `required_harness`: the selected agent's exact harness;
-- `repository_remote`: the caller origin when available;
-- `requested_memory_gib: 4`, unless the user or task supplies a better
-  estimate.
+# codex
+~/.claude/skills/cloud-dispatch/scripts/dispatch-codex.sh \
+  --branch <base> --env <env_id> [--plan] [--attempts N] "<task>"
 
-Use only the returned `workspace_path`; never use
-`coder_reported_directory`.
+# coder box
+~/.claude/skills/cloud-dispatch/scripts/dispatch-coder.sh \
+  --box <ypbox1|ypbox2> --harness <claude|codex> --branch <base> [--plan] "<task>"
+```
 
-### Explicitly selected box
+Fanout (single Bash call, `timeout: 600000`; mixing vendors in one fan-out
+is fine — same pattern, per-task script):
 
-- Match only by exact `host_id`, `coder_workspace_id`, or `workspace_id`, or
-  by case-insensitive exact `host_name` or `workspace_name`. A partial match
-  is not enough.
-- Zero matches is a hard failure. Multiple name matches are ambiguous and
-  require the user to choose an ID.
-- A repository mismatch, unverified workspace path, offline host, missing
-  harness, or unauthenticated harness is a hard failure.
-- If `override_allowed` is true, show every `ineligibility_reasons` entry and
-  ask the user before overriding it. This is limited to unknown or
-  insufficient advisory capacity and legacy hosts whose harness readiness is
-  unknown. A reported missing or unauthenticated harness is never overridable.
-- If creation fails, report the failure. **Never reroute a pinned dispatch to
-  another box.**
+```bash
+log_dir=/tmp/cloud-dispatch-$(date +%s)
+mkdir -p "$log_dir"
+D=~/.claude/skills/cloud-dispatch/scripts
+"$D/dispatch-claude.sh" --branch <base> "<task 1>" >"$log_dir/1.log" 2>&1 &
+"$D/dispatch-claude.sh" --branch <base> "<task 2>" >"$log_dir/2.log" 2>&1 &
+wait
+ls -la "$log_dir"
+```
 
-### Automatic placement
+If even 10 min isn't enough (10+ tasks, slow provisioning), fall back to
+fire-and-forget: `nohup <script> ... >/tmp/cloud-dispatch-$$.log 2>&1 & disown`
+and read the logs after.
 
-- Consider eligible candidates in the returned rank order.
-- For multiple tasks, assign greedily across eligible hosts. After assigning a
-  task, subtract its requested memory from that candidate's available-memory
-  estimate for the remainder of this batch. Logical CPU count is not a
-  session limit.
-- When no candidate is eligible but `needs_confirmation` is true, show a
-  compact table of candidates with `override_allowed: true`, including their
-  capacity and harness-readiness reasons, and ask before proceeding.
-- Never override repository, path, connectivity, harness, or authentication
-  failures.
+## Confirmation message template
 
-## Launch
+```
+About to dispatch <N> cloud session(s):
+  vendor:      <claude|codex>
+  base branch: <base>
+  plan mode:   <on|off>
+  env id:      <env_id>          (codex only)
+  tasks:
+    1. <task 1>
+    ...
 
-For each task:
+Prereqs: you must already be on `<base>` locally with origin/<base> up to date.
 
-1. Generate a unique branch named `omni/<task-slug>-<short-random-suffix>`.
-2. Call `sys_session_create` with `detached: true`, the selected existing
-   `agent_id`, `host_id`, verified absolute `workspace_path` as `workspace`,
-   generated `branch_name`, exact `base_branch`, concise `title`, and complete
-   task as `message`. Never omit `detached: true` for cloud dispatch.
-3. Include this safety boundary in the message:
+Proceed?
+```
 
-   > Work only inside the isolated worktree created for this session. Do not
-   > commit, push, open a pull request, merge, deploy, or alter another
-   > worktree unless the user separately authorizes it.
+Wait for explicit confirmation. If the user edits the task list, re-show it.
 
-4. For automatic placement only, retry once on the next eligible candidate
-   with a fresh branch name after `placement_conflict`,
-   `placement_unavailable`, or a host disconnect. Do not retry another host
-   when the user selected a box.
-5. Report the returned conversation ID, provider and harness, selected box,
-   host ID, branch, and worktree. Explain that it is an independent session in
-   the main session list and will not report completion into the current chat.
-   Monitor later with `sys_session_get_info` or `sys_session_get_history` when
-   requested.
+## After dispatch
 
-## Safety
+Report sessions spawned and any non-zero exits with the failing task, then
+where to monitor:
 
-- Coder metrics are advisory snapshots, not reservations.
-- Repository identity and verified paths are security boundaries, not ranking
-  hints.
-- Never expose Coder tokens or repository credentials in prompts, tool output,
-  or results. Sanitize repository URLs before they reach stdout.
-- Never commit, push, open a pull request, merge, or deploy without separate
-  human authorization.
+- **claude**: https://claude.ai/tasks or `/tasks` in a Claude CLI session.
+- **codex**: `codex cloud list` / `codex cloud status <id>`; pull results
+  with `codex cloud diff <id>` or `codex cloud apply <id>`, or at
+  chatgpt.com/codex.
+- **coder**: the script prints monitor/attach commands. claude harness:
+  steer from claude.ai/code (URL in `dispatch.log`) or
+  `ssh -t <box> tmux attach -t <slug>`; the session stays open for follow-up
+  — kill the tmux session and `git worktree remove` when done. codex
+  harness: `ssh <box> tail -f <worktree>/dispatch.log`; exits on its own
+  (`exit=N` appended to the log).
+
+## Troubleshooting
+
+- **"does not support --remote" / "does not support 'cloud exec'"** → upgrade
+  the respective CLI.
+- **"current branch is 'X', expected 'Y'"** → `git checkout Y` first.
+- **"origin/<branch> does not exist"** → push it first.
+- **"origin is not a GitHub remote"** → both backends clone from GitHub only.
+- **claude: dispatched but nothing at claude.ai/tasks** → run `/web-setup`
+  once to authorize the GitHub app.
+- **codex: env id unknown/invalid** → browse the `codex cloud` TUI or create
+  an env for the repo at chatgpt.com/codex (one-time per repo).
+- **coder: cannot reach box over SSH** → the launchd port-forward agent
+  (`com.ypatel.coder-pf-ypbox*`) is down; restart it or `coder port-forward`.
+- **coder claude harness: session exits immediately** → a first-run TUI
+  dialog wasn't auto-answered; check `dispatch.log` in the worktree for
+  which dialog rendered last.
