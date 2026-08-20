@@ -29,7 +29,11 @@ Resolve these before creating a session:
   supplied or explicitly confirmed by the user. Never assume `main`.
 - The caller repository's `origin` URL when available. Read it without
   modifying git state and send it as `repository_remote` so a similarly named
-  checkout cannot be selected.
+  checkout cannot be selected. Never run `git remote get-url` without
+  redacting credentials first: it expands Git URL rewrites and can print an
+  embedded token into the transcript. Use a pipeline that strips HTTPS
+  userinfo before it reaches stdout, for example
+  `git config --get remote.origin.url | sed -E 's#^(https?://)[^/@]+@#\1#'`.
 - Optional Coder box selection. A box may be identified by exact `host_id`,
   exact `coder_workspace_id` / `workspace_id`, or case-insensitive exact
   `host_name` / `workspace_name`.
@@ -127,6 +131,7 @@ For each task:
 - Coder metrics are advisory snapshots, not reservations.
 - Repository identity and verified paths are security boundaries, not ranking
   hints.
-- Never expose Coder tokens or repository credentials in prompts or results.
+- Never expose Coder tokens or repository credentials in prompts, tool output,
+  or results. Sanitize repository URLs before they reach stdout.
 - Never commit, push, open a pull request, merge, or deploy without separate
   human authorization.

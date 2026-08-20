@@ -124,6 +124,8 @@ def test_cloud_dispatch_skill_pins_provider_box_and_safety_contract() -> None:
     assert "isolated worktree" in content
     assert "`detached: true`" in content
     assert "main session list" in content
+    assert "Never run `git remote get-url` without" in content
+    assert "Sanitize repository URLs before they reach stdout" in content
 
 
 def test_coder_dispatch_alias_names_removal_version() -> None:
